@@ -335,6 +335,30 @@ class Qwen3_5Model(Qwen3NextModel):
         else:
             self.norm = PPMissingLayer()
 
+        # CacheBlend / KVLink: must be initialized here because __init__ calls
+        # super(Qwen3NextModel, self).__init__() (i.e., nn.Module.__init__)
+        # which bypasses Qwen3NextModel.__init__ entirely.
+        self.cache_fuse_metadata: dict = {
+            "check_layers": [1],
+            "check": False,
+            "recomp_ratios": [0.16],
+            "recomp_ratio": 0.16,
+            "original_slot_mapping": None,
+            "our_slot_mapping": None,
+            "kv_cache_dtype": None,
+            "attn_bias": None,
+            "imp_indices": None,
+            "org_seq_len": None,
+            "collect": False,
+            "kvlink": None,
+            "prob_attn": False,
+            "attn_matrix": [],
+            "layer_idx": 0,
+        }
+        self.old_kvs: list[list[torch.Tensor | None]] = [
+            [None, None] for _ in range(config.num_hidden_layers)
+        ]
+
     def load_fused_expert_weights(
         self,
         name: str,

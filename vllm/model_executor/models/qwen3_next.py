@@ -907,11 +907,19 @@ class Qwen3NextAttention(nn.Module):
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # CacheBlend / KVLink: stores the last raw (post-qk_norm, pre-RoPE)
+        # K/V produced by this layer so the driver can collect them between
+        # `llm.generate()` calls. Populated inside XFormersImpl.forward().
+        self.hack_kv: list[torch.Tensor] = []
+
     def forward(
         self,
         positions: torch.Tensor,
         output: torch.Tensor,
         hidden_states: torch.Tensor,
+        status: int | None = None,
+        cache_fuse_metadata: dict | None = None,
+        old_kv: list[torch.Tensor] | None = None,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -934,13 +942,51 @@ class Qwen3NextAttention(nn.Module):
             -1, self.num_kv_heads * self.head_dim
         )
 
+        # CacheBlend / KVLink: when old_kv from a previous generate() pass is
+        # supplied, re-apply RoPE to it at the *original* positions so the
+        # cached K aligns with the full concatenated sequence. Mirrors the
+        # "fake_q" trick in epic's qwen2.py.
+        if cache_fuse_metadata is not None and old_kv is not None:
+            if (
+                cache_fuse_metadata.get("kvlink") is not None
+                or status in (1, 2)
+            ):
+                if cache_fuse_metadata.get("fake_q") is None:
+                    cache_fuse_metadata["fake_q"] = torch.rand_like(q)
+                _, old_kv[0] = self.rotary_emb(
+                    cache_fuse_metadata["org_pos"],
+                    cache_fuse_metadata["fake_q"],
+                    old_kv[0],
+                )
+
         q, k = self.rotary_emb(positions, q, k)
+
+        # Stash the CacheBlend/KVLink state on the attention layer so the
+        # XFormers impl can read it without needing extra forward() args.
+        if cache_fuse_metadata is not None:
+            self.attn.cache_fuse_metadata = cache_fuse_metadata
+            self.attn.status = status
+            self.attn.old_kv = old_kv
+        else:
+            # Clear from any prior iteration.
+            self.attn.cache_fuse_metadata = None
+            self.attn.status = None
+            self.attn.old_kv = None
 
         attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
+
+        # CacheBlend: forward the "hack_kv" collected by impl up to this
+        # module so the driver sees it at `self_attn.hack_kv`.
+        hack_kv = getattr(self.attn, "hack_kv", None)
+        if hack_kv is not None:
+            self.hack_kv = hack_kv
+            # Clear on the attention layer so subsequent standard forwards
+            # don't re-emit stale state.
+            self.attn.hack_kv = None
 
         output[:], _ = self.o_proj(attn_output)
 
@@ -1032,6 +1078,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor = None,
+        status: int | None = None,
+        cache_fuse_metadata: dict | None = None,
+        old_kv: list | None = None,
         **kwargs: object,
     ):
         if residual is None:
@@ -1040,7 +1089,19 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        self_attention_output = torch.empty_like(hidden_states)
+        # CacheBlend / KVLink hooks only apply to full_attention layers.
+        cfm = cache_fuse_metadata if self.layer_type == "full_attention" else None
+        ok = old_kv if self.layer_type == "full_attention" else None
+        st = status if self.layer_type == "full_attention" else None
+
+        # When `status == 1` the attention layer will select a subset of
+        # query rows (imp_indices). Pre-size the output to the full sequence
+        # so we can write back into it by index.
+        if st == 1 and cfm is not None:
+            self_attention_output = torch.empty_like(hidden_states)
+        else:
+            self_attention_output = torch.empty_like(hidden_states)
+
         if self.layer_type == "linear_attention":
             self.linear_attn(
                 hidden_states=hidden_states,
@@ -1051,10 +1112,25 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 output=self_attention_output,
                 positions=positions,
+                status=st,
+                cache_fuse_metadata=cfm,
+                old_kv=ok,
             )
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+
+        # CacheBlend: on the "check" layer (status == 1) the self-attention
+        # produced an output only for the selected (imp_indices) rows, so
+        # we must slice residual and hidden_states to match before the MLP.
+        if (
+            st == 1
+            and cfm is not None
+            and cfm.get("imp_indices") is not None
+        ):
+            imp_indices = cfm["imp_indices"]
+            residual = residual[imp_indices]
+            hidden_states = hidden_states[: imp_indices.shape[0]]
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -1126,6 +1202,31 @@ class Qwen3NextModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # CacheBlend / KVLink state. Only used when the user explicitly
+        # turns on CacheBlend / KVLink by mutating this dict from outside
+        # (via llm.apply_model). All paths are off by default so this model
+        # behaves identically to the upstream Qwen3Next in the normal case.
+        self.cache_fuse_metadata: dict = {
+            "check_layers": [1],
+            "check": False,
+            "recomp_ratios": [0.16],
+            "recomp_ratio": 0.16,
+            "original_slot_mapping": None,
+            "our_slot_mapping": None,
+            "kv_cache_dtype": None,
+            "attn_bias": None,
+            "imp_indices": None,
+            "org_seq_len": None,
+            "collect": False,
+            "kvlink": None,
+            "prob_attn": False,
+            "attn_matrix": [],
+            "layer_idx": 0,
+        }
+        self.old_kvs: list[list[torch.Tensor | None]] = [
+            [None, None] for _ in range(config.num_hidden_layers)
+        ]
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1147,12 +1248,75 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # ---- CacheBlend / KVLink orchestration --------------------------
+        # Decide whether this is a prefill or a decode step. The v1
+        # engine no longer exposes attention metadata on `self` directly;
+        # we infer prefill vs decode from the presence of input_ids with
+        # >1 tokens. For the CacheBlend/KVLink research driver, runs are
+        # always single-sequence, so `input_ids.shape[0] > 1` is a
+        # reliable prefill indicator.
+        cfm = self.cache_fuse_metadata
+        is_prefill = input_ids is not None and input_ids.dim() == 1 and input_ids.shape[0] > 1
+        temp_status: int | None = -1  # default: decode
+        check_layer_idx = 0
+        if is_prefill:
+            temp_status = 0  # full prefill
+            if cfm["check"]:
+                cfm["org_seq_len"] = input_ids.shape[0]
+                cfm["fake_q"] = None
+                cfm["attn_bias"] = None
+                cfm["imp_indices"] = None
+                cfm["original_slot_mapping"] = None
+                cfm["our_slot_mapping"] = None
+                cfm["org_pos"] = positions[:]
+            if cfm["kvlink"] is not None:
+                cfm["org_seq_len"] = input_ids.shape[0]
+                cfm["fake_q"] = None
+                cfm["attn_bias"] = None
+                cfm["original_slot_mapping"] = None
+                cfm["our_slot_mapping"] = None
+                cfm["org_pos"] = positions[:]
+
+                imp_indices = torch.as_tensor(
+                    cfm["kvlink"], device=positions.device, dtype=torch.long
+                )
+                cfm["imp_indices"] = imp_indices
+                positions = positions[imp_indices]
+                hidden_states = hidden_states[imp_indices]
+
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            # Per-layer status for CacheBlend "check" mode.
+            layer_status: int | None = temp_status
+            if is_prefill and cfm["check"] and getattr(layer, "layer_type", None) == "full_attention":
+                if layer_idx in cfm["check_layers"]:
+                    layer_status = 1
+                    cfm["check_layer"] = cfm["check_layers"][check_layer_idx]
+                    check_layer_idx += 1
+                elif layer_idx > cfm["check_layers"][0]:
+                    layer_status = 2
+
+            layer_cfm = cfm if (cfm["check"] or cfm["kvlink"] is not None or cfm["collect"]) else None
+            layer_old_kv = (
+                self.old_kvs[layer_idx]
+                if layer_cfm is not None and getattr(layer, "layer_type", None) == "full_attention"
+                else None
+            )
+
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                status=layer_status,
+                cache_fuse_metadata=layer_cfm,
+                old_kv=layer_old_kv,
             )
+            # When the check layer (status==1) sliced the token set, also
+            # slice positions so subsequent layers see aligned tensors.
+            if layer_status == 1 and cfm.get("imp_indices") is not None:
+                positions = positions[cfm["imp_indices"]]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
