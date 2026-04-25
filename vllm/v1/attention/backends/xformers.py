@@ -100,6 +100,7 @@ class XFormersMetadataBuilder(AttentionMetadataBuilder[XFormersAttentionMetadata
 
 
 class XFormersBackend(AttentionBackend):
+    accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
@@ -223,19 +224,22 @@ class XFormersImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: XFormersAttentionMetadata,
-        output: torch.Tensor,
+        output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward with standard paged attention + CacheBlend / KVLink hooks.
 
         ``query``/``key``/``value``: shape [num_tokens, num_{q|kv}_heads, head_size].
-        ``output``: preallocated tensor with the same shape as query.
+        ``output``: preallocated tensor (optional); allocated here if not given.
         """
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "Fused output quantization is not supported by XFormersImpl."
             )
+
+        if output is None:
+            output = torch.empty_like(query)
 
         if attn_metadata is None:
             # Dummy/profiling run.
