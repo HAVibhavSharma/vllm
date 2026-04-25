@@ -417,6 +417,24 @@ class EvalEngine:
                 max_tokens=1024 if configs.dataset == "multi_news" else 32,
                 skip_special_tokens=True,
             )
+            import time as _time
+            torch.cuda.synchronize()
+            _t0 = _time.perf_counter()
+            # Force ttft measurement: only generate the first token here.
+            ttft_sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=1,
+                skip_special_tokens=True,
+            )
+            _ = llm.generate(
+                sampling_params=ttft_sampling_params,
+                prompts=[{"prompt_token_ids": input_ids}],
+                use_tqdm=False,
+            )
+            torch.cuda.synchronize()
+            ttft_measured = _time.perf_counter() - _t0
+
+            # Now generate the full answer for accuracy scoring.
             output = llm.generate(
                 sampling_params=sampling_params,
                 prompts=[{"prompt_token_ids": input_ids}],
@@ -435,10 +453,7 @@ class EvalEngine:
 
             generated_text = generated_text.strip()
             results[f"output_{configs.approach}"].append(generated_text)
-            results[f"TTFT_{configs.approach}"].append(
-                output[0].metrics.first_token_time
-                - output[0].metrics.first_scheduled_time
-            )
+            results[f"TTFT_{configs.approach}"].append(ttft_measured)
 
             # Free CUDA memory accumulated during this dataset item.
             reset_layer_hack_kv(llm)
