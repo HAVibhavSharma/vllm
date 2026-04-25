@@ -335,7 +335,7 @@ class EvalEngine:
             for i in range(len(token_ids)):
                 llm.generate(
                     sampling_params=sampling_params,
-                    prompt_token_ids=[token_ids[i]],
+                    prompts=[{"prompt_token_ids": token_ids[i]}],
                     use_tqdm=False,
                 )
                 per_layer_kv = collect_hack_kv(llm)
@@ -419,7 +419,7 @@ class EvalEngine:
             )
             output = llm.generate(
                 sampling_params=sampling_params,
-                prompt_token_ids=[input_ids],
+                prompts=[{"prompt_token_ids": input_ids}],
                 use_tqdm=False,
             )
             generated_text = output[0].outputs[0].text
