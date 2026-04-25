@@ -38,6 +38,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
     chunked_prefill_paged_decode,
 )
+from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
@@ -401,7 +402,9 @@ class XFormersImpl(AttentionImpl):
     ) -> None:
         if key is None or value is None or kv_cache.numel() == 0:
             return
-        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size
+        )
         triton_reshape_and_cache_flash(
             key,
             value,
@@ -444,7 +447,9 @@ class XFormersImpl(AttentionImpl):
             output.copy_(out.view_as(output))
             return
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size
+        )
 
         chunked_prefill_paged_decode(
             query=query,
