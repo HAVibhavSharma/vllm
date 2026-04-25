@@ -293,6 +293,9 @@ class EvalEngine:
         ):
             # Convert the prompts to token ids.
             # Newer transformers may return a BatchEncoding instead of List[int].
+            # We open the user turn here (system prompt) and the closing
+            # `<|im_end|>\n<|im_start|>assistant\n` is appended to the
+            # free-form chunk below so the model has a proper role boundary.
             _sys_result = tokenizer.apply_chat_template(
                 [{"role": "user", "content": system_prompts}]
             )
@@ -300,17 +303,36 @@ class EvalEngine:
                 system_token_ids: List[int] = list(_sys_result["input_ids"])
             else:
                 system_token_ids: List[int] = list(_sys_result)
-            if system_token_ids[-1] == tokenizer.eos_token_id:
+            # Strip the trailing <|im_end|> (and any tokens after it) so we can
+            # paste documents *inside* the user turn before closing it.
+            im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+            if im_end_id in system_token_ids:
+                _idx = system_token_ids.index(im_end_id)
+                system_token_ids = system_token_ids[:_idx]
+            elif system_token_ids[-1] == tokenizer.eos_token_id:
                 system_token_ids = system_token_ids[:-1]
+
             mod_token_ids: List[List[int]] = [
-                list(tokenizer.encode(mod_prompt)) for mod_prompt in mod_prompts
+                list(tokenizer.encode(mod_prompt, add_special_tokens=False))
+                for mod_prompt in mod_prompts
             ]
-            _ff_result = tokenizer.encode(free_form_prompt)
+
+            _ff_result = tokenizer.encode(
+                free_form_prompt, add_special_tokens=False
+            )
             if isinstance(_ff_result, dict) or hasattr(_ff_result, "input_ids"):
                 _ff_result = list(_ff_result["input_ids"])
             else:
                 _ff_result = list(_ff_result)
-            free_form_token_ids: List[int] = _ff_result + [tokenizer.eos_token_id]
+            # Close the user turn and open the assistant turn so the model
+            # actually responds. For Qwen3.5 we also disable the <think> mode
+            # by inserting an empty <think>/</think> pair, matching the
+            # `enable_thinking=False` chat-template behavior.
+            assistant_open_text = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            assistant_open_ids = tokenizer.encode(
+                assistant_open_text, add_special_tokens=False
+            )
+            free_form_token_ids: List[int] = _ff_result + assistant_open_ids
             token_ids: List[List[int]] = (
                 [system_token_ids] + mod_token_ids + [free_form_token_ids]
             )
@@ -412,9 +434,12 @@ class EvalEngine:
             else:
                 raise ValueError(f"Invalid approach: {configs.approach}")
 
+            # Qwen3.5 may emit <think>...</think> before the answer; we both
+            # disable thinking via the chat-template prefix and give some
+            # extra headroom in case it slips through.
             sampling_params = SamplingParams(
                 temperature=0,
-                max_tokens=1024 if configs.dataset == "multi_news" else 32,
+                max_tokens=1024 if configs.dataset == "multi_news" else 512,
                 skip_special_tokens=True,
             )
             import time as _time
@@ -450,6 +475,19 @@ class EvalEngine:
             for marker in ("<|im_end|>", "<|im_start|>", "</s>"):
                 if marker in generated_text:
                     generated_text = generated_text[: generated_text.index(marker)]
+
+            # Strip Qwen3.5 thinking blocks: anything inside <think>...</think>,
+            # plus any leftover unclosed <think> at the start.
+            import re as _re
+            generated_text = _re.sub(
+                r"<think>.*?</think>", "", generated_text, flags=_re.DOTALL
+            )
+            if "<think>" in generated_text:
+                # Unclosed think (truncated by max_tokens) — drop everything
+                # from the opening tag onward.
+                generated_text = generated_text.split("<think>", 1)[0]
+            if "</think>" in generated_text:
+                generated_text = generated_text.split("</think>", 1)[1]
 
             generated_text = generated_text.strip()
             results[f"output_{configs.approach}"].append(generated_text)
