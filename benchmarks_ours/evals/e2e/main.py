@@ -24,6 +24,12 @@ Key differences vs. the 0.8.5 version:
 import argparse
 import logging
 import os
+
+# Allow pickle-based serialization so we can ship closures (set_cache_fuse_flags,
+# collect_hack_kv, set_old_kvs, reset_layer_hack_kv) to the EngineCore worker
+# process. Must be set BEFORE importing vllm.
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List
@@ -159,7 +165,7 @@ class EvalConfigs:
     all_models: List[str] = field(
         default_factory=lambda: [
             "Qwen/Qwen3.5-4B",
-            "Qwen/Qwen3.5-7B",
+            "Qwen/Qwen3.5-9B",
             # Original-stack models (not yet ported to v1 hooks):
             "mistralai/Mistral-7B-Instruct-v0.2",
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -215,9 +221,7 @@ class EvalConfigs:
         )
 
     def _verify_init_args(self):
-        assert self.model in self.all_models, (
-            f"{self.model} not in {self.all_models}"
-        )
+        assert self.model in self.all_models, f"{self.model} not in {self.all_models}"
         assert self.dataset in self.all_datasets, (
             f"{self.dataset} not in {self.all_datasets}"
         )
@@ -238,9 +242,7 @@ class EvalEngine:
             f" \033[32m{self.configs.model}\033[0m and"
             f" \033[32m{self.configs.dataset}\033[0m"
         )
-        logger.info(
-            f"Save the results to \033[32m{self.configs.result_path}\033[0m"
-        )
+        logger.info(f"Save the results to \033[32m{self.configs.result_path}\033[0m")
 
         set_seed(self.configs.seed)
 
@@ -265,9 +267,7 @@ class EvalEngine:
             enforce_eager=True,
             max_model_len=32768,
             attention_backend="XFORMERS",
-            quantization=(
-                "modelopt" if "FP8" in self.configs.model.upper() else None
-            ),
+            quantization=("modelopt" if "FP8" in self.configs.model.upper() else None),
         )
 
         # Run inference, record results into the dataset.
@@ -284,9 +284,7 @@ class EvalEngine:
         tokenizer: AutoTokenizer,
         llm: LLM,
     ) -> Data_set:
-        logger.info(
-            "Run the inference. This might take a long time... Good luck"
-        )
+        logger.info("Run the inference. This might take a long time... Good luck")
 
         results = defaultdict(list)
 
@@ -360,12 +358,8 @@ class EvalEngine:
                         if old_kvs[j][0] is None:
                             old_kvs[j] = [temp_k, temp_v]
                         else:
-                            old_kvs[j][0] = torch.cat(
-                                (old_kvs[j][0], temp_k), dim=0
-                            )
-                            old_kvs[j][1] = torch.cat(
-                                (old_kvs[j][1], temp_v), dim=0
-                            )
+                            old_kvs[j][0] = torch.cat((old_kvs[j][0], temp_k), dim=0)
+                            old_kvs[j][1] = torch.cat((old_kvs[j][1], temp_v), dim=0)
 
                 set_old_kvs(llm, old_kvs)
 
@@ -388,14 +382,10 @@ class EvalEngine:
                 temp: list[int] = []
                 for i in range(1, len(start_offset) - 1):
                     if i == len(start_offset) - 2:
-                        temp += list(
-                            range(start_offset[i], start_offset[i + 1])
-                        )
+                        temp += list(range(start_offset[i], start_offset[i + 1]))
                     else:
                         temp += list(
-                            range(
-                                start_offset[i], start_offset[i] + recomp_num
-                            )
+                            range(start_offset[i], start_offset[i] + recomp_num)
                         )
                 set_cache_fuse_flags(
                     llm,
@@ -441,9 +431,7 @@ class EvalEngine:
                 generated_text = generated_text.split(assistant_header, 1)[1]
             for marker in ("<|im_end|>", "<|im_start|>", "</s>"):
                 if marker in generated_text:
-                    generated_text = generated_text[
-                        : generated_text.index(marker)
-                    ]
+                    generated_text = generated_text[: generated_text.index(marker)]
 
             generated_text = generated_text.strip()
             results[f"output_{configs.approach}"].append(generated_text)
@@ -462,23 +450,13 @@ class EvalEngine:
         return dataset
 
     def generate_presentation(self):
-        self.dataset.calc_accuracy(
-            self.configs.dataset, self.configs.approach
-        )
+        self.dataset.calc_accuracy(self.configs.dataset, self.configs.approach)
         self.dataset.save_dataset(self.configs.result_path)
 
-        accuracy_avg = np.mean(
-            self.dataset.data[f"score_{self.configs.approach}"]
-        )
-        ttft_avg = np.mean(
-            self.dataset.data[f"TTFT_{self.configs.approach}"]
-        )
-        logger.info(
-            f"Average accuracy of {self.configs.approach}: {accuracy_avg:.3f}"
-        )
-        logger.info(
-            f"Average TTFT of {self.configs.approach}: {ttft_avg:.2f} s"
-        )
+        accuracy_avg = np.mean(self.dataset.data[f"score_{self.configs.approach}"])
+        ttft_avg = np.mean(self.dataset.data[f"TTFT_{self.configs.approach}"])
+        logger.info(f"Average accuracy of {self.configs.approach}: {accuracy_avg:.3f}")
+        logger.info(f"Average TTFT of {self.configs.approach}: {ttft_avg:.2f} s")
 
 
 if __name__ == "__main__":
