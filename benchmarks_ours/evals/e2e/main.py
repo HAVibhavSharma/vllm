@@ -294,17 +294,25 @@ class EvalEngine:
             dataset, desc="dataset", leave=True
         ):
             # Convert the prompts to token ids.
-            system_token_ids: List[int] = tokenizer.apply_chat_template(
+            # Newer transformers may return a BatchEncoding instead of List[int].
+            _sys_result = tokenizer.apply_chat_template(
                 [{"role": "user", "content": system_prompts}]
             )
+            if isinstance(_sys_result, dict) or hasattr(_sys_result, "input_ids"):
+                system_token_ids: List[int] = list(_sys_result["input_ids"])
+            else:
+                system_token_ids: List[int] = list(_sys_result)
             if system_token_ids[-1] == tokenizer.eos_token_id:
                 system_token_ids = system_token_ids[:-1]
             mod_token_ids: List[List[int]] = [
-                tokenizer.encode(mod_prompt) for mod_prompt in mod_prompts
+                list(tokenizer.encode(mod_prompt)) for mod_prompt in mod_prompts
             ]
-            free_form_token_ids: List[int] = tokenizer.encode(
-                free_form_prompt
-            ) + [tokenizer.eos_token_id]
+            _ff_result = tokenizer.encode(free_form_prompt)
+            if isinstance(_ff_result, dict) or hasattr(_ff_result, "input_ids"):
+                _ff_result = list(_ff_result["input_ids"])
+            else:
+                _ff_result = list(_ff_result)
+            free_form_token_ids: List[int] = _ff_result + [tokenizer.eos_token_id]
             token_ids: List[List[int]] = (
                 [system_token_ids] + mod_token_ids + [free_form_token_ids]
             )
