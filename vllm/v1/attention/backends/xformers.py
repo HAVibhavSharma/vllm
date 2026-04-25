@@ -464,7 +464,6 @@ class XFormersImpl(AttentionImpl):
             alibi_slopes=self.alibi_slopes,
             sliding_window=self.sliding_window,
             sm_scale=self.scale,
-            causal=attn_metadata.causal,
         )
 
 
