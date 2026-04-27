@@ -947,17 +947,81 @@ class Qwen3NextAttention(nn.Module):
         # cached K aligns with the full concatenated sequence. Mirrors the
         # "fake_q" trick in epic's qwen2.py.
         if cache_fuse_metadata is not None and old_kv is not None:
-            if (
-                cache_fuse_metadata.get("kvlink") is not None
-                or status in (1, 2)
-            ):
-                if cache_fuse_metadata.get("fake_q") is None:
-                    cache_fuse_metadata["fake_q"] = torch.rand_like(q)
-                _, old_kv[0] = self.rotary_emb(
-                    cache_fuse_metadata["org_pos"],
+            _kvlink_present = cache_fuse_metadata.get("kvlink") is not None
+            _org_pos_present = cache_fuse_metadata.get("org_pos") is not None
+            if (_kvlink_present or status in (1, 2)) and _org_pos_present:
+                old_k = old_kv[0]
+                org_pos = cache_fuse_metadata["org_pos"]
+
+                # Flatten to 2D [T, num_kv_heads * head_dim] as rotary_emb expects.
+                old_k_was_3d = (old_k.dim() == 3)
+                if old_k_was_3d:
+                    old_k_2d = old_k.reshape(old_k.shape[0], -1).contiguous()
+                else:
+                    old_k_2d = old_k.contiguous()
+
+                old_seq_len = old_k_2d.shape[0]
+
+                # Slice positions to match old_k length.
+                # MRoPE: positions is [3, full_seq_len]; standard: [full_seq_len].
+                if org_pos.dim() == 2:
+                    pos_for_old_kv = org_pos[:, :old_seq_len].contiguous()
+                else:
+                    pos_for_old_kv = org_pos[:old_seq_len].contiguous()
+
+                # fake_q must match old_k token count and be contiguous.
+                fake_q = cache_fuse_metadata.get("fake_q")
+                if fake_q is None or fake_q.shape[0] != old_seq_len:
+                    cache_fuse_metadata["fake_q"] = torch.rand(
+                        (old_seq_len,) + q.shape[1:],
+                        dtype=q.dtype,
+                        device=q.device,
+                    ).contiguous()
+
+                if cache_fuse_metadata.get("log"):
+                    logger.info(
+                        "[old_kv USED] Re-applying RoPE to old_kv[0] | "
+                        "status=%s | kvlink=%s | old_k_2d shape=%s | "
+                        "pos_for_old_kv shape=%s | fake_q shape=%s | "
+                        "old_k_2d is_contiguous=%s | pos_for_old_kv is_contiguous=%s",
+                        status,
+                        _kvlink_present,
+                        old_k_2d.shape,
+                        pos_for_old_kv.shape,
+                        cache_fuse_metadata["fake_q"].shape,
+                        old_k_2d.is_contiguous(),
+                        pos_for_old_kv.is_contiguous(),
+                    )
+
+                _, rotated_k = self.rotary_emb(
+                    pos_for_old_kv,
                     cache_fuse_metadata["fake_q"],
-                    old_kv[0],
+                    old_k_2d,
                 )
+
+                # Store back — ensure contiguous and in correct shape.
+                if old_k_was_3d:
+                    old_kv[0] = rotated_k.reshape(old_k.shape).contiguous()
+                else:
+                    old_kv[0] = rotated_k.contiguous()
+
+            else:
+                if cache_fuse_metadata.get("log"):
+                    logger.info(
+                        "[old_kv PRESENT but condition not met — skipped RoPE re-apply] "
+                        "status=%s | kvlink=%s | org_pos present=%s",
+                        status,
+                        _kvlink_present,
+                        _org_pos_present,
+                    )
+        else:
+            pass
+            # if(cache_fuse_metadata.get("log")):
+            #     logger.info(
+            #         "[old_kv NOT USED] cfm present=%s | old_kv present=%s",
+            #         cache_fuse_metadata is not None,
+            #         old_kv is not None,
+            #     )
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -1094,6 +1158,14 @@ class Qwen3NextDecoderLayer(nn.Module):
         ok = old_kv if self.layer_type == "full_attention" else None
         st = status if self.layer_type == "full_attention" else None
 
+        # logger.info(
+        #     "[DecoderLayer %d] layer_type=%s | old_kv passed in=%s | ok (forwarded)=%s",
+        #     self.layer_idx,
+        #     self.layer_type,
+        #     old_kv is not None,
+        #     ok is not None,
+        # )
+
         # When `status == 1` the attention layer will select a subset of
         # query rows (imp_indices). Pre-size the output to the full sequence
         # so we can write back into it by index.
@@ -1208,6 +1280,7 @@ class Qwen3NextModel(nn.Module):
         # behaves identically to the upstream Qwen3Next in the normal case.
         self.cache_fuse_metadata: dict = {
             "check_layers": [1],
+            "log":True,
             "check": False,
             "recomp_ratios": [0.16],
             "recomp_ratio": 0.16,
@@ -1222,6 +1295,8 @@ class Qwen3NextModel(nn.Module):
             "prob_attn": False,
             "attn_matrix": [],
             "layer_idx": 0,
+            "org_pos": None,   # ← add this line
+            "fake_q": None,    # ← add this line
         }
         self.old_kvs: list[list[torch.Tensor | None]] = [
             [None, None] for _ in range(config.num_hidden_layers)
@@ -1256,21 +1331,38 @@ class Qwen3NextModel(nn.Module):
         # always single-sequence, so `input_ids.shape[0] > 1` is a
         # reliable prefill indicator.
         cfm = self.cache_fuse_metadata
-        is_prefill = input_ids is not None and input_ids.dim() == 1 and input_ids.shape[0] > 1
+        is_prefill = positions is not None and positions.shape[0] > 1
+        seq_len = positions.shape[0] if positions is not None else 0
         temp_status: int | None = -1  # default: decode
         check_layer_idx = 0
+        # logger.info(
+        # f"is_prefill ? {is_prefill} | "
+        # f"input_ids shape={input_ids.shape if input_ids is not None else None} | "
+        # f"kvlink={cfm.get('kvlink')}"
+        # )
+
+
+
+        # if (
+        #     cfm.get("kvlink") is not None
+        #     and len(cfm["kvlink"]) > 0
+        #     and seq_len > 0
+        #     and max(cfm["kvlink"]) >= seq_len
+        # ):
+        #     cfm["kvlink"] = []   # disarms kvlink for this chunk
+
         if is_prefill:
             temp_status = 0  # full prefill
             if cfm["check"]:
-                cfm["org_seq_len"] = input_ids.shape[0]
+                cfm["org_seq_len"] = seq_len
                 cfm["fake_q"] = None
                 cfm["attn_bias"] = None
                 cfm["imp_indices"] = None
                 cfm["original_slot_mapping"] = None
                 cfm["our_slot_mapping"] = None
                 cfm["org_pos"] = positions[:]
-            if cfm["kvlink"] is not None:
-                cfm["org_seq_len"] = input_ids.shape[0]
+            if cfm["kvlink"] is not None :
+                cfm["org_seq_len"] = seq_len
                 cfm["fake_q"] = None
                 cfm["attn_bias"] = None
                 cfm["original_slot_mapping"] = None
@@ -1281,8 +1373,8 @@ class Qwen3NextModel(nn.Module):
                     cfm["kvlink"], device=positions.device, dtype=torch.long
                 )
                 cfm["imp_indices"] = imp_indices
-                positions = positions[imp_indices]
-                hidden_states = hidden_states[imp_indices]
+                # positions = positions[imp_indices]
+                # hidden_states = hidden_states[imp_indices]
 
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -1304,6 +1396,16 @@ class Qwen3NextModel(nn.Module):
                 if layer_cfm is not None and getattr(layer, "layer_type", None) == "full_attention"
                 else None
             )
+            # logger.info(
+            #     "[Model layer %d] layer_type=%s | layer_cfm active=%s | "
+            #     "layer_old_kv passed=%s | old_kvs[0] is None=%s | old_kvs[1] is None=%s",
+            #     layer_idx,
+            #     getattr(layer, "layer_type", "unknown"),
+            #     layer_cfm is not None,
+            #     layer_old_kv is not None,
+            #     self.old_kvs[layer_idx][0] is None if layer_old_kv is not None else "N/A",
+            #     self.old_kvs[layer_idx][1] is None if layer_old_kv is not None else "N/A",
+            # )
 
             hidden_states, residual = layer(
                 positions=positions,
@@ -1673,7 +1775,6 @@ def fused_gdn_gating_kernel(
     tl.store(
         beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
     )
-
 
 def fused_gdn_gating(
     A_log: torch.Tensor,

@@ -121,14 +121,13 @@ def set_old_kvs(llm: LLM, old_kvs: list[list[torch.Tensor]]) -> None:
             else:
                 new_kvs.append(
                     [
-                        pair[0].to(device=device, dtype=dtype),
-                        pair[1].to(device=device, dtype=dtype),
+                        pair[0].to(device=device, dtype=dtype).contiguous(),
+                        pair[1].to(device=device, dtype=dtype).contiguous(),
                     ]
                 )
         lang_model.old_kvs = new_kvs
 
     llm.apply_model(_apply)
-
 
 def reset_layer_hack_kv(llm: LLM) -> None:
     """Clear every layer's `hack_kv` and reset `old_kvs` to empty slots."""
@@ -350,6 +349,7 @@ class EvalEngine:
                 collect=True,
                 check=False,
                 kvlink=None,
+                log=False    
             )
             sampling_params = SamplingParams(temperature=0, max_tokens=1)
 
@@ -361,6 +361,7 @@ class EvalEngine:
                     use_tqdm=False,
                 )
                 per_layer_kv = collect_hack_kv(llm)
+                
 
                 for j, pair in enumerate(per_layer_kv):
                     if pair[0] is None:
@@ -384,87 +385,99 @@ class EvalEngine:
                             old_kvs[j][1] = torch.cat((old_kvs[j][1], temp_v), dim=0)
 
                 set_old_kvs(llm, old_kvs)
+                # print(f"Old kv total number of values {len(old_kvs)}")
+                # print(old_kvs)
+                # --- Step 2: second inference for performance evaluation ---
+                # --- Step 2: second inference for performance evaluation ---
+                logger.info("Second inference for performance evaluation")
+                start_offset = [0]
+                for _token_ids in token_ids:
+                    start_offset.append(start_offset[-1] + len(_token_ids))
+                if configs.approach == "naive":
+                    set_cache_fuse_flags(
+                        llm,
+                        kvlink=[start_offset[-1] - 1],
+                        check=False,
+                        collect=False,
+                    )
+                elif "kvlink" in configs.approach:
+                    recomp_num = int(configs.approach.split("-")[-1])
+                    temp: list[int] = []
+                    for i in range(1, len(start_offset) - 1):
+                        if i == len(start_offset) - 2:
+                            temp += list(range(start_offset[i], start_offset[i + 1]))
+                        else:
+                            temp += list(
+                                range(start_offset[i], start_offset[i] + recomp_num)
+                            )
+                    set_cache_fuse_flags(
+                        llm,
+                        kvlink=temp,
+                        check=False,
+                        collect=False,
+                        log=False
+                    )
+                elif "cacheblend" in configs.approach:
+                    recomp_ratio = int(configs.approach.split("-")[-1]) / 100
+                    set_cache_fuse_flags(
+                        llm,
+                        kvlink=None,
+                        check=True,
+                        collect=False,
+                        recomp_ratio=recomp_ratio,
+                    )
+                elif configs.approach == "fr":
+                    set_cache_fuse_flags(
+                        llm,
+                        kvlink=None,
+                        check=False,
+                        collect=False,
+                    )
+                else:
+                    raise ValueError(f"Invalid approach: {configs.approach}")
 
-            # --- Step 2: second inference for performance evaluation ---
-            logger.debug("Second inference for performance evaluation")
-            start_offset = [0]
-            for _token_ids in token_ids:
-                start_offset.append(start_offset[-1] + len(_token_ids))
+                sampling_params = SamplingParams(
+                    temperature=0,
+                    max_tokens=1024 if configs.dataset == "multi_news" else 512,
+                    skip_special_tokens=True,
+                )
+                import time as _time
+                torch.cuda.synchronize()
+                _t0 = _time.perf_counter()
+                ttft_sampling_params = SamplingParams(
+                    temperature=0,
+                    max_tokens=1,
+                    skip_special_tokens=True,
+                )
+                _ = llm.generate(
+                    sampling_params=ttft_sampling_params,
+                    prompts=[{"prompt_token_ids": input_ids}],
+                    use_tqdm=False,
+                )
+                torch.cuda.synchronize()
+                ttft_measured = _time.perf_counter() - _t0
 
-            if configs.approach == "naive":
-                # Only recompute the last token.
-                set_cache_fuse_flags(
-                    llm,
-                    kvlink=[start_offset[-1] - 1],
-                    check=False,
-                    collect=False,
-                )
-            elif "kvlink" in configs.approach:
-                recomp_num = int(configs.approach.split("-")[-1])
-                temp: list[int] = []
-                for i in range(1, len(start_offset) - 1):
-                    if i == len(start_offset) - 2:
-                        temp += list(range(start_offset[i], start_offset[i + 1]))
-                    else:
-                        temp += list(
-                            range(start_offset[i], start_offset[i] + recomp_num)
-                        )
-                set_cache_fuse_flags(
-                    llm,
-                    kvlink=temp,
-                    check=False,
-                    collect=False,
-                )
-            elif "cacheblend" in configs.approach:
-                recomp_ratio = int(configs.approach.split("-")[-1]) / 100
+                # ← ADD THIS: reset to fully neutral state before the decode-only
+                # full generate, so the decode step doesn't see stale kvlink/check flags.
                 set_cache_fuse_flags(
                     llm,
                     kvlink=None,
-                    check=True,
-                    collect=False,
-                    recomp_ratio=recomp_ratio,
-                )
-            elif configs.approach == "fr":
-                set_cache_fuse_flags(
-                    llm,
-                    kvlink=None,
                     check=False,
                     collect=False,
+                    org_pos=None,
+                    fake_q=None,
+                    imp_indices=None,
+                    org_seq_len=None,
+                    log=False,
                 )
-            else:
-                raise ValueError(f"Invalid approach: {configs.approach}")
+                reset_layer_hack_kv(llm) 
 
-            # Qwen3.5 may emit <think>...</think> before the answer; we both
-            # disable thinking via the chat-template prefix and give some
-            # extra headroom in case it slips through.
-            sampling_params = SamplingParams(
-                temperature=0,
-                max_tokens=1024 if configs.dataset == "multi_news" else 512,
-                skip_special_tokens=True,
-            )
-            import time as _time
-            torch.cuda.synchronize()
-            _t0 = _time.perf_counter()
-            # Force ttft measurement: only generate the first token here.
-            ttft_sampling_params = SamplingParams(
-                temperature=0,
-                max_tokens=1,
-                skip_special_tokens=True,
-            )
-            _ = llm.generate(
-                sampling_params=ttft_sampling_params,
-                prompts=[{"prompt_token_ids": input_ids}],
-                use_tqdm=False,
-            )
-            torch.cuda.synchronize()
-            ttft_measured = _time.perf_counter() - _t0
-
-            # Now generate the full answer for accuracy scoring.
-            output = llm.generate(
-                sampling_params=sampling_params,
-                prompts=[{"prompt_token_ids": input_ids}],
-                use_tqdm=False,
-            )
+                # Now generate the full answer for accuracy scoring.
+                output = llm.generate(
+                    sampling_params=sampling_params,
+                    prompts=[{"prompt_token_ids": input_ids}],
+                    use_tqdm=False,
+                )
             generated_text = output[0].outputs[0].text
 
             # Chat models (e.g. Qwen2.5 / Qwen3.5) emit a new turn after the
