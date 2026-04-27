@@ -305,13 +305,13 @@ class XFormersImpl(AttentionImpl):
         v = value[:num_actual_tokens] if value is not None else None
 
         key_old = old_kv[0].view(-1, self.num_kv_heads, self.head_size)
-        
+
         value_old = old_kv[1].view(-1, self.num_kv_heads, self.head_size)
 
         # --- Chunked prefill guard ---
         # If this chunk doesn't cover the full sequence and kvlink is already
         # consumed, this is a continuation chunk — fall back to standard attention.
-        # This reverts to standard computation if the shape is different , which is the next set of tokens ig 
+        # This reverts to standard computation if the shape is different , which is the next set of tokens ig
         kvlink_list = cache_fuse_metadata.get("kvlink") or []
         is_continuation_chunk = (
             num_actual_tokens < key_old.shape[0]
@@ -319,9 +319,14 @@ class XFormersImpl(AttentionImpl):
             and not kvlink_active
         )
         if is_continuation_chunk:
-            self._write_kv_cache(layer, key, value, kv_cache, attn_metadata.slot_mapping)
+            self._write_kv_cache(
+                layer, key, value, kv_cache, attn_metadata.slot_mapping
+            )
             self._run_standard_attention(
-                layer, q, k, v,
+                layer,
+                q,
+                k,
+                v,
                 output[:num_actual_tokens],
                 kv_cache,
                 attn_metadata,
@@ -334,7 +339,7 @@ class XFormersImpl(AttentionImpl):
             #     f"Guard check: num_actual_tokens={num_actual_tokens}, "
             #     f"key_old.shape[0]={key_old.shape[0]}, "
             #     f"kvlink_list len={len(kvlink_list)}, "
-            #     f"kvlink_active={kvlink_active}, "  
+            #     f"kvlink_active={kvlink_active}, "
             #     f"status={status}"
             # )
 
@@ -344,13 +349,19 @@ class XFormersImpl(AttentionImpl):
                 # a continuation chunk of a chunked prefill. The kvlink indices
                 # were built for the full sequence; fall back to standard attention
                 # for this chunk.
-                self._write_kv_cache(layer, key, value, kv_cache, attn_metadata.slot_mapping)
-                self._run_standard_attention(layer, q, k, v, output[:num_actual_tokens], kv_cache, attn_metadata)
+                self._write_kv_cache(
+                    layer, key, value, kv_cache, attn_metadata.slot_mapping
+                )
+                self._run_standard_attention(
+                    layer, q, k, v, output[:num_actual_tokens], kv_cache, attn_metadata
+                )
                 return output
 
             imp_indices = cache_fuse_metadata["kvlink"]
             if not isinstance(imp_indices, torch.Tensor):
-                imp_indices = torch.tensor(imp_indices, dtype=torch.long, device=k.device)
+                imp_indices = torch.tensor(
+                    imp_indices, dtype=torch.long, device=k.device
+                )
 
             # imp_indices are absolute positions in the full sequence.
             # Only keep those that fall within this chunk.
@@ -358,8 +369,12 @@ class XFormersImpl(AttentionImpl):
 
             if imp_indices.numel() == 0:
                 # No kvlink indices land in this chunk — standard attention.
-                self._write_kv_cache(layer, key, value, kv_cache, attn_metadata.slot_mapping)
-                self._run_standard_attention(layer, q, k, v, output[:num_actual_tokens], kv_cache, attn_metadata)
+                self._write_kv_cache(
+                    layer, key, value, kv_cache, attn_metadata.slot_mapping
+                )
+                self._run_standard_attention(
+                    layer, q, k, v, output[:num_actual_tokens], kv_cache, attn_metadata
+                )
                 return output
 
             key_old[imp_indices] = k[imp_indices]
@@ -604,30 +619,17 @@ def _make_partial_bias(
 def _make_partial_bias_mha(
     cache_fuse_metadata: dict, device: torch.device, num_kv_heads: int
 ) -> torch.Tensor:
+    """Partial causal bias for multi-head attention (batch size == 1)."""
     seq_len = cache_fuse_metadata["org_seq_len"]
     padded_len = (seq_len + 7) // 8 * 8
     dtype = cache_fuse_metadata["kv_cache_dtype"]
     imp_indices = cache_fuse_metadata["imp_indices"]
-
-    # Do ALL filtering on CPU to avoid async CUDA assert propagation.
-    if isinstance(imp_indices, torch.Tensor):
-        imp_indices_list = imp_indices.cpu().tolist()
-    else:
-        imp_indices_list = list(imp_indices)
-    # Filter: keep only indices that are valid for both padded_len and seq_len.
-    imp_indices_list = [int(i) for i in imp_indices_list if 0 <= int(i) < seq_len]
-    imp_indices_cpu = torch.tensor(imp_indices_list, dtype=torch.long)
-
     attn_mask = torch.triu(
         torch.ones(padded_len, padded_len, dtype=dtype, device=device),
         diagonal=1,
     )
-    attn_mask = (attn_mask * torch.finfo(dtype).min).view(
-        1, 1, padded_len, padded_len
-    )
-    # Index on CPU-derived indices, moved to device only for the expand/return.
-    imp_indices_gpu = imp_indices_cpu.to(device)
-    attn_mask = attn_mask[:, :, imp_indices_gpu]
+    attn_mask = (attn_mask * torch.finfo(dtype).min).view(1, 1, padded_len, padded_len)
+    attn_mask = attn_mask[:, :, imp_indices]
     attn_mask = attn_mask.expand(1, num_kv_heads, -1, -1)
     return attn_mask[:, :, :, :seq_len]
 
@@ -638,20 +640,11 @@ def _make_partial_bias_gqa(
     num_kv_heads: int,
     num_queries_per_kv: int,
 ) -> torch.Tensor:
+    """Partial causal bias for grouped-query attention (batch size == 1)."""
     seq_len = cache_fuse_metadata["org_seq_len"]
     padded_len = (seq_len + 7) // 8 * 8
     dtype = cache_fuse_metadata["kv_cache_dtype"]
     imp_indices = cache_fuse_metadata["imp_indices"]
-
-    # Do ALL filtering on CPU to avoid async CUDA assert propagation.
-    if isinstance(imp_indices, torch.Tensor):
-        imp_indices_list = imp_indices.cpu().tolist()
-    else:
-        imp_indices_list = list(imp_indices)
-    # Filter: keep only indices that are valid for both padded_len and seq_len.
-    imp_indices_list = [int(i) for i in imp_indices_list if 0 <= int(i) < seq_len]
-    imp_indices_cpu = torch.tensor(imp_indices_list, dtype=torch.long)
-
     attn_mask = torch.triu(
         torch.ones(padded_len, padded_len, dtype=dtype, device=device),
         diagonal=1,
@@ -659,7 +652,6 @@ def _make_partial_bias_gqa(
     attn_mask = (attn_mask * torch.finfo(dtype).min).view(
         1, 1, 1, padded_len, padded_len
     )
-    imp_indices_gpu = imp_indices_cpu.to(device)
-    attn_mask = attn_mask[:, :, :, imp_indices_gpu]
+    attn_mask = attn_mask[:, :, :, imp_indices]
     attn_mask = attn_mask.expand(1, num_kv_heads, num_queries_per_kv, -1, -1)
     return attn_mask[:, :, :, :, :seq_len]

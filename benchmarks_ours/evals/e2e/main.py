@@ -384,100 +384,97 @@ class EvalEngine:
                             old_kvs[j][0] = torch.cat((old_kvs[j][0], temp_k), dim=0)
                             old_kvs[j][1] = torch.cat((old_kvs[j][1], temp_v), dim=0)
 
-                set_old_kvs(llm, old_kvs)
-                # print(f"Old kv total number of values {len(old_kvs)}")
-                # print(old_kvs)
-                # --- Step 2: second inference for performance evaluation ---
-                # --- Step 2: second inference for performance evaluation ---
-                logger.info("Second inference for performance evaluation")
-                start_offset = [0]
-                for _token_ids in token_ids:
-                    start_offset.append(start_offset[-1] + len(_token_ids))
-                if configs.approach == "naive":
-                    set_cache_fuse_flags(
-                        llm,
-                        kvlink=[start_offset[-1] - 1],
-                        check=False,
-                        collect=False,
-                    )
-                elif "kvlink" in configs.approach:
-                    recomp_num = int(configs.approach.split("-")[-1])
-                    temp: list[int] = []
-                    for i in range(1, len(start_offset) - 1):
-                        if i == len(start_offset) - 2:
-                            temp += list(range(start_offset[i], start_offset[i + 1]))
-                        else:
-                            temp += list(
-                                range(start_offset[i], start_offset[i] + recomp_num)
-                            )
-                    set_cache_fuse_flags(
-                        llm,
-                        kvlink=temp,
-                        check=False,
-                        collect=False,
-                        log=False
-                    )
-                elif "cacheblend" in configs.approach:
-                    recomp_ratio = int(configs.approach.split("-")[-1]) / 100
-                    set_cache_fuse_flags(
-                        llm,
-                        kvlink=None,
-                        check=True,
-                        collect=False,
-                        recomp_ratio=recomp_ratio,
-                    )
-                elif configs.approach == "fr":
-                    set_cache_fuse_flags(
-                        llm,
-                        kvlink=None,
-                        check=False,
-                        collect=False,
-                    )
-                else:
-                    raise ValueError(f"Invalid approach: {configs.approach}")
-
-                sampling_params = SamplingParams(
-                    temperature=0,
-                    max_tokens=1024 if configs.dataset == "multi_news" else 512,
-                    skip_special_tokens=True,
+            set_old_kvs(llm, old_kvs)
+            # --- Step 2: second inference for performance evaluation ---
+            logger.info("Second inference for performance evaluation")
+            start_offset = [0]
+            for _token_ids in token_ids:
+                start_offset.append(start_offset[-1] + len(_token_ids))
+            if configs.approach == "naive":
+                set_cache_fuse_flags(
+                    llm,
+                    kvlink=[start_offset[-1] - 1],
+                    check=False,
+                    collect=False,
                 )
-                import time as _time
-                torch.cuda.synchronize()
-                _t0 = _time.perf_counter()
-                ttft_sampling_params = SamplingParams(
-                    temperature=0,
-                    max_tokens=1,
-                    skip_special_tokens=True,
+            elif "kvlink" in configs.approach:
+                recomp_num = int(configs.approach.split("-")[-1])
+                temp: list[int] = []
+                for _i in range(1, len(start_offset) - 1):
+                    if _i == len(start_offset) - 2:
+                        temp += list(range(start_offset[_i], start_offset[_i + 1]))
+                    else:
+                        temp += list(
+                            range(start_offset[_i], start_offset[_i] + recomp_num)
+                        )
+                set_cache_fuse_flags(
+                    llm,
+                    kvlink=temp,
+                    check=False,
+                    collect=False,
+                    log=False
                 )
-                _ = llm.generate(
-                    sampling_params=ttft_sampling_params,
-                    prompts=[{"prompt_token_ids": input_ids}],
-                    use_tqdm=False,
+            elif "cacheblend" in configs.approach:
+                recomp_ratio = int(configs.approach.split("-")[-1]) / 100
+                set_cache_fuse_flags(
+                    llm,
+                    kvlink=None,
+                    check=True,
+                    collect=False,
+                    recomp_ratio=recomp_ratio,
                 )
-                torch.cuda.synchronize()
-                ttft_measured = _time.perf_counter() - _t0
-
-                # ← ADD THIS: reset to fully neutral state before the decode-only
-                # full generate, so the decode step doesn't see stale kvlink/check flags.
+            elif configs.approach == "fr":
                 set_cache_fuse_flags(
                     llm,
                     kvlink=None,
                     check=False,
                     collect=False,
-                    org_pos=None,
-                    fake_q=None,
-                    imp_indices=None,
-                    org_seq_len=None,
-                    log=False,
                 )
-                reset_layer_hack_kv(llm) 
+            else:
+                raise ValueError(f"Invalid approach: {configs.approach}")
 
-                # Now generate the full answer for accuracy scoring.
-                output = llm.generate(
-                    sampling_params=sampling_params,
-                    prompts=[{"prompt_token_ids": input_ids}],
-                    use_tqdm=False,
-                )
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=1024 if configs.dataset == "multi_news" else 512,
+                skip_special_tokens=True,
+            )
+            import time as _time
+            torch.cuda.synchronize()
+            _t0 = _time.perf_counter()
+            ttft_sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=1,
+                skip_special_tokens=True,
+            )
+            _ = llm.generate(
+                sampling_params=ttft_sampling_params,
+                prompts=[{"prompt_token_ids": input_ids}],
+                use_tqdm=False,
+            )
+            torch.cuda.synchronize()
+            ttft_measured = _time.perf_counter() - _t0
+
+            # Reset to fully neutral state before the decode-only full generate,
+            # so the decode step doesn't see stale kvlink/check flags.
+            set_cache_fuse_flags(
+                llm,
+                kvlink=None,
+                check=False,
+                collect=False,
+                org_pos=None,
+                fake_q=None,
+                imp_indices=None,
+                org_seq_len=None,
+                log=False,
+            )
+            reset_layer_hack_kv(llm)
+
+            # Now generate the full answer for accuracy scoring.
+            output = llm.generate(
+                sampling_params=sampling_params,
+                prompts=[{"prompt_token_ids": input_ids}],
+                use_tqdm=False,
+            )
             generated_text = output[0].outputs[0].text
 
             # Chat models (e.g. Qwen2.5 / Qwen3.5) emit a new turn after the
