@@ -594,15 +594,20 @@ class LlamaModel(nn.Module):
             layer_cfm = cfm if (cfm["check"] or cfm["kvlink"] is not None or cfm["collect"]) else None
             layer_old_kv = self.old_kvs[layer_idx] if layer_cfm is not None else None
 
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-                cache_fuse_metadata=layer_cfm,
-                status=layer_status,
-                old_kv=layer_old_kv,
-                **extra_layer_kwargs,
-            )
+            if layer_cfm is not None:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    cache_fuse_metadata=layer_cfm,
+                    status=layer_status,
+                    old_kv=layer_old_kv,
+                    **extra_layer_kwargs,
+                )
+            else:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, **extra_layer_kwargs
+                )
 
             # After the check layer (status==1), slice positions to match the
             # reduced token set so subsequent layers stay aligned.
