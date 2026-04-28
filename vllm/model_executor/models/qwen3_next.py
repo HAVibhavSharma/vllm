@@ -962,48 +962,68 @@ class Qwen3NextAttention(nn.Module):
 
                 old_seq_len = old_k_2d.shape[0]
 
-                # Slice positions to match old_k length.
-                # MRoPE: positions is [3, full_seq_len]; standard: [full_seq_len].
+                # How many positions are available in the current forward call.
+                # In chunked prefill, org_pos only covers the current chunk
+                # (e.g. tokens 0..16383 of a 17480-token prompt), so it can be
+                # shorter than old_kv.  Passing a truncated pos_for_old_kv to
+                # rotary_emb while fake_q/old_k have old_seq_len rows causes the
+                # CUDA kernel to read pos[chunk_len..old_seq_len-1] out-of-bounds
+                # → cudaErrorIllegalAddress.  When positions don't cover old_kv
+                # we skip the re-application: the kvlink path always falls back to
+                # standard attention whenever num_actual_tokens < old_seq_len, so
+                # old_kv is never used for computation in that case.
                 if org_pos.dim() == 2:
-                    pos_for_old_kv = org_pos[:, :old_seq_len].contiguous()
+                    available_pos_len = org_pos.shape[1]
                 else:
-                    pos_for_old_kv = org_pos[:old_seq_len].contiguous()
+                    available_pos_len = org_pos.shape[0]
 
-                # fake_q must match old_k token count and be contiguous.
-                fake_q = cache_fuse_metadata.get("fake_q")
-                if fake_q is None or fake_q.shape[0] != old_seq_len:
-                    cache_fuse_metadata["fake_q"] = torch.rand(
-                        (old_seq_len,) + q.shape[1:],
-                        dtype=q.dtype,
-                        device=q.device,
-                    ).contiguous()
+                if available_pos_len < old_seq_len:
+                    # Chunked-prefill continuation: not enough positions to
+                    # re-apply RoPE safely.  old_kv is unused this step.
+                    pass
+                else:
+                    # Slice positions to match old_k length.
+                    # MRoPE: positions is [3, full_seq_len]; standard: [full_seq_len].
+                    if org_pos.dim() == 2:
+                        pos_for_old_kv = org_pos[:, :old_seq_len].contiguous()
+                    else:
+                        pos_for_old_kv = org_pos[:old_seq_len].contiguous()
 
-                if cache_fuse_metadata.get("log"):
-                    logger.info(
-                        "[old_kv USED] Re-applying RoPE to old_kv[0] | "
-                        "status=%s | kvlink=%s | old_k_2d shape=%s | "
-                        "pos_for_old_kv shape=%s | fake_q shape=%s | "
-                        "old_k_2d is_contiguous=%s | pos_for_old_kv is_contiguous=%s",
-                        status,
-                        _kvlink_present,
-                        old_k_2d.shape,
-                        pos_for_old_kv.shape,
-                        cache_fuse_metadata["fake_q"].shape,
-                        old_k_2d.is_contiguous(),
-                        pos_for_old_kv.is_contiguous(),
+                    # fake_q must match old_k token count and be contiguous.
+                    fake_q = cache_fuse_metadata.get("fake_q")
+                    if fake_q is None or fake_q.shape[0] != old_seq_len:
+                        cache_fuse_metadata["fake_q"] = torch.rand(
+                            (old_seq_len,) + q.shape[1:],
+                            dtype=q.dtype,
+                            device=q.device,
+                        ).contiguous()
+
+                    if cache_fuse_metadata.get("log"):
+                        logger.info(
+                            "[old_kv USED] Re-applying RoPE to old_kv[0] | "
+                            "status=%s | kvlink=%s | old_k_2d shape=%s | "
+                            "pos_for_old_kv shape=%s | fake_q shape=%s | "
+                            "old_k_2d is_contiguous=%s | pos_for_old_kv is_contiguous=%s",
+                            status,
+                            _kvlink_present,
+                            old_k_2d.shape,
+                            pos_for_old_kv.shape,
+                            cache_fuse_metadata["fake_q"].shape,
+                            old_k_2d.is_contiguous(),
+                            pos_for_old_kv.is_contiguous(),
+                        )
+
+                    _, rotated_k = self.rotary_emb(
+                        pos_for_old_kv,
+                        cache_fuse_metadata["fake_q"],
+                        old_k_2d,
                     )
 
-                _, rotated_k = self.rotary_emb(
-                    pos_for_old_kv,
-                    cache_fuse_metadata["fake_q"],
-                    old_k_2d,
-                )
-
-                # Store back — ensure contiguous and in correct shape.
-                if old_k_was_3d:
-                    old_kv[0] = rotated_k.reshape(old_k.shape).contiguous()
-                else:
-                    old_kv[0] = rotated_k.contiguous()
+                    # Store back — ensure contiguous and in correct shape.
+                    if old_k_was_3d:
+                        old_kv[0] = rotated_k.reshape(old_k.shape).contiguous()
+                    else:
+                        old_kv[0] = rotated_k.contiguous()
 
             else:
                 if cache_fuse_metadata.get("log"):
