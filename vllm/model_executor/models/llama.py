@@ -56,8 +56,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+
+logger = init_logger(__name__)
 
 from .adapters import as_embedding_model, as_seq_cls_model
 from .interfaces import (
@@ -180,6 +183,10 @@ class LlamaAttention(nn.Module):
 
         self._init_rotary_emb(config, quant_config=quant_config)
 
+        # CacheBlend / KVLink: stores raw K/V collected during the collect
+        # pass so the driver can read them between generate() calls.
+        self.hack_kv: list[torch.Tensor] = []
+
         sliding_window = None
         if layer_types := getattr(config, "layer_types", None):
             # Fix for Eagle3 compatibility:
@@ -223,11 +230,85 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        cache_fuse_metadata: dict | None = None,
+        status: int | None = None,
+        old_kv: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # CacheBlend / KVLink: re-apply RoPE to cached old_kv at global
+        # positions so it aligns with the full concatenated sequence.
+        if cache_fuse_metadata is not None and old_kv is not None:
+            _kvlink_present = cache_fuse_metadata.get("kvlink") is not None
+            _org_pos_present = cache_fuse_metadata.get("org_pos") is not None
+            if (_kvlink_present or status in (1, 2)) and _org_pos_present:
+                old_k = old_kv[0]
+                org_pos = cache_fuse_metadata["org_pos"]
+
+                old_k_was_3d = (old_k.dim() == 3)
+                if old_k_was_3d:
+                    old_k_2d = old_k.reshape(old_k.shape[0], -1).contiguous()
+                else:
+                    old_k_2d = old_k.contiguous()
+
+                old_seq_len = old_k_2d.shape[0]
+
+                # Guard against chunked prefill: org_pos may only cover the
+                # current chunk, not the full sequence. Applying RoPE with a
+                # truncated position tensor causes OOB CUDA reads.
+                if org_pos.dim() == 2:
+                    available_pos_len = org_pos.shape[1]
+                else:
+                    available_pos_len = org_pos.shape[0]
+
+                if available_pos_len >= old_seq_len:
+                    if org_pos.dim() == 2:
+                        pos_for_old_kv = org_pos[:, :old_seq_len].contiguous()
+                    else:
+                        pos_for_old_kv = org_pos[:old_seq_len].contiguous()
+
+                    fake_q = cache_fuse_metadata.get("fake_q")
+                    if fake_q is None or fake_q.shape[0] != old_seq_len:
+                        cache_fuse_metadata["fake_q"] = torch.rand(
+                            (old_seq_len,) + q.shape[1:],
+                            dtype=q.dtype,
+                            device=q.device,
+                        ).contiguous()
+
+                    _, rotated_k = self.rotary_emb(
+                        pos_for_old_kv,
+                        cache_fuse_metadata["fake_q"],
+                        old_k_2d,
+                    )
+
+                    if old_k_was_3d:
+                        old_kv[0] = rotated_k.reshape(old_k.shape).contiguous()
+                    else:
+                        old_kv[0] = rotated_k.contiguous()
+
         q, k = self.rotary_emb(positions, q, k)
+
+        # Stash CacheBlend/KVLink state on the attn wrapper so XFormersImpl
+        # can read it without extra forward() arguments.
+        if cache_fuse_metadata is not None:
+            self.attn.cache_fuse_metadata = cache_fuse_metadata
+            self.attn.status = status
+            self.attn.old_kv = old_kv
+        else:
+            self.attn.cache_fuse_metadata = None
+            self.attn.status = None
+            self.attn.old_kv = None
+
         attn_output = self.attn(q, k, v)
+
+        # Forward hack_kv collected by XFormersImpl up to this module so the
+        # driver can read it at layer.self_attn.hack_kv.
+        hack_kv = getattr(self.attn, "hack_kv", None)
+        if hack_kv is not None:
+            self.hack_kv = hack_kv
+            self.attn.hack_kv = None
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -317,6 +398,10 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        cache_fuse_metadata: dict | None = None,
+        status: int | None = None,
+        old_kv: list | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -324,7 +409,21 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            cache_fuse_metadata=cache_fuse_metadata,
+            status=status,
+            old_kv=old_kv,
+        )
+
+        # CacheBlend status==1: attention wrote output only for imp_indices
+        # rows; slice residual to match before the MLP.
+        if status == 1 and cache_fuse_metadata is not None:
+            imp_indices = cache_fuse_metadata.get("imp_indices")
+            if imp_indices is not None:
+                residual = residual[imp_indices]
+                hidden_states = hidden_states[: imp_indices.shape[0]]
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -395,6 +494,32 @@ class LlamaModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        # CacheBlend / KVLink research hooks. All flags are off by default so
+        # this model behaves identically to upstream Llama in normal usage.
+        self.cache_fuse_metadata: dict = {
+            "check_layers": [1],
+            "log": False,
+            "check": False,
+            "recomp_ratios": [0.16],
+            "recomp_ratio": 0.16,
+            "original_slot_mapping": None,
+            "our_slot_mapping": None,
+            "kv_cache_dtype": None,
+            "attn_bias": None,
+            "imp_indices": None,
+            "org_seq_len": None,
+            "collect": False,
+            "kvlink": None,
+            "prob_attn": False,
+            "attn_matrix": [],
+            "layer_idx": 0,
+            "org_pos": None,
+            "fake_q": None,
+        }
+        self.old_kvs: list[list[torch.Tensor | None]] = [
+            [None, None] for _ in range(config.num_hidden_layers)
+        ]
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -417,15 +542,72 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        # ---- CacheBlend / KVLink orchestration --------------------------
+        cfm = self.cache_fuse_metadata
+        is_prefill = positions is not None and positions.shape[0] > 1
+        seq_len = positions.shape[0] if positions is not None else 0
+        temp_status: int | None = -1  # decode by default
+        check_layer_idx = 0
+
+        if is_prefill:
+            temp_status = 0
+            if cfm["check"]:
+                cfm["org_seq_len"] = seq_len
+                cfm["fake_q"] = None
+                cfm["attn_bias"] = None
+                cfm["imp_indices"] = None
+                cfm["original_slot_mapping"] = None
+                cfm["our_slot_mapping"] = None
+                cfm["org_pos"] = positions[:]
+            if cfm["kvlink"] is not None:
+                cfm["org_seq_len"] = seq_len
+                cfm["fake_q"] = None
+                cfm["attn_bias"] = None
+                cfm["original_slot_mapping"] = None
+                cfm["our_slot_mapping"] = None
+                cfm["org_pos"] = positions[:]
+
+                imp_indices = torch.as_tensor(
+                    cfm["kvlink"], device=positions.device, dtype=torch.long
+                )
+                cfm["imp_indices"] = imp_indices
+
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
+            layer_idx = self.start_layer + idx
+
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
+
+            # Per-layer status for CacheBlend "check" mode.
+            layer_status: int | None = temp_status
+            if is_prefill and cfm["check"]:
+                if layer_idx in cfm["check_layers"]:
+                    layer_status = 1
+                    cfm["check_layer"] = cfm["check_layers"][check_layer_idx]
+                    check_layer_idx += 1
+                elif layer_idx > cfm["check_layers"][0]:
+                    layer_status = 2
+
+            layer_cfm = cfm if (cfm["check"] or cfm["kvlink"] is not None or cfm["collect"]) else None
+            layer_old_kv = self.old_kvs[layer_idx] if layer_cfm is not None else None
+
             hidden_states, residual = layer(
-                positions, hidden_states, residual, **extra_layer_kwargs
+                positions,
+                hidden_states,
+                residual,
+                cache_fuse_metadata=layer_cfm,
+                status=layer_status,
+                old_kv=layer_old_kv,
+                **extra_layer_kwargs,
             )
+
+            # After the check layer (status==1), slice positions to match the
+            # reduced token set so subsequent layers stay aligned.
+            if layer_status == 1 and cfm.get("imp_indices") is not None:
+                positions = positions[cfm["imp_indices"]]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
