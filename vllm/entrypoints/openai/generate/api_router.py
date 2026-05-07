@@ -41,6 +41,12 @@ def register_generate_api_routers(app: FastAPI):
 
     register_chunked_chat_api_router(app)
 
+    from vllm.entrypoints.openai.cached_chat.api_router import (
+        attach_router as register_cached_chat_api_router,
+    )
+
+    register_cached_chat_api_router(app)
+
     from vllm.entrypoints.anthropic.api_router import (
         attach_router as register_anthropic_api_router,
     )
@@ -65,6 +71,7 @@ async def init_generate_state(
     from vllm.entrypoints.openai.chat_completion.batch_serving import (
         OpenAIServingChatBatch,
     )
+    from vllm.entrypoints.openai.cached_chat.serving import OpenAIServingCachedChat
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
     from vllm.entrypoints.openai.chunked_chat.serving import OpenAIServingChunkedChat
     from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
@@ -144,6 +151,11 @@ async def init_generate_state(
     )
     state.openai_serving_chunked_chat = (
         OpenAIServingChunkedChat(**_chat_kwargs)
+        if "generate" in supported_tasks
+        else None
+    )
+    state.openai_serving_cached_chat = (
+        OpenAIServingCachedChat(**_chat_kwargs)
         if "generate" in supported_tasks
         else None
     )

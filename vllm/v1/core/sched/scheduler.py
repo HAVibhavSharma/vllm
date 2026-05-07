@@ -640,6 +640,34 @@ class Scheduler(SchedulerInterface):
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
 
+                    # Manual KV reuse: the cached_chat endpoint stuffs the
+                    # number of prefix tokens it has already saved into
+                    # sampling_params.extra_args. Treat them as
+                    # externally-computed so allocate_slots reserves blocks
+                    # for them but the scheduler doesn't issue a prefill.
+                    # The actual GPU copy-in happens in the model runner
+                    # hook (see _ManualKVRunnerState.inject_pending).
+                    if (
+                        num_new_local_computed_tokens == 0
+                        and num_external_computed_tokens == 0
+                        and request.sampling_params is not None
+                        and request.sampling_params.extra_args
+                    ):
+                        manual_prefilled = (
+                            request.sampling_params.extra_args.get(
+                                "manual_kv_prefilled_tokens"
+                            )
+                        )
+                        if manual_prefilled:
+                            manual_prefilled = int(manual_prefilled)
+                            # Cap at num_tokens - 1 so at least one token
+                            # is left for the first decode step.
+                            manual_prefilled = min(
+                                manual_prefilled, request.num_tokens - 1
+                            )
+                            if manual_prefilled > 0:
+                                num_external_computed_tokens = manual_prefilled
+
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens

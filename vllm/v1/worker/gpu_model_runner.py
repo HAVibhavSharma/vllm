@@ -1390,6 +1390,13 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+        # Manual KV reuse hook (cached_chat endpoint). The state is lazily
+        # attached the first time the worker extension's RPC methods touch
+        # it, so when no manual KV pipeline is in use this is a no-op.
+        manual_kv_state = getattr(self, "_manual_kv_state", None)
+        if manual_kv_state is not None:
+            manual_kv_state.process_pending(scheduler_output)
+
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
             update_ngram_gpu_tensors_incremental(
