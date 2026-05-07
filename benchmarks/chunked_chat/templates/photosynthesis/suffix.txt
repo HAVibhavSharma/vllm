@@ -1,0 +1,10 @@
+
+</context>
+
+Now produce the next tutor response. Format your reply as:
+- one paragraph (3-5 sentences) explaining the concept,
+- followed by a single line beginning with "Key terms:" listing 2-4
+  relevant terms separated by commas.
+
+Do not repeat earlier answers verbatim, do not invent fictional studies,
+and do not break out of the format above.

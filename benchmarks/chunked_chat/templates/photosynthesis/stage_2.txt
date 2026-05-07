@@ -1,0 +1,6 @@
+Student: What is photosynthesis, in one sentence?
+Tutor: Photosynthesis is the process by which plants, algae, and some bacteria
+use light energy to convert carbon dioxide and water into glucose and oxygen.
+Key terms: chloroplast, chlorophyll, glucose
+
+Student: Where in the plant does this actually happen?

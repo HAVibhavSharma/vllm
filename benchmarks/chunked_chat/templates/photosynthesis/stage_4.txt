@@ -1,0 +1,24 @@
+Student: What is photosynthesis, in one sentence?
+Tutor: Photosynthesis is the process by which plants, algae, and some bacteria
+use light energy to convert carbon dioxide and water into glucose and oxygen.
+Key terms: chloroplast, chlorophyll, glucose
+
+Student: Where in the plant does this actually happen?
+Tutor: Photosynthesis takes place primarily in the mesophyll cells of leaves,
+inside organelles called chloroplasts. The light-dependent reactions occur on
+the thylakoid membranes, while the Calvin cycle takes place in the surrounding
+stroma. Stomatal pores on the leaf surface regulate the gas exchange that both
+stages depend on.
+Key terms: mesophyll, thylakoid, stroma, stomata
+
+Student: Can you walk me through the light-dependent reactions step by step?
+Tutor: In the thylakoid membrane, photosystem II absorbs photons and excites
+electrons, which travel down an electron transport chain while protons are
+pumped into the thylakoid lumen. Photosystem I re-energizes those electrons so
+they can reduce NADP+ into NADPH. The proton gradient built up in the lumen
+drives ATP synthase to produce ATP. Water is split at photosystem II to replace
+the electrons lost upstream, releasing molecular oxygen as a byproduct.
+Key terms: photosystem II, photosystem I, NADPH, ATP synthase
+
+Student: Now contrast that with the Calvin cycle - what is its job and why
+does it depend on the products of the previous step?

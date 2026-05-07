@@ -35,6 +35,12 @@ def register_generate_api_routers(app: FastAPI):
 
     register_completion_api_router(app)
 
+    from vllm.entrypoints.openai.chunked_chat.api_router import (
+        attach_router as register_chunked_chat_api_router,
+    )
+
+    register_chunked_chat_api_router(app)
+
     from vllm.entrypoints.anthropic.api_router import (
         attach_router as register_anthropic_api_router,
     )
@@ -60,6 +66,7 @@ async def init_generate_state(
         OpenAIServingChatBatch,
     )
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.chunked_chat.serving import OpenAIServingChunkedChat
     from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
     from vllm.entrypoints.openai.fingerprint import set_default_fingerprint_mode
     from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
@@ -132,6 +139,11 @@ async def init_generate_state(
     )
     state.openai_serving_chat_batch = (
         OpenAIServingChatBatch(**_chat_kwargs)
+        if "generate" in supported_tasks
+        else None
+    )
+    state.openai_serving_chunked_chat = (
+        OpenAIServingChunkedChat(**_chat_kwargs)
         if "generate" in supported_tasks
         else None
     )
