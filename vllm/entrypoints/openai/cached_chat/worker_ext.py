@@ -214,13 +214,23 @@ class _ManualKVRunnerState:
             )
             return
 
+        sample = kv_caches[0]
+        block_dim = 1 if sample.shape[0] == 2 else 0
+        num_cache_blocks = sample.shape[block_dim]
+        max_id = max(target_block_ids)
+        if max_id >= num_cache_blocks:
+            raise RuntimeError(
+                f"manual_kv inject: block id {max_id} >= num_blocks "
+                f"{num_cache_blocks} (kv shape={tuple(sample.shape)})"
+            )
+
         for layer_idx, layer_kv in enumerate(kv_caches):
             host_buf = blob[layer_idx]
             gpu_index = torch.tensor(
                 target_block_ids, dtype=torch.long, device=layer_kv.device
             )
             src = host_buf.to(layer_kv.device, non_blocking=False)
-            layer_kv.index_copy_(0, gpu_index, src)
+            layer_kv.index_copy_(block_dim, gpu_index, src)
             del src
 
         logger.info(
@@ -253,10 +263,25 @@ class _ManualKVRunnerState:
         prefix_block_ids = block_ids[:num_blocks]
 
         kv_caches = self._kv_cache_tensors()
+        if not kv_caches:
+            return
+
+        sample = kv_caches[0]
+        block_dim = 1 if sample.shape[0] == 2 else 0
+        num_cache_blocks = sample.shape[block_dim]
+        max_id = max(prefix_block_ids)
+        if max_id >= num_cache_blocks:
+            raise RuntimeError(
+                f"manual_kv capture: block id {max_id} >= num_blocks "
+                f"{num_cache_blocks} (kv shape={tuple(sample.shape)})"
+            )
+
         per_layer: list[torch.Tensor] = []
-        index_t = torch.tensor(prefix_block_ids, dtype=torch.long)
+        index_t = torch.tensor(
+            prefix_block_ids, dtype=torch.long, device=sample.device
+        )
         for layer_kv in kv_caches:
-            gpu_view = layer_kv.index_select(0, index_t.to(layer_kv.device))
+            gpu_view = layer_kv.index_select(block_dim, index_t)
             host_buf = torch.empty(
                 gpu_view.shape, dtype=gpu_view.dtype, pin_memory=True
             )
