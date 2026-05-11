@@ -42,6 +42,7 @@ from typing import Any
 class StageResult:
     stage: int
     latency_s: float
+    ttft_s: float | None
     chunk_chars: list[int]
     prompt_tokens: int | None
     completion_tokens: int | None
@@ -170,7 +171,7 @@ def build_growing_chunks(
     return chunks, anchor_indices
 
 
-def post_chunked_chat(
+def post_chunked_chat_streaming(
     base_url: str,
     model: str,
     chunks: list[str],
@@ -179,34 +180,93 @@ def post_chunked_chat(
     temperature: float,
     timeout_s: float,
 ) -> tuple[int, dict[str, Any]]:
+    """Send a streaming chunked_chat request and measure TTFT.
+
+    Returns (status, body) where body has the following extra keys:
+        - ttft_s: time-to-first-content-token, in seconds
+        - latency_s: total elapsed time from request start to stream end
+        - output: assembled assistant text
+        - prompt_tokens / completion_tokens: from the final usage frame
+    """
     payload = {
         "model": model,
         "chunks": chunks,
         "anchor_indices": anchor_indices,
         "max_completion_tokens": max_tokens,
         "temperature": temperature,
-        "stream": False,
+        "stream": True,
+        # Ask vLLM to include usage in the final stream frame; without
+        # this many servers omit usage in streaming mode.
+        "stream_options": {"include_usage": True},
     }
     body = json.dumps(payload).encode("utf-8")
     url = f"{base_url.rstrip('/')}/v1/chunked_chat/completions"
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
         method="POST",
     )
+
+    t0 = time.perf_counter()
+    ttft: float | None = None
+    output_parts: list[str] = []
+    completion_tokens: int | None = None
+    prompt_tokens: int | None = None
+    status = 0
+    error: str | None = None
+
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             status = resp.status
-            response_body = resp.read().decode("utf-8")
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = event.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content")
+                    if content:
+                        if ttft is None:
+                            ttft = time.perf_counter() - t0
+                        output_parts.append(content)
+
+                usage = event.get("usage")
+                if usage:
+                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                    completion_tokens = usage.get(
+                        "completion_tokens", completion_tokens
+                    )
     except urllib.error.HTTPError as e:
         status = e.code
-        response_body = e.read().decode("utf-8", errors="replace")
-    try:
-        parsed = json.loads(response_body)
-    except json.JSONDecodeError:
-        parsed = {"_raw": response_body}
-    return status, parsed
+        try:
+            error = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            error = str(e)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+    elapsed = time.perf_counter() - t0
+    return status, {
+        "ttft_s": ttft,
+        "latency_s": elapsed,
+        "output": "".join(output_parts),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "_error": error,
+    }
 
 
 def run_stage(
@@ -225,8 +285,7 @@ def run_stage(
         anchor_indices = list(manifest["anchor_indices"])
     chunk_chars = [len(c) for c in chunks]
 
-    t0 = time.perf_counter()
-    status, body = post_chunked_chat(
+    status, body = post_chunked_chat_streaming(
         base_url=args.base_url,
         model=args.model,
         chunks=chunks,
@@ -235,28 +294,18 @@ def run_stage(
         temperature=args.temperature,
         timeout_s=args.timeout,
     )
-    elapsed = time.perf_counter() - t0
 
-    output = ""
-    prompt_tokens = None
-    completion_tokens = None
-    if status == 200:
-        try:
-            output = body["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError, TypeError):
-            output = ""
-        usage = body.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-    else:
-        output = json.dumps(body)[:500]
+    output = body.get("output") or ""
+    if status != 200 and not output:
+        output = (body.get("_error") or json.dumps(body))[:500]
 
     return StageResult(
         stage=stage,
-        latency_s=elapsed,
+        latency_s=float(body.get("latency_s") or 0.0),
+        ttft_s=body.get("ttft_s"),
         chunk_chars=chunk_chars,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        prompt_tokens=body.get("prompt_tokens"),
+        completion_tokens=body.get("completion_tokens"),
         output=output,
         status=status,
     )
@@ -330,8 +379,10 @@ def main() -> None:
         r = run_stage(args, templates_dir, manifest, stage)
         results.append(r)
         chars_str = "+".join(str(c) for c in r.chunk_chars)
+        ttft_str = f"{r.ttft_s:.3f}s" if r.ttft_s is not None else "n/a"
         print(
             f"[stage {stage}] status={r.status} "
+            f"ttft={ttft_str} "
             f"latency={r.latency_s:.3f}s "
             f"chunk_chars={chars_str} (total={sum(r.chunk_chars)}) "
             f"prompt_tokens={r.prompt_tokens} "
@@ -342,10 +393,17 @@ def main() -> None:
 
     print()
     print("=== summary ===")
+    print(f"  {'stage':>5}  {'ttft':>8}  {'latency':>8}  prompt_tokens")
+    baseline_ttft = results[0].ttft_s if results else None
     for r in results:
+        ttft_str = f"{r.ttft_s:.3f}s" if r.ttft_s is not None else "n/a"
+        delta = ""
+        if baseline_ttft and r.ttft_s and r.stage != results[0].stage:
+            speedup = baseline_ttft / r.ttft_s
+            delta = f"  ({speedup:.2f}× vs stage {results[0].stage})"
         print(
-            f"  stage {r.stage:>3}: {r.latency_s:7.3f}s "
-            f"prompt_tokens={r.prompt_tokens}"
+            f"  {r.stage:>5}  {ttft_str:>8}  "
+            f"{r.latency_s:7.3f}s  {r.prompt_tokens}{delta}"
         )
 
 
