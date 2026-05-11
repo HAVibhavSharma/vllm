@@ -1,0 +1,6 @@
+Student: Where exactly inside the chloroplast do the light reactions happen?
+Tutor: The light-dependent reactions take place on the thylakoid membranes,
+specifically inside the stacked discs called grana. Embedded protein
+complexes — Photosystem II, the cytochrome b6f complex, and Photosystem I —
+shuttle electrons along the chain and pump protons into the thylakoid lumen.
+

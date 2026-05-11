@@ -1,0 +1,7 @@
+Student: How does the Calvin cycle connect to those light reactions?
+Tutor: The light reactions produce ATP and NADPH, which then power the
+Calvin cycle in the stroma. The Calvin cycle fixes CO2 onto ribulose-1,5-
+bisphosphate via RuBisCO, reduces the resulting 3-phosphoglycerate using
+NADPH, and regenerates RuBP — net producing glyceraldehyde-3-phosphate
+that the plant later uses to build glucose and other sugars.
+

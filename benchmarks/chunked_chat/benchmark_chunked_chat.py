@@ -56,6 +56,34 @@ def _read_text(path: Path) -> str:
 
 
 def load_manifest(templates_dir: Path) -> dict[str, Any]:
+    """Load + validate the template manifest.
+
+    Two manifest schemas are supported:
+
+    1. Legacy "fixed-layout" mode (default):
+           {
+             "chunk_template":   ["prefix.txt", "stage_{n}.txt", "suffix.txt"],
+             "anchor_indices":   [0, 2],
+             "stages":           [1, 2, 3, 4]
+           }
+       Same set of files per stage; only `{n}` substitution differs.
+
+    2. "growing_history" mode (mimics an agentic loop):
+           {
+             "mode":                   "growing_history",
+             "static_prefix_chunks":   ["prefix.txt"],
+             "history_turn_template":  "past_turn_{n}.txt",
+             "current_turn_template":  "current_turn_{n}.txt",
+             "static_suffix_chunks":   ["suffix.txt"],
+             "stages":                 [1, 2, 3, 4]
+           }
+       Stage N composes the prompt as:
+           [static_prefix_chunks]
+           [past_turn_1, ..., past_turn_{N-1}]    ← grows by 1 per stage
+           [current_turn_N]                       ← the only dynamic chunk
+           [static_suffix_chunks]
+       All chunks except `current_turn_N` are marked as anchors.
+    """
     manifest_path = templates_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(
@@ -64,9 +92,25 @@ def load_manifest(templates_dir: Path) -> dict[str, Any]:
             "stages (list[int])."
         )
     manifest = json.loads(manifest_path.read_text())
-    for key in ("chunk_template", "anchor_indices", "stages"):
-        if key not in manifest:
-            raise ValueError(f"manifest.json missing required key: {key!r}")
+    if "stages" not in manifest:
+        raise ValueError("manifest.json missing required key: 'stages'")
+    mode = manifest.get("mode", "fixed")
+    if mode == "growing_history":
+        required = (
+            "static_prefix_chunks",
+            "history_turn_template",
+            "current_turn_template",
+            "static_suffix_chunks",
+        )
+        for key in required:
+            if key not in manifest:
+                raise ValueError(
+                    f"manifest.json (growing_history) missing required key: {key!r}"
+                )
+    else:
+        for key in ("chunk_template", "anchor_indices"):
+            if key not in manifest:
+                raise ValueError(f"manifest.json missing required key: {key!r}")
     return manifest
 
 
@@ -82,6 +126,48 @@ def build_chunks(
     per stage but their bytes don't change).
     """
     return [_read_text(templates_dir / name.format(n=stage)) for name in chunk_template]
+
+
+def build_growing_chunks(
+    templates_dir: Path,
+    manifest: dict[str, Any],
+    stage: int,
+) -> tuple[list[str], list[int]]:
+    """Compose the prompt for `growing_history` mode at this stage.
+
+    Returns `(chunks, anchor_indices)`.
+    """
+    prefix_files = list(manifest["static_prefix_chunks"])
+    suffix_files = list(manifest["static_suffix_chunks"])
+    history_template: str = manifest["history_turn_template"]
+    current_template: str = manifest["current_turn_template"]
+
+    prefix_chunks = [_read_text(templates_dir / f) for f in prefix_files]
+    history_chunks = [
+        _read_text(templates_dir / history_template.format(n=i))
+        for i in range(1, stage)
+    ]
+    current_chunks = [_read_text(templates_dir / current_template.format(n=stage))]
+    suffix_chunks = [_read_text(templates_dir / f) for f in suffix_files]
+
+    chunks = prefix_chunks + history_chunks + current_chunks + suffix_chunks
+
+    # Index layout:
+    #   [0 .. P)               = static prefix chunks
+    #   [P .. P+H)             = past history turns (static after stage 1)
+    #   [P+H .. P+H+1)         = current dynamic turn  ← NOT an anchor
+    #   [P+H+1 .. end)         = static suffix chunks
+    P = len(prefix_chunks)
+    H = len(history_chunks)
+    current_idx = P + H
+    suffix_start = current_idx + 1
+
+    anchor_indices = (
+        list(range(0, P))                   # prefixes
+        + list(range(P, P + H))             # frozen-history turns
+        + list(range(suffix_start, len(chunks)))  # suffixes
+    )
+    return chunks, anchor_indices
 
 
 def post_chunked_chat(
@@ -126,11 +212,17 @@ def post_chunked_chat(
 def run_stage(
     args: argparse.Namespace,
     templates_dir: Path,
-    chunk_template: list[str],
-    anchor_indices: list[int],
+    manifest: dict[str, Any],
     stage: int,
 ) -> StageResult:
-    chunks = build_chunks(templates_dir, chunk_template, stage)
+    mode = manifest.get("mode", "fixed")
+    if mode == "growing_history":
+        chunks, anchor_indices = build_growing_chunks(
+            templates_dir, manifest, stage
+        )
+    else:
+        chunks = build_chunks(templates_dir, manifest["chunk_template"], stage)
+        anchor_indices = list(manifest["anchor_indices"])
     chunk_chars = [len(c) for c in chunks]
 
     t0 = time.perf_counter()
@@ -208,28 +300,34 @@ def main() -> None:
     args = parse_args()
     templates_dir: Path = args.templates_dir
     manifest = load_manifest(templates_dir)
-    chunk_template: list[str] = manifest["chunk_template"]
-    anchor_indices: list[int] = manifest["anchor_indices"]
     stages: list[int] = manifest["stages"]
     topic = manifest.get("topic", templates_dir.name)
+    mode = manifest.get("mode", "fixed")
 
     print(f"=== chunked_chat benchmark: {topic} ===")
     print(f"  templates dir : {templates_dir}")
     print(f"  base url      : {args.base_url}")
     print(f"  model         : {args.model}")
-    print(f"  chunk layout  : {chunk_template}")
-    print(f"  anchor indices: {anchor_indices}")
+    print(f"  mode          : {mode}")
+    if mode == "growing_history":
+        print(f"  prefix chunks : {manifest['static_prefix_chunks']}")
+        print(f"  history tpl   : {manifest['history_turn_template']}")
+        print(f"  current tpl   : {manifest['current_turn_template']}")
+        print(f"  suffix chunks : {manifest['static_suffix_chunks']}")
+    else:
+        print(f"  chunk layout  : {manifest['chunk_template']}")
+        print(f"  anchor indices: {manifest['anchor_indices']}")
     print(f"  stages        : {stages}")
     print()
 
     if args.warmup and stages:
         print("[warmup] running stage", stages[0], "once and discarding result")
-        run_stage(args, templates_dir, chunk_template, anchor_indices, stages[0])
+        run_stage(args, templates_dir, manifest, stages[0])
         print()
 
     results: list[StageResult] = []
     for stage in stages:
-        r = run_stage(args, templates_dir, chunk_template, anchor_indices, stage)
+        r = run_stage(args, templates_dir, manifest, stage)
         results.append(r)
         chars_str = "+".join(str(c) for c in r.chunk_chars)
         print(

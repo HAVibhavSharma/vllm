@@ -1,0 +1,7 @@
+
+</context>
+
+Now produce the next tutor response. Format your reply as:
+- one paragraph (3-5 sentences) explaining the concept,
+- followed by a "Key terms:" line listing the most important specific
+  vocabulary used in your answer.
