@@ -33,6 +33,7 @@ Required server flags:
 
 import asyncio
 import hashlib
+import os
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -52,6 +53,25 @@ logger = init_logger(__name__)
 _XARG_ANCHOR_SPANS = "anchor_pool_spans"
 _XARG_ENTROPY_THRESHOLD = "anchor_pool_entropy_threshold"
 _XARG_TOP_P = "anchor_pool_top_p"
+_XARG_BLEND_ON_NO_ADMIT = "anchor_pool_blend_on_no_admit"
+_XARG_BLEND_TEMPERATURE = "anchor_pool_blend_temperature"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
 
 
 class OpenAIServingChunkedChat(OpenAIServingChat):
@@ -62,8 +82,33 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
         # Forces the worker extension to attach its state on first hit.
         self._anchor_pool_installed: bool = False
         self._anchor_pool_install_lock = asyncio.Lock()
-        self._anchor_pool_threshold: float = 0.3
-        self._anchor_pool_top_p: float = 0.9
+        self._anchor_pool_threshold: float = _env_float(
+            "ANCHOR_POOL_ENTROPY_THRESHOLD", 0.3
+        )
+        self._anchor_pool_top_p: float = _env_float(
+            "ANCHOR_POOL_TOP_P", 0.9
+        )
+        # When True, the worker extension's admit=False branch blends
+        # anchor deltas into the candidate K/V and writes the corrected
+        # tensors back into the live KV cache. This is the "Option X"
+        # accuracy-validation path — no compute saved, but exercises the
+        # reference reuse formula end-to-end so its quality vs. raw
+        # dense prefill can be measured. Controlled by env var
+        # `ANCHOR_POOL_BLEND` (default on).
+        self._anchor_pool_blend_on_no_admit: bool = _env_bool(
+            "ANCHOR_POOL_BLEND", True
+        )
+        self._anchor_pool_blend_temperature: float = _env_float(
+            "ANCHOR_POOL_BLEND_TEMPERATURE", 1.0
+        )
+        logger.info(
+            "[chunked_chat] anchor pool config: threshold=%.2f top_p=%.2f "
+            "blend=%s temperature=%.2f",
+            self._anchor_pool_threshold,
+            self._anchor_pool_top_p,
+            self._anchor_pool_blend_on_no_admit,
+            self._anchor_pool_blend_temperature,
+        )
 
     # ------------------------------------------------------------------
     # Lazy install on first request
@@ -247,13 +292,21 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
                 xargs[_XARG_ANCHOR_SPANS] = spans
                 xargs[_XARG_ENTROPY_THRESHOLD] = self._anchor_pool_threshold
                 xargs[_XARG_TOP_P] = self._anchor_pool_top_p
+                xargs[_XARG_BLEND_ON_NO_ADMIT] = (
+                    self._anchor_pool_blend_on_no_admit
+                )
+                xargs[_XARG_BLEND_TEMPERATURE] = (
+                    self._anchor_pool_blend_temperature
+                )
                 request.vllm_xargs = xargs
                 logger.info(
                     "[chunked_chat] dispatching with %d anchor spans "
-                    "(threshold=%.2f top_p=%.2f)",
+                    "(threshold=%.2f top_p=%.2f blend=%s temp=%.2f)",
                     len(spans),
                     self._anchor_pool_threshold,
                     self._anchor_pool_top_p,
+                    self._anchor_pool_blend_on_no_admit,
+                    self._anchor_pool_blend_temperature,
                 )
 
         return await self.create_chat_completion(request, raw_request)

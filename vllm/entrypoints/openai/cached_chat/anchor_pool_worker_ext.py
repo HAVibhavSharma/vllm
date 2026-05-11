@@ -56,6 +56,14 @@ logger = init_logger(__name__)
 EXTRA_KEY_ANCHOR_SPANS = "anchor_pool_spans"
 EXTRA_KEY_ENTROPY_THRESHOLD = "anchor_pool_entropy_threshold"
 EXTRA_KEY_TOP_P = "anchor_pool_top_p"
+# When True, the post-prefill `admit=False` branch blends anchor deltas
+# into the current request's K/V and writes the corrected tensors back.
+# Lets the reference reuse formula execute end-to-end on non-leading
+# anchors (e.g. the suffix in `[static, dynamic, static]` templates)
+# without needing scheduler-side hole support. No speedup — this is
+# the accuracy-validation path before committing to Option Y.
+EXTRA_KEY_BLEND_ON_NO_ADMIT = "anchor_pool_blend_on_no_admit"
+EXTRA_KEY_BLEND_TEMPERATURE = "anchor_pool_blend_temperature"
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +78,11 @@ class _AnchorPoolRunnerState:
         self.runner = runner
         self.manager = AnchorPoolManager()
         self.prefix_store = PrefixSegmentStore()
-        # req_id -> (spans, num_prompt_tokens, threshold, top_p)
-        # Populated when a new request enters with anchor_pool_spans in
-        # its extra_args; consumed when num_computed_tokens reaches
-        # num_prompt_tokens (prefill done).
+        # req_id -> (spans, num_prompt_tokens, threshold, top_p,
+        #            blend_on_no_admit, blend_temperature)
         self._pending: dict[
-            str, tuple[list[dict[str, Any]], int, float, float]
+            str,
+            tuple[list[dict[str, Any]], int, float, float, bool, float],
         ] = {}
 
         cache_config = runner.vllm_config.cache_config
@@ -446,11 +453,19 @@ class _AnchorPoolRunnerState:
                 continue
             threshold = float(extra.get(EXTRA_KEY_ENTROPY_THRESHOLD, 0.3))
             top_p = float(extra.get(EXTRA_KEY_TOP_P, 0.9))
+            blend_on_no_admit = bool(
+                extra.get(EXTRA_KEY_BLEND_ON_NO_ADMIT, False)
+            )
+            blend_temperature = float(
+                extra.get(EXTRA_KEY_BLEND_TEMPERATURE, 1.0)
+            )
             self._pending[new_req.req_id] = (
                 list(spans),
                 int(num_prompt_tokens),
                 threshold,
                 top_p,
+                blend_on_no_admit,
+                blend_temperature,
             )
             logger.info(
                 "[anchor-pool] queued req=%s spans=%d prompt_tokens=%d",
@@ -463,9 +478,14 @@ class _AnchorPoolRunnerState:
         if not self._pending:
             return
         ready: list[str] = []
-        for req_id, (spans, num_prompt_tokens, threshold, top_p) in (
-            self._pending.items()
-        ):
+        for req_id, (
+            spans,
+            num_prompt_tokens,
+            threshold,
+            top_p,
+            blend_on_no_admit,
+            blend_temperature,
+        ) in self._pending.items():
             req_state = self.runner.requests.get(req_id)
             if req_state is None:
                 ready.append(req_id)
@@ -475,7 +495,14 @@ class _AnchorPoolRunnerState:
             # Prefill done — run captures / predictions for each span.
             for span in spans:
                 try:
-                    self._handle_span(req_id, span, threshold, top_p)
+                    self._handle_span(
+                        req_id,
+                        span,
+                        threshold,
+                        top_p,
+                        blend_on_no_admit,
+                        blend_temperature,
+                    )
                 except Exception as e:
                     logger.warning(
                         "[anchor-pool] span handler failed req=%s span=%s: %s",
@@ -493,19 +520,20 @@ class _AnchorPoolRunnerState:
         span: dict[str, Any],
         threshold: float,
         top_p: float,
+        blend_on_no_admit: bool,
+        blend_temperature: float,
     ) -> None:
         chunk_hash = str(span["chunk_hash"])
         t_start = int(span["t_start"])
         num_tokens = int(span["num_tokens"])
 
-        # Capacity-check: chunk must fit in the request's blocks.
         if num_tokens <= 0:
             return
 
+        # First observation: record the base and exit.
         if not self.manager.has_pool(chunk_hash) or not self.manager.pool(
             chunk_hash
         ).has_base:
-            # First time we see this chunk on this worker — record the base.
             try:
                 self.capture_placeholder_base(
                     req_id=req_id,
@@ -527,11 +555,28 @@ class _AnchorPoolRunnerState:
                 )
             return
 
-        # Pool + base exist. Decide admission.
-        result = self.predict_as_anchor_for_request(
-            req_id=req_id,
-            chunk_hash=chunk_hash,
-            ph_t_start=t_start,
+        pool = self.manager.pool(chunk_hash)
+
+        # Gather the placeholder's real K/V once — used for admission
+        # similarity (V only) and, if needed, for the blend below.
+        try:
+            real_ph_K, real_ph_V = self.gather_chunk_kv(
+                req_id, t_start, num_tokens
+            )
+        except Exception as e:
+            logger.warning(
+                "[anchor-pool] gather failed req=%s chunk=%s: %s",
+                req_id,
+                chunk_hash[:12],
+                e,
+            )
+            return
+
+        # Entropy-gated admission — similarity over V at canonical position.
+        # V is position-independent so we use it as-gathered.
+        result = self.predict_as_anchor(
+            pool,
+            real_ph_V,
             threshold=threshold,
             top_p=top_p,
             bump=True,
@@ -546,30 +591,90 @@ class _AnchorPoolRunnerState:
             result.get("n_anchors", 0),
             len(result.get("activated_anchor_ids", [])),
         )
-        if not result.get("admit"):
+
+        if result.get("admit"):
+            # Novel candidate — capture as a new anchor entry. The
+            # capture path re-gathers internally; cheap, and keeps the
+            # public capture_anchor API self-contained.
+            anchor_id = f"anc-{req_id[:10]}-{chunk_hash[:8]}"
+            try:
+                self.capture_anchor(
+                    req_id=req_id,
+                    chunk_hash=chunk_hash,
+                    anchor_id=anchor_id,
+                    ph_t_start=t_start,
+                    prefix_id=None,
+                    derotate=True,
+                )
+                logger.info(
+                    "[anchor-pool] anchor captured chunk=%s anchor=%s",
+                    chunk_hash[:12],
+                    anchor_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[anchor-pool] anchor capture failed chunk=%s: %s",
+                    chunk_hash[:12],
+                    e,
+                )
             return
 
-        anchor_id = f"anc-{req_id[:10]}-{chunk_hash[:8]}"
+        # admit=False: the candidate is well-explained by existing
+        # anchors. If blending is enabled, apply the reference-style
+        # weighted-sum correction and write back. Otherwise just return
+        # (activation counts already bumped inside predict_as_anchor).
+        if not blend_on_no_admit:
+            return
+        if result.get("n_anchors", 0) == 0:
+            return
+
         try:
-            self.capture_anchor(
-                req_id=req_id,
-                chunk_hash=chunk_hash,
-                anchor_id=anchor_id,
-                ph_t_start=t_start,
-                # No prefix base in the chunked_chat benchmark layout —
-                # the dynamic chunk between anchors varies per request.
-                prefix_id=None,
-                derotate=True,
+            # Blend in canonical-position-0 frame: anchor embeddings and
+            # deltas are stored de-rotated. De-rotate the candidate K so
+            # the per-(layer, head) similarity comparison is meaningful.
+            real_ph_K_pos0 = self.derotate_to_position_zero(
+                real_ph_K, t_start
             )
+            # No prefix segment in this template — pass zeros so the
+            # blend math runs cleanly and we just ignore the pf outputs.
+            zero_pf_K = torch.zeros_like(real_ph_K_pos0)
+            zero_pf_V = torch.zeros_like(real_ph_V)
+
+            (
+                corr_ph_K_pos0,
+                corr_ph_V,
+                _corr_pf_K,
+                _corr_pf_V,
+            ) = self.blend_anchors(
+                pool,
+                real_ph_K=real_ph_K_pos0,
+                real_ph_V=real_ph_V,
+                base_pf_K=zero_pf_K,
+                base_pf_V=zero_pf_V,
+                temperature=blend_temperature,
+                skip_layer_zero=True,
+            )
+
+            # Re-rotate K back to the request's absolute position, then
+            # scatter the corrected (K, V) into the request's blocks.
+            corr_ph_K = self.rerotate_from_position_zero(
+                corr_ph_K_pos0, t_start
+            )
+            self.scatter_chunk_kv(req_id, t_start, corr_ph_K, corr_ph_V)
             logger.info(
-                "[anchor-pool] anchor captured chunk=%s anchor=%s",
+                "[anchor-pool] blended chunk=%s t_start=%d tokens=%d "
+                "anchors=%d temperature=%.3f",
                 chunk_hash[:12],
-                anchor_id,
+                t_start,
+                num_tokens,
+                result.get("n_anchors", 0),
+                blend_temperature,
             )
         except Exception as e:
             logger.warning(
-                "[anchor-pool] anchor capture failed chunk=%s: %s",
+                "[anchor-pool] blend failed chunk=%s t_start=%d: %s",
                 chunk_hash[:12],
+                t_start,
                 e,
             )
 
