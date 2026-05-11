@@ -196,6 +196,16 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
                 "rendered prompt; spans may be approximate"
             )
 
+        # If the very first chunk is an anchor, absorb the chat-template
+        # wrapper tokens into its span. Otherwise the wrapper tokens sit
+        # at positions [0, T_wrapper) un-cached and force the connector's
+        # contiguity walk to stop on its first iteration.
+        #
+        # Caveat: the absorbed span's hash now includes the wrapper text,
+        # which is fine — the wrapper is byte-stable per model, so the
+        # combined hash is still content-deterministic across requests.
+        absorb_wrapper = bool(chunks) and (0 in anchor_indices)
+
         # Walk chunks in order, accumulating char offsets and tokenizing
         # the rendered prefix-up-to-each-boundary.
         spans: list[dict[str, Any]] = []
@@ -208,10 +218,18 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
             if idx not in anchor_indices:
                 continue
 
+            # First anchor: absorb the chat-template wrapper.
+            if idx == 0 and absorb_wrapper:
+                effective_start = 0
+                effective_chunk_text = rendered[:chunk_end]  # wrapper + chunk
+            else:
+                effective_start = chunk_start
+                effective_chunk_text = chunk
+
             try:
                 t_start = len(
                     tokenizer.encode(
-                        rendered[:chunk_start], add_special_tokens=False
+                        rendered[:effective_start], add_special_tokens=False
                     )
                 )
                 t_end = len(
@@ -235,7 +253,9 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
                     idx,
                 )
                 continue
-            chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+            chunk_hash = hashlib.sha256(
+                effective_chunk_text.encode("utf-8")
+            ).hexdigest()
             spans.append(
                 {
                     "chunk_hash": chunk_hash,
@@ -245,11 +265,12 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
             )
             logger.info(
                 "[chunked_chat] anchor span chunk_idx=%d hash=%s "
-                "t_start=%d num_tokens=%d",
+                "t_start=%d num_tokens=%d%s",
                 idx,
                 chunk_hash[:12],
                 t_start,
                 num_tokens,
+                " (wrapper absorbed)" if (idx == 0 and absorb_wrapper) else "",
             )
         return spans
 
