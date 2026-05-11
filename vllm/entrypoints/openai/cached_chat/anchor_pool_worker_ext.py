@@ -84,6 +84,11 @@ class _AnchorPoolRunnerState:
             str,
             tuple[list[dict[str, Any]], int, float, float, bool, float],
         ] = {}
+        # Set of chunk_hashes whose KV the connector injected for a given
+        # req_id (i.e. the spans whose dense prefill was skipped). Used to
+        # gate the blend write-back: only inject-skipped spans get blended,
+        # freshly-prefilled spans are left untouched.
+        self._injected_spans: dict[str, set[str]] = {}
 
         cache_config = runner.vllm_config.cache_config
         model_config = runner.vllm_config.model_config
@@ -419,6 +424,15 @@ class _AnchorPoolRunnerState:
             return len(ids)
         return getattr(req_state, "num_prompt_tokens", None)
 
+    def mark_injected(self, req_id: str, chunk_hash: str) -> None:
+        """Record that the connector skipped dense prefill for this span
+        (KV was loaded from the anchor pool). Only inject-skipped spans
+        are eligible for the blend write-back in `_handle_span`."""
+        self._injected_spans.setdefault(req_id, set()).add(chunk_hash)
+
+    def was_injected(self, req_id: str, chunk_hash: str) -> bool:
+        return chunk_hash in self._injected_spans.get(req_id, ())
+
     def process_pending(self, scheduler_output: "SchedulerOutput") -> None:
         """Single hook driven from `GPUModelRunner._update_states`.
 
@@ -438,6 +452,7 @@ class _AnchorPoolRunnerState:
         # Drop pending entries for finished requests.
         for finished_id in scheduler_output.finished_req_ids:
             self._pending.pop(finished_id, None)
+            self._injected_spans.pop(finished_id, None)
 
         # 1. Queue new requests that carry anchor_pool_spans.
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -626,6 +641,18 @@ class _AnchorPoolRunnerState:
         if not blend_on_no_admit:
             return
         if result.get("n_anchors", 0) == 0:
+            return
+        # Only blend spans whose dense prefill was actually skipped by the
+        # connector. If prefill ran for this span, the live K/V is already
+        # the ground truth — don't overwrite it with the approximation.
+        if not self.was_injected(req_id, chunk_hash):
+            logger.info(
+                "[anchor-pool] skip blend chunk=%s t_start=%d tokens=%d "
+                "(prefill ran, not injected)",
+                chunk_hash[:12],
+                t_start,
+                num_tokens,
+            )
             return
 
         try:

@@ -141,6 +141,12 @@ class Scheduler(SchedulerInterface):
             self.kv_events_config,
             self.parallel_config.data_parallel_index,
         )
+        # Per-request external (KV-connector-skip) runs in absolute prompt
+        # positions. Populated from connector.get_external_runs() at request
+        # admission. Sorted, non-overlapping. The leading run starting at
+        # position 0 (if any) corresponds to num_external_computed_tokens
+        # — included here too so the per-step run advance is symmetric.
+        self._external_runs: dict[str, list[tuple[int, int]]] = {}
         self.ec_connector = None
         if self.vllm_config.ec_transfer_config is not None:
             self.ec_connector = ECConnectorFactory.create_connector(
@@ -299,6 +305,41 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+    def _advance_past_external_runs(
+        self, request: Request, cursor: int
+    ) -> tuple[int, list[tuple[int, int]]]:
+        """Greedily advance `cursor` past every external run that begins
+        at the current position. Returns (new_cursor, runs_traversed).
+
+        Runs are looked up from `self._external_runs` populated at
+        admission; only runs whose start equals the current cursor are
+        consumed, so a dense gap stays a dense gap until the dense
+        forward catches up to the next run boundary."""
+        runs = self._external_runs.get(request.request_id)
+        if not runs:
+            return cursor, []
+        traversed: list[tuple[int, int]] = []
+        for run_start, run_length in runs:
+            if run_start == cursor:
+                traversed.append((run_start, run_length))
+                cursor = run_start + run_length
+        return cursor, traversed
+
+    def _cap_at_next_external_run(
+        self, request: Request, cursor: int, num_new_tokens: int
+    ) -> int:
+        """Cap the dense chunk so it ends right before the next external
+        run start. Keeps each prefill step's Q-positions contiguous (the
+        forward batch builder assumes this), even when the request has
+        non-leading skip runs further down the prompt."""
+        runs = self._external_runs.get(request.request_id)
+        if not runs:
+            return num_new_tokens
+        for run_start, _ in runs:
+            if run_start > cursor:
+                return min(num_new_tokens, run_start - cursor)
+        return num_new_tokens
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -405,10 +446,23 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # Path A: advance past any external (connector-skip) runs whose
+            # start equals the current cursor. The dense forward stays
+            # contiguous in absolute positions because num_new_tokens is
+            # capped at the next run start; the just-traversed runs get
+            # their KV injected by the connector pre-forward and the
+            # request's num_computed_tokens is bumped manually below.
+            cursor_after_advance, runs_traversed = (
+                self._advance_past_external_runs(
+                    request, request.num_computed_tokens
+                )
+            )
+            external_advance = cursor_after_advance - request.num_computed_tokens
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
-                - request.num_computed_tokens
+                - cursor_after_advance
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -417,7 +471,11 @@ class Scheduler(SchedulerInterface):
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                num_new_tokens, self.max_model_len - 1 - cursor_after_advance
+            )
+            # Cap at next external run so this step's Q remains contiguous.
+            num_new_tokens = self._cap_at_next_external_run(
+                request, cursor_after_advance, num_new_tokens
             )
 
             # Schedule encoder inputs.
@@ -467,6 +525,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
+                        num_external_computed_tokens=external_advance,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
@@ -520,6 +579,22 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            # If the connector advanced the cursor past one or more external
+            # runs this step, bump num_computed manually so build_connector_meta
+            # and CachedRequestData see the post-advance position. The natural
+            # _update_after_schedule advance (by num_scheduled_tokens) covers
+            # only the dense forward chunk.
+            if external_advance > 0:
+                request.num_computed_tokens += external_advance
+                logger.info(
+                    "Scheduler: req=%s advanced past %d external-run tokens "
+                    "(runs=%d) cursor=%d dense_chunk=%d",
+                    request_id,
+                    external_advance,
+                    len(runs_traversed),
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -640,6 +715,28 @@ class Scheduler(SchedulerInterface):
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
 
+                        # Non-contiguous skip support: ask the connector
+                        # for the full run set so subsequent prefill steps
+                        # can cap their dense chunks at the next run
+                        # boundary and advance past runs the cursor
+                        # reaches. The leading run at position 0 (if any)
+                        # is already covered by num_external_computed_tokens.
+                        try:
+                            runs = list(
+                                self.connector.get_external_runs(request)
+                            )
+                        except Exception:
+                            runs = []
+                        if runs:
+                            runs = sorted(runs, key=lambda r: int(r[0]))
+                            self._external_runs[request.request_id] = [
+                                (int(s), int(l)) for s, l in runs
+                            ]
+                        else:
+                            self._external_runs.pop(
+                                request.request_id, None
+                            )
+
                     # Manual KV reuse: the cached_chat endpoint stuffs the
                     # number of prefix tokens it has already saved into
                     # sampling_params.extra_args. Treat them as
@@ -706,6 +803,14 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    # Cap at the next external run boundary so the dense
+                    # chunk this step forwards over stays contiguous in
+                    # absolute prompt positions. Non-leading runs are
+                    # advanced past in later running-branch passes once
+                    # the cursor reaches them.
+                    num_new_tokens = self._cap_at_next_external_run(
+                        request, num_computed_tokens, num_new_tokens
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1860,6 +1965,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+        self._external_runs.pop(request.request_id, None)
 
     @property
     def pause_state(self) -> PauseState:

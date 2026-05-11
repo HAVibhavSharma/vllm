@@ -481,6 +481,27 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_external_runs(
+        self, request: "Request"
+    ) -> list[tuple[int, int]]:
+        """Return the set of token ranges within `request`'s prompt that are
+        available as external KV beyond the contiguous leading prefix
+        reported by `get_num_new_matched_tokens`.
+
+        Each entry is `(start, length)` in absolute prompt-token positions,
+        sorted by `start`, non-overlapping. A run that begins at position 0
+        represents the leading prefix (i.e. it should match the value
+        returned by `get_num_new_matched_tokens`). Non-leading runs allow
+        non-contiguous prefill skip: the scheduler will advance
+        `num_computed_tokens` past each run when its cursor lands on the
+        run's start, and the connector is expected to inject the run's KV
+        before the following forward step.
+
+        The default returns `[]` — connectors that only support contiguous
+        leading-prefix skip do not need to override this.
+        """
+        return []
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

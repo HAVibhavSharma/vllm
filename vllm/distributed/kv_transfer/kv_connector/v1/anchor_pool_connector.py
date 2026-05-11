@@ -118,8 +118,16 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
         # Scheduler-side state.
         self._populated_hashes: set[str] = set()
-        # req_id -> (claimed_tokens, list of inject ops to put in next metadata)
-        self._pending: dict[str, list[_InjectOp]] = {}
+        # req_id -> list of (start, length, chunk_hash) — every populated
+        # span for this request (leading + non-leading). The trailing run
+        # is trimmed by 1 token if it would otherwise cover the last
+        # prompt position (so the dense forward always sees at least one
+        # token at the end, producing logits for the first decode step).
+        self._req_runs: dict[str, list[tuple[int, int, str]]] = {}
+        # req_id -> set of (start, length) for runs whose inject op has
+        # already been emitted to the worker. Prevents double-injecting
+        # across the multiple steps of a chunked prefill.
+        self._req_emitted: dict[str, set[tuple[int, int]]] = {}
         # Worker-side: lazy lookup; resolved on first call.
         self._block_size: int | None = None
         self._kv_caches: dict[str, torch.Tensor] | None = None
@@ -139,6 +147,56 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         # Defensive copy so we never mutate the request object.
         return [dict(s) for s in spans]
 
+    def _populated_runs_for(
+        self,
+        request: "Request",
+    ) -> list[tuple[int, int, str]]:
+        """Return populated-anchor runs for `request`, sorted by start,
+        with the trailing run trimmed by 1 if it covers the last prompt
+        position. Cached per request via `self._req_runs`."""
+        cached = self._req_runs.get(request.request_id)
+        if cached is not None:
+            return cached
+
+        spans = self._read_spans(request)
+        if not spans:
+            self._req_runs[request.request_id] = []
+            return []
+
+        spans = sorted(spans, key=lambda s: int(s["t_start"]))
+        runs: list[tuple[int, int, str]] = []
+        for span in spans:
+            t_start = int(span["t_start"])
+            num_tokens = int(span["num_tokens"])
+            chunk_hash = str(span["chunk_hash"])
+            if num_tokens <= 0:
+                continue
+            if chunk_hash not in self._populated_hashes:
+                continue
+            runs.append((t_start, num_tokens, chunk_hash))
+
+        # Trailing trim: leave at least one dense position at the end so
+        # the forward produces logits for sampling. Only applies if a
+        # populated run ends exactly at the last prompt position.
+        num_prompt = request.num_prompt_tokens
+        if runs:
+            t_start, num_tokens, h = runs[-1]
+            if t_start + num_tokens >= num_prompt:
+                new_len = max(0, (num_prompt - 1) - t_start)
+                if new_len <= 0:
+                    runs.pop()
+                else:
+                    runs[-1] = (t_start, new_len, h)
+
+        self._req_runs[request.request_id] = runs
+        return runs
+
+    def get_external_runs(
+        self,
+        request: "Request",
+    ) -> list[tuple[int, int]]:
+        return [(s, l) for s, l, _ in self._populated_runs_for(request)]
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -150,56 +208,49 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         if num_computed_tokens > 0:
             return 0, False
 
-        spans = self._read_spans(request)
-        if not spans:
+        runs = self._populated_runs_for(request)
+        if not runs:
             return 0, False
 
-        # Sort spans by t_start; we'll walk a contiguous leading prefix.
-        spans = sorted(spans, key=lambda s: int(s["t_start"]))
-
-        claimed = 0
-        ops: list[_InjectOp] = []
+        # Length of the contiguous leading prefix run starting at 0 — what
+        # the scheduler's `num_external_computed_tokens` mechanism handles.
+        # The remaining non-leading runs are surfaced via `get_external_runs`
+        # and handled by the scheduler's per-step run-boundary advance.
+        leading = 0
         cursor = 0
-        for span in spans:
-            t_start = int(span["t_start"])
-            num_tokens = int(span["num_tokens"])
-            chunk_hash = str(span["chunk_hash"])
-
-            # We only skip a CONTIGUOUS leading prefix. Stop if this
-            # span doesn't sit right after the running cursor.
+        for t_start, num_tokens, _ in runs:
             if t_start != cursor:
                 break
-            if chunk_hash not in self._populated_hashes:
-                break
-            ops.append(
-                _InjectOp(
-                    req_id=request.request_id,
-                    chunk_hash=chunk_hash,
-                    t_start=t_start,
-                    num_tokens=num_tokens,
-                    block_ids=[],  # filled in build_connector_meta
-                )
-            )
-            claimed += num_tokens
+            leading += num_tokens
             cursor = t_start + num_tokens
 
-        if claimed == 0:
-            return 0, False
+        total_runs_tokens = sum(l for _, l, _ in runs)
+        non_leading = total_runs_tokens - leading
+        logger.info(
+            "AnchorPoolConnector: claim req=%s leading=%d non_leading=%d "
+            "total_runs=%d",
+            request.request_id,
+            leading,
+            non_leading,
+            len(runs),
+        )
+        if leading > 0:
+            logger.info(
+                "TOKENS SKIPPED DURING PREFILL (leading): %d (REQ=%s)",
+                leading,
+                request.request_id,
+            )
+        if non_leading > 0:
+            logger.info(
+                "TOKENS SKIPPED DURING PREFILL (non-leading runs): %d "
+                "across %d runs (REQ=%s)",
+                non_leading,
+                len(runs) - (1 if leading > 0 else 0),
+                request.request_id,
+            )
 
-        self._pending[request.request_id] = ops
-        logger.info(
-            "AnchorPoolConnector: claim req=%s tokens=%d ops=%d",
-            request.request_id,
-            claimed,
-            len(ops),
-        )
-        logger.info(
-            "TOKENS SKIPPED DURING PREFILL: %d (REQ=%s)",
-            claimed,
-            request.request_id,
-        )
-        # Synchronous load (we do it pre-forward, not asynchronously).
-        return claimed, False
+        # Synchronous load — we inject pre-forward, not asynchronously.
+        return leading, False
 
     def update_state_after_alloc(
         self,
@@ -215,34 +266,51 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> KVConnectorMetadata:
+        """Emit inject ops for every populated run whose entire span has
+        been advanced past by the scheduler (run.end <= num_computed) and
+        which we haven't already emitted.
+
+        Block resolution is deferred to the worker side: leaving
+        `op.block_ids` empty signals `_inject_one` to look them up via
+        the running anchor-pool state, which always has the live block
+        table for the request. This avoids having to track new_block_ids
+        across chunked-prefill steps on the scheduler side."""
         meta = AnchorPoolConnectorMetadata()
-        if not self._pending:
+        if not self._req_runs:
             return meta
 
-        # Resolve block_ids for each newly-scheduled request from the
-        # scheduler output. block_ids is a tuple-of-lists (one per KV
-        # group), we use group 0 (single group is the common case).
-        new_req_blocks: dict[str, list[int]] = {}
+        # Walk both newly-scheduled and continuing requests to learn each
+        # request's current num_computed_tokens.
+        req_num_computed: dict[str, int] = {}
         for new_req in scheduler_output.scheduled_new_reqs:
-            bids = new_req.block_ids
-            if isinstance(bids, tuple):
-                bids = bids[0] if bids else []
-            new_req_blocks[new_req.req_id] = [int(b) for b in bids]
+            req_num_computed[new_req.req_id] = int(new_req.num_computed_tokens)
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, rid in enumerate(cached.req_ids):
+            req_num_computed[rid] = int(cached.num_computed_tokens[i])
 
-        ready: list[str] = []
-        for req_id, ops in self._pending.items():
-            blocks = new_req_blocks.get(req_id)
-            if blocks is None:
-                # Not yet scheduled (or finished before scheduling).
-                # Leave in pending; will retry next step.
+        for req_id, runs in self._req_runs.items():
+            num_computed = req_num_computed.get(req_id)
+            if num_computed is None:
                 continue
-            for op in ops:
-                op.block_ids = blocks
-                meta.injects.append(op)
-            ready.append(req_id)
-
-        for req_id in ready:
-            self._pending.pop(req_id, None)
+            emitted = self._req_emitted.setdefault(req_id, set())
+            for t_start, num_tokens, chunk_hash in runs:
+                if t_start + num_tokens > num_computed:
+                    # Scheduler hasn't advanced past this run yet — wait
+                    # for a later step.
+                    continue
+                key = (t_start, num_tokens)
+                if key in emitted:
+                    continue
+                meta.injects.append(
+                    _InjectOp(
+                        req_id=req_id,
+                        chunk_hash=chunk_hash,
+                        t_start=t_start,
+                        num_tokens=num_tokens,
+                        block_ids=[],  # worker resolves at inject time
+                    )
+                )
+                emitted.add(key)
 
         if meta.injects:
             logger.info(
@@ -272,8 +340,9 @@ class AnchorPoolConnector(KVConnectorBase_V1):
                 len(added),
                 len(self._populated_hashes),
             )
-        # Clean up any leftover pending state.
-        self._pending.pop(request.request_id, None)
+        # Clean up per-request state.
+        self._req_runs.pop(request.request_id, None)
+        self._req_emitted.pop(request.request_id, None)
         return False, None
 
     # ==================================================================
@@ -367,8 +436,26 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         )
         block_pos = positions // block_size
         slot_pos = positions % block_size
+        # Resolve the request's block list. Connector-scheduled inject ops
+        # (non-leading runs especially) carry empty op.block_ids — the
+        # runner-side state always has the up-to-date allocation, so use
+        # that as the source of truth.
+        if op.block_ids:
+            block_id_list = list(op.block_ids)
+        else:
+            try:
+                block_id_list = state._block_ids_for(op.req_id)
+            except Exception as e:
+                logger.warning(
+                    "AnchorPoolConnector: block-id lookup failed req=%s "
+                    "chunk=%s: %s",
+                    op.req_id,
+                    op.chunk_hash[:12],
+                    e,
+                )
+                return
         block_ids_t = torch.tensor(
-            op.block_ids, dtype=torch.long, device=state.device
+            block_id_list, dtype=torch.long, device=state.device
         )
         physical_blocks = block_ids_t[block_pos]
 
@@ -379,6 +466,18 @@ class AnchorPoolConnector(KVConnectorBase_V1):
                 layer_kv[1, physical_blocks, slot_pos] = V[layer_idx]
             else:
                 layer_kv[physical_blocks, slot_pos] = K[layer_idx]
+        # Tell the worker extension this span's dense prefill was skipped,
+        # so its post-prefill hook knows to apply the blend correction
+        # (instead of leaving freshly-prefilled K/V alone).
+        try:
+            state.mark_injected(op.req_id, op.chunk_hash)
+        except Exception as e:
+            logger.warning(
+                "AnchorPoolConnector: mark_injected failed req=%s chunk=%s: %s",
+                op.req_id,
+                op.chunk_hash[:12],
+                e,
+            )
         logger.info(
             "AnchorPoolConnector: injected req=%s chunk=%s t_start=%d "
             "tokens=%d",
