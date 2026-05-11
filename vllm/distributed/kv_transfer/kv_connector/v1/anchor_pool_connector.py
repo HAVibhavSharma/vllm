@@ -193,6 +193,11 @@ class AnchorPoolConnector(KVConnectorBase_V1):
             claimed,
             len(ops),
         )
+        logger.info(
+            "TOKENS SKIPPED DURING PREFILL: %d (REQ=%s)",
+            claimed,
+            request.request_id,
+        )
         # Synchronous load (we do it pre-forward, not asynchronously).
         return claimed, False
 
