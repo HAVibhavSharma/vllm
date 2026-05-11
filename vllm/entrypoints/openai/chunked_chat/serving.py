@@ -268,38 +268,6 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
         chunks = list(request.chunks or [])
         anchor_indices = list(request.anchor_indices or [])
 
-        # Optional: move all anchor chunks to the front so the connector's
-        # leading-prefix skip covers every static span (otherwise a suffix
-        # anchor goes through dense prefill because it isn't contiguous
-        # with the prefix anchor). Preserves original order within each
-        # group: [anchor_0, anchor_1, ..., dynamic_0, dynamic_1, ...].
-        #
-        # CAVEAT: this changes the token sequence the model sees. Safe
-        # for templates whose suffix is order-independent (style /
-        # formatting instructions); breaks templates where the suffix
-        # references prior content (e.g. "the conversation above").
-        # A/B compare with the env var off to verify quality.
-        if (
-            chunks
-            and anchor_indices
-            and _env_bool("ANCHOR_POOL_REORDER_ANCHORS_FRONT", False)
-        ):
-            anchor_set = set(anchor_indices)
-            anchor_chunks = [
-                c for i, c in enumerate(chunks) if i in anchor_set
-            ]
-            dynamic_chunks = [
-                c for i, c in enumerate(chunks) if i not in anchor_set
-            ]
-            chunks = anchor_chunks + dynamic_chunks
-            anchor_indices = list(range(len(anchor_chunks)))
-            logger.info(
-                "[chunked_chat] reordered: %d anchors → front, %d "
-                "dynamic chunks → back",
-                len(anchor_chunks),
-                len(dynamic_chunks),
-            )
-
         # If messages weren't supplied, build a single user message from
         # the concatenated chunks. The standard chat path will tokenize
         # this through the same chat template we just used for span
