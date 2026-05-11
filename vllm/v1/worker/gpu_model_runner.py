@@ -1397,6 +1397,12 @@ class GPUModelRunner(
         if manual_kv_state is not None:
             manual_kv_state.process_pending(scheduler_output)
 
+        # Anchor-pool hook (chunked_chat endpoint). Same pattern — state
+        # is lazily attached on first RPC; absent state means no-op.
+        anchor_pool_state = getattr(self, "_anchor_pool_state", None)
+        if anchor_pool_state is not None:
+            anchor_pool_state.process_pending(scheduler_output)
+
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
             update_ngram_gpu_tensors_incremental(
