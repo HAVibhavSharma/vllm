@@ -1,42 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""AnchorPoolConnector — proper v1 scheduler-side prefill skip for the
+"""AnchorPoolConnector — entropy-gated v1 prefill skip for the
 chunked_chat anchor pool.
 
-How it fits with the existing components:
+Decision flow (single gate, pre-forward):
 
     chunked_chat serving       stamps vllm_xargs["anchor_pool_spans"]
         │
         ▼
-    Request enters scheduler
-        │
-        ▼
     AnchorPoolConnector (SCHEDULER role)
         ├─ get_num_new_matched_tokens(req):
-        │       reads anchor_pool_spans from request.sampling_params.
-        │       Returns the contiguous leading-prefix token count that
-        │       is in self._populated_hashes  →  scheduler treats those
-        │       as already-computed and only schedules prefill on the tail.
+        │       reads anchor_pool_spans and, for each span, queries the
+        │       worker's cached admit verdict
+        │       (AnchorPoolWorkerExtension.get_admit_verdict).
         │
-        ├─ build_connector_meta(scheduler_output):
-        │       builds AnchorPoolConnectorMetadata with the inject ops
-        │       for newly-scheduled requests.
+        │       verdict == False  → pool is saturated, chunk is well-
+        │                           explained by existing anchors. The
+        │                           span is claimed for skip; the inject
+        │                           path will scatter a blended KV.
         │
-        └─ request_finished(req):
-                adds all hashes that this request produced to
-                _populated_hashes (optimistic — capture happened in
-                AnchorPoolWorkerExtension.process_pending).
+        │       verdict == True   → chunk is novel; the span is NOT
+        │       (or unset)         claimed, dense prefill runs, and the
+        │                          worker captures a new anchor in
+        │                          _handle_span post-prefill.
+        │
+        ├─ build_connector_meta:
+        │       emits one _InjectOp per claimed run, carrying the
+        │       caller's blend_temperature.
         ▼
     AnchorPoolConnector (WORKER role).start_load_kv(...)
-        For each inject op: gather pool.base() → re-rotate to t_start →
-        scatter into the request's allocated blocks.
-        Model forward then runs only over the un-cached tail.
+        For each inject op: run blend_anchors(pool, real_ph=base, ...)
+        → rerotate K to t_start → scatter blended (K, V) into the
+        request's allocated blocks. Model forward then sees these as
+        already-computed tokens.
 
-The actual capture-after-prefill pipeline stays in
-`AnchorPoolWorkerExtension` (the existing worker_ext + process_pending
-hook). This connector reads from the same `AnchorPoolManager` via the
-module-level singleton.
+Capture-after-prefill stays in `AnchorPoolWorkerExtension` (only the
+admit decision and the blend moved here). After every successful
+capture the worker refreshes its admit verdict for the chunk_hash, so
+the next request's scheduling decision picks up the new pool state.
 """
 
 from __future__ import annotations
@@ -69,6 +71,7 @@ logger = init_logger(__name__)
 # already understands so the chunked_chat serving layer only has to
 # stamp them once.
 _XARG_ANCHOR_SPANS = "anchor_pool_spans"
+_XARG_BLEND_TEMPERATURE = "anchor_pool_blend_temperature"
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +88,7 @@ class _InjectOp:
     t_start: int
     num_tokens: int
     block_ids: list[int]
+    blend_temperature: float = 1.0
 
 
 @dataclass
@@ -128,6 +132,10 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         # already been emitted to the worker. Prevents double-injecting
         # across the multiple steps of a chunked prefill.
         self._req_emitted: dict[str, set[tuple[int, int]]] = {}
+        # req_id -> blend temperature, captured at first-scheduling.
+        # Threaded into each _InjectOp so the worker-side blend uses the
+        # caller-configured temperature.
+        self._req_blend_temperatures: dict[str, float] = {}
         # Worker-side: lazy lookup; resolved on first call.
         self._block_size: int | None = None
         self._kv_caches: dict[str, torch.Tensor] | None = None
@@ -151,9 +159,19 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         self,
         request: "Request",
     ) -> list[tuple[int, int, str]]:
-        """Return populated-anchor runs for `request`, sorted by start,
-        with the trailing run trimmed by 1 if it covers the last prompt
-        position. Cached per request via `self._req_runs`."""
+        """Return injectable runs for `request`, sorted by start, with
+        the trailing run trimmed by 1 if it covers the last prompt
+        position. Cached per request via `self._req_runs`.
+
+        Admit gate: a run is injectable only if the worker's admit
+        verdict for its `chunk_hash` is False (i.e. the pool has been
+        saturated enough that the chunk is well-explained by existing
+        anchors — safe to skip dense prefill and use a blended
+        approximation). Runs whose verdict is True or unset (no pool
+        observation yet) are dropped here so dense prefill runs for
+        them; the worker's `_handle_span` will then capture a new
+        anchor and refresh the verdict.
+        """
         cached = self._req_runs.get(request.request_id)
         if cached is not None:
             return cached
@@ -163,6 +181,20 @@ class AnchorPoolConnector(KVConnectorBase_V1):
             self._req_runs[request.request_id] = []
             return []
 
+        # Stash blend temperature for this request — picked up by
+        # build_connector_meta when emitting inject ops.
+        sp = getattr(request, "sampling_params", None)
+        extra = getattr(sp, "extra_args", None) if sp is not None else None
+        if extra:
+            try:
+                self._req_blend_temperatures[request.request_id] = float(
+                    extra.get(_XARG_BLEND_TEMPERATURE, 1.0)
+                )
+            except (TypeError, ValueError):
+                self._req_blend_temperatures[request.request_id] = 1.0
+
+        state = self._get_anchor_state()
+
         spans = sorted(spans, key=lambda s: int(s["t_start"]))
         runs: list[tuple[int, int, str]] = []
         for span in spans:
@@ -171,7 +203,18 @@ class AnchorPoolConnector(KVConnectorBase_V1):
             chunk_hash = str(span["chunk_hash"])
             if num_tokens <= 0:
                 continue
-            if chunk_hash not in self._populated_hashes:
+            verdict: bool | None
+            if state is None:
+                # Worker state not yet attached (very first request before
+                # anchor_pool_install RPC has resolved). Treat as no
+                # verdict: run prefill, let capture populate the pool.
+                verdict = None
+            else:
+                verdict = state.get_admit_verdict(chunk_hash)
+            if verdict is not False:
+                # verdict True (novel) or None (no observation yet) -> let
+                # dense prefill run for this span so the worker can
+                # capture base / new anchor.
                 continue
             runs.append((t_start, num_tokens, chunk_hash))
 
@@ -293,6 +336,7 @@ class AnchorPoolConnector(KVConnectorBase_V1):
             if num_computed is None:
                 continue
             emitted = self._req_emitted.setdefault(req_id, set())
+            blend_temp = self._req_blend_temperatures.get(req_id, 1.0)
             for t_start, num_tokens, chunk_hash in runs:
                 if t_start + num_tokens > num_computed:
                     # Scheduler hasn't advanced past this run yet — wait
@@ -308,6 +352,7 @@ class AnchorPoolConnector(KVConnectorBase_V1):
                         t_start=t_start,
                         num_tokens=num_tokens,
                         block_ids=[],  # worker resolves at inject time
+                        blend_temperature=blend_temp,
                     )
                 )
                 emitted.add(key)
@@ -343,6 +388,7 @@ class AnchorPoolConnector(KVConnectorBase_V1):
         # Clean up per-request state.
         self._req_runs.pop(request.request_id, None)
         self._req_emitted.pop(request.request_id, None)
+        self._req_blend_temperatures.pop(request.request_id, None)
         return False, None
 
     # ==================================================================
@@ -421,9 +467,44 @@ class AnchorPoolConnector(KVConnectorBase_V1):
             )
             return
 
-        # Re-rotate K back to the request's position offset.
-        K = state.rerotate_from_position_zero(K_base, op.t_start)
-        V = V_base
+        # Inject-time blend: use base K/V as the "real_ph" proxy (we
+        # don't have a real prefill output here — that's the whole point
+        # of skipping prefill). The blend weights anchor deltas by
+        # similarity-to-base; for a single anchor the result reduces to
+        # that anchor's stored K/V, for N anchors it's a softmax-weighted
+        # combination favoring anchors whose stored K/V are closest to
+        # the base.
+        #
+        # blend_anchors operates in canonical position-0 frame; K_base
+        # and V_base are stored derotated, so they go in as-is. The
+        # corrected K is then rerotated to op.t_start before scatter.
+        zero_pf_K = torch.zeros_like(K_base)
+        zero_pf_V = torch.zeros_like(V_base)
+        try:
+            (
+                K_pos0,
+                V,
+                _pf_K,
+                _pf_V,
+            ) = state.blend_anchors(
+                pool,
+                real_ph_K=K_base,
+                real_ph_V=V_base,
+                base_pf_K=zero_pf_K,
+                base_pf_V=zero_pf_V,
+                temperature=float(op.blend_temperature),
+                skip_layer_zero=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "AnchorPoolConnector: blend failed chunk=%s; falling "
+                "back to base-only inject: %s",
+                op.chunk_hash[:12],
+                e,
+            )
+            K_pos0 = K_base
+            V = V_base
+        K = state.rerotate_from_position_zero(K_pos0, op.t_start)
 
         # Scatter into the request's blocks. We use the same gather/scatter
         # geometry the worker extension does — by abs token position.

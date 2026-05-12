@@ -53,15 +53,7 @@ logger = init_logger(__name__)
 _XARG_ANCHOR_SPANS = "anchor_pool_spans"
 _XARG_ENTROPY_THRESHOLD = "anchor_pool_entropy_threshold"
 _XARG_TOP_P = "anchor_pool_top_p"
-_XARG_BLEND_ON_NO_ADMIT = "anchor_pool_blend_on_no_admit"
 _XARG_BLEND_TEMPERATURE = "anchor_pool_blend_temperature"
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -88,25 +80,14 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
         self._anchor_pool_top_p: float = _env_float(
             "ANCHOR_POOL_TOP_P", 0.9
         )
-        # When True, the worker extension's admit=False branch blends
-        # anchor deltas into the candidate K/V and writes the corrected
-        # tensors back into the live KV cache. This is the "Option X"
-        # accuracy-validation path — no compute saved, but exercises the
-        # reference reuse formula end-to-end so its quality vs. raw
-        # dense prefill can be measured. Controlled by env var
-        # `ANCHOR_POOL_BLEND` (default on).
-        self._anchor_pool_blend_on_no_admit: bool = _env_bool(
-            "ANCHOR_POOL_BLEND", True
-        )
         self._anchor_pool_blend_temperature: float = _env_float(
             "ANCHOR_POOL_BLEND_TEMPERATURE", 1.0
         )
         logger.info(
             "[chunked_chat] anchor pool config: threshold=%.2f top_p=%.2f "
-            "blend=%s temperature=%.2f",
+            "blend_temperature=%.2f",
             self._anchor_pool_threshold,
             self._anchor_pool_top_p,
-            self._anchor_pool_blend_on_no_admit,
             self._anchor_pool_blend_temperature,
         )
 
@@ -329,21 +310,17 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
                 xargs[_XARG_ANCHOR_SPANS] = spans
                 xargs[_XARG_ENTROPY_THRESHOLD] = self._anchor_pool_threshold
                 xargs[_XARG_TOP_P] = self._anchor_pool_top_p
-                xargs[_XARG_BLEND_ON_NO_ADMIT] = (
-                    self._anchor_pool_blend_on_no_admit
-                )
                 xargs[_XARG_BLEND_TEMPERATURE] = (
                     self._anchor_pool_blend_temperature
                 )
                 request.vllm_xargs = xargs
                 logger.info(
                     "[chunked_chat] dispatching with %d anchor spans "
-                    "agent=%s (threshold=%.2f top_p=%.2f blend=%s temp=%.2f)",
+                    "agent=%s (threshold=%.2f top_p=%.2f temp=%.2f)",
                     len(spans),
                     agent_id if agent_id is not None else "-",
                     self._anchor_pool_threshold,
                     self._anchor_pool_top_p,
-                    self._anchor_pool_blend_on_no_admit,
                     self._anchor_pool_blend_temperature,
                 )
 

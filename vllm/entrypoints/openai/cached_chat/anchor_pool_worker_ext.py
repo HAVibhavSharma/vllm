@@ -56,13 +56,6 @@ logger = init_logger(__name__)
 EXTRA_KEY_ANCHOR_SPANS = "anchor_pool_spans"
 EXTRA_KEY_ENTROPY_THRESHOLD = "anchor_pool_entropy_threshold"
 EXTRA_KEY_TOP_P = "anchor_pool_top_p"
-# When True, the post-prefill `admit=False` branch blends anchor deltas
-# into the current request's K/V and writes the corrected tensors back.
-# Lets the reference reuse formula execute end-to-end on non-leading
-# anchors (e.g. the suffix in `[static, dynamic, static]` templates)
-# without needing scheduler-side hole support. No speedup — this is
-# the accuracy-validation path before committing to Option Y.
-EXTRA_KEY_BLEND_ON_NO_ADMIT = "anchor_pool_blend_on_no_admit"
 EXTRA_KEY_BLEND_TEMPERATURE = "anchor_pool_blend_temperature"
 
 
@@ -79,16 +72,30 @@ class _AnchorPoolRunnerState:
         self.manager = AnchorPoolManager()
         self.prefix_store = PrefixSegmentStore()
         # req_id -> (spans, num_prompt_tokens, threshold, top_p,
-        #            blend_on_no_admit, blend_temperature)
+        #            blend_temperature)
         self._pending: dict[
             str,
-            tuple[list[dict[str, Any]], int, float, float, bool, float],
+            tuple[list[dict[str, Any]], int, float, float, float],
         ] = {}
         # Set of chunk_hashes whose KV the connector injected for a given
         # req_id (i.e. the spans whose dense prefill was skipped). Used to
-        # gate the blend write-back: only inject-skipped spans get blended,
-        # freshly-prefilled spans are left untouched.
+        # gate the post-prefill capture decision: inject-skipped spans
+        # already have anchor-derived KV in the cache, so they must NOT
+        # be re-captured as anchors. Freshly-prefilled spans (admit=True
+        # decided pre-forward by the connector) are eligible for capture.
         self._injected_spans: dict[str, set[str]] = {}
+        # Admit verdict cache, keyed by chunk_hash. Computed by running
+        # `predict_as_anchor` with the pool's stored base V as the
+        # candidate (a deterministic per-chunk_hash signal). Updated after
+        # every successful capture. The connector reads this from the
+        # scheduler side to decide whether to claim a span for prefill
+        # skip (verdict=False => pool explains the chunk => inject blend
+        # and skip prefill).
+        self._admit_verdicts: dict[str, bool] = {}
+        # Per-request blend temperature, stashed when a request is queued.
+        # Read by the connector's inject path so the blend at inject time
+        # uses the caller-configured temperature.
+        self._req_blend_temperature: dict[str, float] = {}
 
         cache_config = runner.vllm_config.cache_config
         model_config = runner.vllm_config.model_config
@@ -437,22 +444,32 @@ class _AnchorPoolRunnerState:
         """Single hook driven from `GPUModelRunner._update_states`.
 
         For each newly-scheduled request that carries `anchor_pool_spans`
-        in its `sampling_params.extra_args`, queue post-prefill work.
-        Each subsequent step, check if prefill has completed; if so, walk
-        the spans and:
+        in its `sampling_params.extra_args`, queue post-prefill capture
+        work. Each subsequent step, check if prefill has completed; if
+        so, walk the spans and:
 
             - if the pool for `chunk_hash` has no base yet:
-                  capture_placeholder_base
+                  capture_placeholder_base   (then update admit verdict)
+            - else if was_injected(req, chunk_hash):
+                  do nothing — connector skipped dense prefill, the live
+                  KV is the anchor-derived approximation, capturing it
+                  would be re-injecting the same content.
             - else:
-                  predict_as_anchor -> if admit, capture_anchor
+                  capture_anchor              (then update admit verdict)
 
-        All errors are caught and logged — a failure in admission /
-        capture must never bring down the engine step.
+        The entropy admit decision itself has moved to the connector's
+        scheduler-side path (see `AnchorPoolConnector._populated_runs_for`);
+        post-prefill capture is unconditional on the "prefill actually
+        ran" case.
+
+        All errors are caught and logged — a failure in capture must
+        never bring down the engine step.
         """
         # Drop pending entries for finished requests.
         for finished_id in scheduler_output.finished_req_ids:
             self._pending.pop(finished_id, None)
             self._injected_spans.pop(finished_id, None)
+            self._req_blend_temperature.pop(finished_id, None)
 
         # 1. Queue new requests that carry anchor_pool_spans.
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -468,9 +485,6 @@ class _AnchorPoolRunnerState:
                 continue
             threshold = float(extra.get(EXTRA_KEY_ENTROPY_THRESHOLD, 0.3))
             top_p = float(extra.get(EXTRA_KEY_TOP_P, 0.9))
-            blend_on_no_admit = bool(
-                extra.get(EXTRA_KEY_BLEND_ON_NO_ADMIT, False)
-            )
             blend_temperature = float(
                 extra.get(EXTRA_KEY_BLEND_TEMPERATURE, 1.0)
             )
@@ -479,9 +493,12 @@ class _AnchorPoolRunnerState:
                 int(num_prompt_tokens),
                 threshold,
                 top_p,
-                blend_on_no_admit,
                 blend_temperature,
             )
+            # Make blend_temperature visible to the connector at inject
+            # time (start_load_kv runs before this request hits the
+            # capture path).
+            self._req_blend_temperature[new_req.req_id] = blend_temperature
             logger.info(
                 "[anchor-pool] queued req=%s spans=%d prompt_tokens=%d",
                 new_req.req_id,
@@ -498,7 +515,6 @@ class _AnchorPoolRunnerState:
             num_prompt_tokens,
             threshold,
             top_p,
-            blend_on_no_admit,
             blend_temperature,
         ) in self._pending.items():
             req_state = self.runner.requests.get(req_id)
@@ -507,7 +523,7 @@ class _AnchorPoolRunnerState:
                 continue
             if int(req_state.num_computed_tokens) < num_prompt_tokens:
                 continue
-            # Prefill done — run captures / predictions for each span.
+            # Prefill done — run captures for each span.
             for span in spans:
                 try:
                     self._handle_span(
@@ -515,8 +531,6 @@ class _AnchorPoolRunnerState:
                         span,
                         threshold,
                         top_p,
-                        blend_on_no_admit,
-                        blend_temperature,
                     )
                 except Exception as e:
                     logger.warning(
@@ -535,9 +549,22 @@ class _AnchorPoolRunnerState:
         span: dict[str, Any],
         threshold: float,
         top_p: float,
-        blend_on_no_admit: bool,
-        blend_temperature: float,
     ) -> None:
+        """Capture-only post-prefill handler.
+
+        The entropy admit decision has already been made pre-forward in
+        the connector. Here we only need to:
+
+          * First observation of a chunk_hash -> capture base.
+          * If the connector skipped dense prefill (was_injected=True) ->
+            do nothing; the live KV is the anchor-derived approximation.
+          * Otherwise (prefill ran, i.e. admit=True or no verdict yet) ->
+            capture a new anchor.
+
+        After any successful capture, refresh the cached admit verdict
+        for this chunk_hash so the connector picks it up on subsequent
+        scheduling decisions.
+        """
         chunk_hash = str(span["chunk_hash"])
         t_start = int(span["t_start"])
         num_tokens = int(span["num_tokens"])
@@ -562,6 +589,7 @@ class _AnchorPoolRunnerState:
                     chunk_hash[:12],
                     num_tokens,
                 )
+                self._recompute_admit_verdict(chunk_hash, threshold, top_p)
             except Exception as e:
                 logger.warning(
                     "[anchor-pool] base capture failed chunk=%s: %s",
@@ -570,140 +598,119 @@ class _AnchorPoolRunnerState:
                 )
             return
 
-        pool = self.manager.pool(chunk_hash)
-
-        # Gather the placeholder's real K/V once — used for admission
-        # similarity (V only) and, if needed, for the blend below.
-        try:
-            real_ph_K, real_ph_V = self.gather_chunk_kv(
-                req_id, t_start, num_tokens
-            )
-        except Exception as e:
-            logger.warning(
-                "[anchor-pool] gather failed req=%s chunk=%s: %s",
-                req_id,
+        # Connector skipped dense prefill — KV at this span is the
+        # injected blend, not real model output. Don't capture it as a
+        # new anchor; that would re-anchor the approximation.
+        if self.was_injected(req_id, chunk_hash):
+            logger.info(
+                "[anchor-pool] skip capture chunk=%s t_start=%d tokens=%d "
+                "(prefill skipped by connector inject)",
                 chunk_hash[:12],
-                e,
+                t_start,
+                num_tokens,
             )
             return
 
-        # Entropy-gated admission — similarity over V at canonical position.
-        # V is position-independent so we use it as-gathered.
+        # Prefill ran (admit=True decided pre-forward, or no verdict yet)
+        # -> capture a new anchor and refresh the verdict.
+        anchor_id = f"anc-{req_id[:10]}-{chunk_hash[:8]}"
+        try:
+            self.capture_anchor(
+                req_id=req_id,
+                chunk_hash=chunk_hash,
+                anchor_id=anchor_id,
+                ph_t_start=t_start,
+                prefix_id=None,
+                derotate=True,
+            )
+            logger.info(
+                "[anchor-pool] anchor captured chunk=%s anchor=%s",
+                chunk_hash[:12],
+                anchor_id,
+            )
+            self._recompute_admit_verdict(chunk_hash, threshold, top_p)
+        except Exception as e:
+            logger.warning(
+                "[anchor-pool] anchor capture failed chunk=%s: %s",
+                chunk_hash[:12],
+                e,
+            )
+
+    # ------------------------------------------------------------------
+    # Admit-verdict cache (read by the connector scheduler-side)
+    # ------------------------------------------------------------------
+    def _recompute_admit_verdict(
+        self,
+        chunk_hash: str,
+        threshold: float,
+        top_p: float,
+    ) -> None:
+        """Refresh `_admit_verdicts[chunk_hash]` by running
+        `predict_as_anchor` with the pool's stored base V as the
+        candidate. The candidate is deterministic per chunk_hash, so the
+        verdict is a property of the pool state itself, not of any
+        specific request.
+
+        verdict=False means the pool is "saturated" enough that the
+        chunk is well-explained by existing anchors — the connector
+        can skip dense prefill for this chunk_hash and inject a
+        blended approximation instead. verdict=True means the pool
+        cannot yet reconstruct the chunk reliably, so dense prefill
+        must run (and the resulting K/V will be captured as a new
+        anchor by `_handle_span`).
+        """
+        if not self.manager.has_pool(chunk_hash):
+            self._admit_verdicts.pop(chunk_hash, None)
+            return
+        pool = self.manager.pool(chunk_hash)
+        base = pool.base()
+        if base is None:
+            self._admit_verdicts.pop(chunk_hash, None)
+            return
+        _K_base, V_base = base
+        # `bump=False`: this is an introspective recompute, not a real
+        # admission event; don't bump anchor activations.
         result = self.predict_as_anchor(
             pool,
-            real_ph_V,
-            threshold=threshold,
-            top_p=top_p,
-            bump=True,
+            V_base,
+            threshold=float(threshold),
+            top_p=float(top_p),
+            bump=False,
         )
+        n_anchors = int(result.get("n_anchors", 0))
+        # n_anchors == 1 trap: a 1-element softmax has zero entropy, so
+        # the entropy math always returns admit=False at n=1 regardless
+        # of how anchor 1 relates to base. That would freeze the pool
+        # at a single anchor forever — no later request could ever
+        # capture a second one. Force admit=True here so the pool can
+        # grow to at least 2 anchors; from n=2 onward the entropy math
+        # has a non-trivial distribution to work with and decides on
+        # its own.
+        if n_anchors == 1:
+            verdict = True
+        else:
+            verdict = bool(result.get("admit"))
+        self._admit_verdicts[chunk_hash] = verdict
         logger.info(
-            "[anchor-pool] predict chunk=%s admit=%s entropy=%.3f/%.3f "
-            "n=%d activated=%d",
+            "[anchor-pool] admit verdict chunk=%s admit=%s n_anchors=%d "
+            "entropy=%.3f/%.3f",
             chunk_hash[:12],
-            result.get("admit"),
+            verdict,
+            n_anchors,
             result.get("entropy", 0.0),
             result.get("max_entropy", 0.0),
-            result.get("n_anchors", 0),
-            len(result.get("activated_anchor_ids", [])),
         )
 
-        if result.get("admit"):
-            # Novel candidate — capture as a new anchor entry. The
-            # capture path re-gathers internally; cheap, and keeps the
-            # public capture_anchor API self-contained.
-            anchor_id = f"anc-{req_id[:10]}-{chunk_hash[:8]}"
-            try:
-                self.capture_anchor(
-                    req_id=req_id,
-                    chunk_hash=chunk_hash,
-                    anchor_id=anchor_id,
-                    ph_t_start=t_start,
-                    prefix_id=None,
-                    derotate=True,
-                )
-                logger.info(
-                    "[anchor-pool] anchor captured chunk=%s anchor=%s",
-                    chunk_hash[:12],
-                    anchor_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[anchor-pool] anchor capture failed chunk=%s: %s",
-                    chunk_hash[:12],
-                    e,
-                )
-            return
+    def get_admit_verdict(self, chunk_hash: str) -> bool | None:
+        """Return the cached admit verdict for `chunk_hash`, or None if
+        no verdict has been computed yet (e.g. the chunk has never been
+        observed). Called by the connector scheduler-side."""
+        return self._admit_verdicts.get(chunk_hash)
 
-        # admit=False: the candidate is well-explained by existing
-        # anchors. If blending is enabled, apply the reference-style
-        # weighted-sum correction and write back. Otherwise just return
-        # (activation counts already bumped inside predict_as_anchor).
-        if not blend_on_no_admit:
-            return
-        if result.get("n_anchors", 0) == 0:
-            return
-        # Only blend spans whose dense prefill was actually skipped by the
-        # connector. If prefill ran for this span, the live K/V is already
-        # the ground truth — don't overwrite it with the approximation.
-        if not self.was_injected(req_id, chunk_hash):
-            logger.info(
-                "[anchor-pool] skip blend chunk=%s t_start=%d tokens=%d "
-                "(prefill ran, not injected)",
-                chunk_hash[:12],
-                t_start,
-                num_tokens,
-            )
-            return
-
-        try:
-            # Blend in canonical-position-0 frame: anchor embeddings and
-            # deltas are stored de-rotated. De-rotate the candidate K so
-            # the per-(layer, head) similarity comparison is meaningful.
-            real_ph_K_pos0 = self.derotate_to_position_zero(
-                real_ph_K, t_start
-            )
-            # No prefix segment in this template — pass zeros so the
-            # blend math runs cleanly and we just ignore the pf outputs.
-            zero_pf_K = torch.zeros_like(real_ph_K_pos0)
-            zero_pf_V = torch.zeros_like(real_ph_V)
-
-            (
-                corr_ph_K_pos0,
-                corr_ph_V,
-                _corr_pf_K,
-                _corr_pf_V,
-            ) = self.blend_anchors(
-                pool,
-                real_ph_K=real_ph_K_pos0,
-                real_ph_V=real_ph_V,
-                base_pf_K=zero_pf_K,
-                base_pf_V=zero_pf_V,
-                temperature=blend_temperature,
-                skip_layer_zero=True,
-            )
-
-            # Re-rotate K back to the request's absolute position, then
-            # scatter the corrected (K, V) into the request's blocks.
-            corr_ph_K = self.rerotate_from_position_zero(
-                corr_ph_K_pos0, t_start
-            )
-            self.scatter_chunk_kv(req_id, t_start, corr_ph_K, corr_ph_V)
-            logger.info(
-                "[anchor-pool] blended chunk=%s t_start=%d tokens=%d "
-                "anchors=%d temperature=%.3f",
-                chunk_hash[:12],
-                t_start,
-                num_tokens,
-                result.get("n_anchors", 0),
-                blend_temperature,
-            )
-        except Exception as e:
-            logger.warning(
-                "[anchor-pool] blend failed chunk=%s t_start=%d: %s",
-                chunk_hash[:12],
-                t_start,
-                e,
-            )
+    def get_blend_temperature(self, req_id: str) -> float:
+        """Return the blend temperature stashed for `req_id` at queue
+        time, or 1.0 if unknown. Called by the connector inject path."""
+        return self._req_blend_temperature.get(req_id, 1.0)
 
     # ------------------------------------------------------------------
     # Capture — three explicit primitives
