@@ -179,6 +179,7 @@ def post_chunked_chat_streaming(
     max_tokens: int,
     temperature: float,
     timeout_s: float,
+    agent_id: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Send a streaming chunked_chat request and measure TTFT.
 
@@ -188,7 +189,7 @@ def post_chunked_chat_streaming(
         - output: assembled assistant text
         - prompt_tokens / completion_tokens: from the final usage frame
     """
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "chunks": chunks,
         "anchor_indices": anchor_indices,
@@ -199,6 +200,8 @@ def post_chunked_chat_streaming(
         # this many servers omit usage in streaming mode.
         "stream_options": {"include_usage": True},
     }
+    if agent_id is not None:
+        payload["agent_id"] = agent_id
     body = json.dumps(payload).encode("utf-8")
     url = f"{base_url.rstrip('/')}/v1/chunked_chat/completions"
     req = urllib.request.Request(
@@ -293,6 +296,7 @@ def run_stage(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         timeout_s=args.timeout,
+        agent_id=args.agent_id,
     )
 
     output = body.get("output") or ""
@@ -342,7 +346,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send the first stage twice so caches are warm before timing.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--agent-id",
+        default="benchmark-agent-1",
+        help=(
+            "Sent as the request's `agent_id` so the server namespaces "
+            "anchor pools per agent. Defaults to a single agent for the "
+            "whole run; pass an empty string to disable."
+        ),
+    )
+    ns = parser.parse_args()
+    if ns.agent_id == "":
+        ns.agent_id = None
+    return ns
 
 
 def main() -> None:
@@ -357,6 +373,7 @@ def main() -> None:
     print(f"  templates dir : {templates_dir}")
     print(f"  base url      : {args.base_url}")
     print(f"  model         : {args.model}")
+    print(f"  agent_id      : {args.agent_id if args.agent_id else '-'}")
     print(f"  mode          : {mode}")
     if mode == "growing_history":
         print(f"  prefix chunks : {manifest['static_prefix_chunks']}")

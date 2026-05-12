@@ -44,6 +44,16 @@ class ChunkedChatCompletionRequest(ChatCompletionRequest):
         ),
     )
 
+    agent_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional unique id (e.g. agent id) that namespaces the "
+            "anchor pools for this request's chunks. Two requests with "
+            "the same chunk text but different `agent_id` will not share "
+            "pools. Leave unset for a global namespace."
+        ),
+    )
+
     @model_validator(mode="after")
     def _validate_chunks_and_anchors(self) -> "ChunkedChatCompletionRequest":
         if not self.chunks and not self.messages:

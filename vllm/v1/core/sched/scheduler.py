@@ -318,11 +318,25 @@ class Scheduler(SchedulerInterface):
         runs = self._external_runs.get(request.request_id)
         if not runs:
             return cursor, []
+        start_cursor = cursor
         traversed: list[tuple[int, int]] = []
         for run_start, run_length in runs:
             if run_start == cursor:
                 traversed.append((run_start, run_length))
                 cursor = run_start + run_length
+        # Non-contiguity proof: a run we just skipped started at a
+        # position > 0, i.e. there were uncached tokens before it that
+        # this request had to dense-prefill in an earlier step.
+        if traversed and start_cursor > 0:
+            logger.info(
+                "[NONCONTIG-SKIP] req=%s skipped non-leading external runs "
+                "at cursor=%d: %s (advanced %d -> %d)",
+                request.request_id,
+                start_cursor,
+                traversed,
+                start_cursor,
+                cursor,
+            )
         return cursor, traversed
 
     def _cap_at_next_external_run(
@@ -337,7 +351,21 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
         for run_start, _ in runs:
             if run_start > cursor:
-                return min(num_new_tokens, run_start - cursor)
+                capped = min(num_new_tokens, run_start - cursor)
+                # Non-contiguity proof: there is a future external run
+                # downstream of this dense chunk, so the skip set is not
+                # a single leading prefix.
+                if capped < num_new_tokens:
+                    logger.info(
+                        "[NONCONTIG-CAP] req=%s cursor=%d capped dense "
+                        "chunk %d -> %d (next run starts at %d)",
+                        request.request_id,
+                        cursor,
+                        num_new_tokens,
+                        capped,
+                        run_start,
+                    )
+                return capped
         return num_new_tokens
 
     def _mamba_block_aligned_split(
@@ -729,9 +757,26 @@ class Scheduler(SchedulerInterface):
                             runs = []
                         if runs:
                             runs = sorted(runs, key=lambda r: int(r[0]))
-                            self._external_runs[request.request_id] = [
+                            normalized = [
                                 (int(s), int(l)) for s, l in runs
                             ]
+                            self._external_runs[request.request_id] = (
+                                normalized
+                            )
+                            # Classify the run set so non-contiguous
+                            # admission is unambiguous in the log.
+                            is_noncontig = (
+                                len(normalized) > 1
+                                or normalized[0][0] > 0
+                            )
+                            logger.info(
+                                "[EXTRUNS-ADMIT] req=%s num_prompt=%d "
+                                "runs=%s non_contiguous=%s",
+                                request.request_id,
+                                request.num_tokens,
+                                normalized,
+                                is_noncontig,
+                            )
                         else:
                             self._external_runs.pop(
                                 request.request_id, None

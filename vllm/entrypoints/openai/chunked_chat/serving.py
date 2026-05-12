@@ -142,6 +142,7 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
         self,
         chunks: list[str],
         anchor_indices: list[int],
+        agent_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return a list of `{chunk_hash, t_start, num_tokens}` for each
         chunk whose index is in `anchor_indices`.
@@ -152,6 +153,10 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
         without sub-substring stability may produce off-by-1 spans, but
         for templates that put chunks on their own lines (the benchmark
         case) the boundaries are exact.
+
+        If `agent_id` is set, the chunk hash mixes it in so the
+        downstream pool key is namespaced per agent: two agents sending
+        the same chunk text get separate pools.
         """
         tokenizer = self.renderer.tokenizer
         if tokenizer is None:
@@ -253,9 +258,16 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
                     idx,
                 )
                 continue
-            chunk_hash = hashlib.sha256(
-                effective_chunk_text.encode("utf-8")
-            ).hexdigest()
+            # Namespace by agent_id so pools are partitioned per agent.
+            # Length-prefix the id to avoid hash collisions between
+            # (agent="ab", text="cd") and (agent="a", text="bcd").
+            hasher = hashlib.sha256()
+            if agent_id is not None:
+                aid_bytes = agent_id.encode("utf-8")
+                hasher.update(len(aid_bytes).to_bytes(8, "big"))
+                hasher.update(aid_bytes)
+            hasher.update(effective_chunk_text.encode("utf-8"))
+            chunk_hash = hasher.hexdigest()
             spans.append(
                 {
                     "chunk_hash": chunk_hash,
@@ -265,11 +277,12 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
             )
             logger.info(
                 "[chunked_chat] anchor span chunk_idx=%d hash=%s "
-                "t_start=%d num_tokens=%d%s",
+                "t_start=%d num_tokens=%d agent=%s%s",
                 idx,
                 chunk_hash[:12],
                 t_start,
                 num_tokens,
+                agent_id if agent_id is not None else "-",
                 " (wrapper absorbed)" if (idx == 0 and absorb_wrapper) else "",
             )
         return spans
@@ -288,6 +301,7 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
 
         chunks = list(request.chunks or [])
         anchor_indices = list(request.anchor_indices or [])
+        agent_id = request.agent_id
 
         # If messages weren't supplied, build a single user message from
         # the concatenated chunks. The standard chat path will tokenize
@@ -302,7 +316,9 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
         # the worker extension can act on them after prefill.
         if chunks and anchor_indices and self._anchor_pool_installed:
             try:
-                spans = self._compute_chunk_spans(chunks, anchor_indices)
+                spans = self._compute_chunk_spans(
+                    chunks, anchor_indices, agent_id=agent_id
+                )
             except Exception as e:
                 logger.warning(
                     "[chunked_chat] span computation failed: %s", e
@@ -322,8 +338,9 @@ class OpenAIServingChunkedChat(OpenAIServingChat):
                 request.vllm_xargs = xargs
                 logger.info(
                     "[chunked_chat] dispatching with %d anchor spans "
-                    "(threshold=%.2f top_p=%.2f blend=%s temp=%.2f)",
+                    "agent=%s (threshold=%.2f top_p=%.2f blend=%s temp=%.2f)",
                     len(spans),
+                    agent_id if agent_id is not None else "-",
                     self._anchor_pool_threshold,
                     self._anchor_pool_top_p,
                     self._anchor_pool_blend_on_no_admit,
