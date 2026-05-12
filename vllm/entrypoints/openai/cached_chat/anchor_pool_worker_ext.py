@@ -613,7 +613,11 @@ class _AnchorPoolRunnerState:
 
         # Prefill ran (admit=True decided pre-forward, or no verdict yet)
         # -> capture a new anchor and refresh the verdict.
-        anchor_id = f"anc-{req_id[:10]}-{chunk_hash[:8]}"
+        # Use the full req_id (vLLM's `chatcmpl-XXXXXXX` is ~16 chars):
+        # truncating to 10 leaves only one byte of disambiguation, which
+        # collides whenever two requests for the same chunk_hash share
+        # their first random char.
+        anchor_id = f"anc-{req_id}-{chunk_hash[:8]}"
         try:
             self.capture_anchor(
                 req_id=req_id,
