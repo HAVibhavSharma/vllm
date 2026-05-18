@@ -29,11 +29,17 @@ from vllm.v1.agent_prefetch.registry import (
     AgentPrefixRegistry,
     PrefixDescriptor,
 )
+from vllm.v1.agent_prefetch.submitter import (
+    PhantomPrefetchSubmitter,
+    build_prefetch_request_id,
+)
 
 __all__ = [
     "AgentPrefixRegistry",
     "DEFAULT_CHUNK_SIZE",
+    "PhantomPrefetchSubmitter",
     "PrefixDescriptor",
+    "build_prefetch_request_id",
     "chunk_align",
     "compute_prefix_hash",
 ]

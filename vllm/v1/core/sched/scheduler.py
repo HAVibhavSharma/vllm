@@ -51,7 +51,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -1674,7 +1679,7 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
-            self._update_from_kv_xfer_finished(kv_connector_output)
+            self._update_from_kv_xfer_finished(kv_connector_output, outputs)
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -2270,15 +2275,25 @@ class Scheduler(SchedulerInterface):
             f"{request.status.name} for request {request.request_id}"
         )
 
-    def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
+    def _update_from_kv_xfer_finished(
+        self,
+        kv_connector_output: KVConnectorOutput,
+        outputs: dict[int, list[EngineCoreOutput]] | None = None,
+    ):
         """
         KV Connector: update the scheduler state based on the output.
 
         The Worker side connectors add finished_recving and
         finished_sending reqs to the output.
         * if finished_sending: free the blocks
-        # if finished_recving: add to state so we can
+        * if finished_recving: add to state so we can
             schedule the request during the next step.
+        * if finished_recving AND the request is flagged ``prefetch_only``
+          in ``kv_transfer_params``: register the loaded blocks in vLLM's
+          APC and finish the request right here, *without* ever
+          scheduling prefill for it. A terminal ``EngineCoreOutput`` is
+          appended to ``outputs`` so the caller's response stream
+          resolves.
         """
 
         if self.connector is not None:
@@ -2290,7 +2305,10 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                self.finished_recving_kv_req_ids.add(req_id)
+                if self._is_prefetch_only_request(req):
+                    self._finalize_prefetch_only_request(req, outputs)
+                else:
+                    self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._free_blocks(self.requests[req_id])
@@ -2298,6 +2316,56 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
+
+    @staticmethod
+    def _is_prefetch_only_request(request: Request) -> bool:
+        params = request.kv_transfer_params
+        return bool(params and params.get("prefetch_only"))
+
+    def _finalize_prefetch_only_request(
+        self,
+        request: Request,
+        outputs: dict[int, list[EngineCoreOutput]] | None,
+    ) -> None:
+        """Register the loaded prefix blocks in APC and finish the
+        phantom request without ever scheduling prefill.
+
+        Blocks remain in the prefix tree even after the request is
+        freed, so a later real request whose prompt starts with the
+        same prefix hits APC and skips prefill entirely. This is the
+        whole point of the prefetch_only path.
+        """
+        # Snapshot client_index before _free_request removes the
+        # request from self.requests.
+        client_index = request.client_index
+        request_id = request.request_id
+
+        # Register loaded blocks with the prefix cache.
+        self.kv_cache_manager.cache_blocks(
+            request, request.num_computed_tokens
+        )
+
+        # Remove from waiting queues so finish bookkeeping doesn't see it.
+        self.waiting.remove_requests([request])
+        self.skipped_waiting.remove_requests([request])
+
+        request.status = RequestStatus.FINISHED_STOPPED
+        self._free_request(request)
+
+        if outputs is not None:
+            outputs[client_index].append(
+                EngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.STOP,
+                )
+            )
+        logger.debug(
+            "Finalized prefetch_only request %s "
+            "(%d computed tokens, registered in APC)",
+            request_id,
+            request.num_computed_tokens,
+        )
 
     def _update_requests_with_invalid_blocks(
         self,

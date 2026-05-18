@@ -217,6 +217,12 @@ class LMCacheMPRequestTracker:
 
     cache_salt: str = ""
 
+    # Phantom prefetch: when True, the scheduler finalizes this request
+    # after the async load completes -- loaded blocks are registered in
+    # vLLM's APC but prefill is skipped entirely. See the scheduler's
+    # _update_from_kv_xfer_finished branch.
+    prefetch_only: bool = False
+
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
         self.cache_salt: str = request.cache_salt or ""
@@ -227,6 +233,8 @@ class LMCacheMPRequestTracker:
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
         self.state = LMCacheMPRequestState.PREFETCHING
+        params = getattr(request, "kv_transfer_params", None) or {}
+        self.prefetch_only = bool(params.get("prefetch_only", False))
 
     ####
     # Check the state of the request
@@ -949,12 +957,23 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 num_extra_cached_blocks * self.vllm_block_size
             )
 
+        # Phantom prefetch: nothing was ever stored to LMCache for this
+        # request (we only retrieved into blocks for APC warming and
+        # finished before any prefill). There's no in-flight STORE to
+        # await, so blocks can be freed immediately. Returning True here
+        # would leak them -- get_finished() never reports finished_sending
+        # for a request that did not store.
+        is_prefetch_only = bool(
+            params is not None and params.get("prefetch_only", False)
+        )
+
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
 
-        return True, return_params
+        delay_blocks = not is_prefetch_only
+        return delay_blocks, return_params
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
