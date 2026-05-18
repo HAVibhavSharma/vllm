@@ -485,7 +485,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             "lmcache.mp.host", "tcp://localhost"
         )
         server_port = vllm_config.kv_transfer_config.get_from_extra_config(
-            "lmcache.mp.port", 5555
+            "lmcache.mp.port", 10903
         )
         mq_timeout = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
