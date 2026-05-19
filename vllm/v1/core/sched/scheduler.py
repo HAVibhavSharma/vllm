@@ -2352,6 +2352,21 @@ class Scheduler(SchedulerInterface):
         request.status = RequestStatus.FINISHED_STOPPED
         self._free_request(request)
 
+        # Do NOT propagate this phantom into the worker's finished_req_ids
+        # set. The phantom never entered the model runner batch (we
+        # finalized it before any forward step processed it), so there
+        # is nothing for the worker to clean up. Worse, the LMCache MP
+        # adapter's _process_finished_stores treats any
+        # finished_req_id_from_engine without a tracked store/retrieve
+        # future as finished_sending -- which would arrive on the next
+        # step and trip the scheduler's "req_id in self.requests"
+        # assertion because the phantom is already deleted here.
+        self.finished_req_ids.discard(request_id)
+        if self.finished_req_ids_dict is not None:
+            per_client = self.finished_req_ids_dict.get(client_index)
+            if per_client is not None:
+                per_client.discard(request_id)
+
         if outputs is not None:
             outputs[client_index].append(
                 EngineCoreOutput(
