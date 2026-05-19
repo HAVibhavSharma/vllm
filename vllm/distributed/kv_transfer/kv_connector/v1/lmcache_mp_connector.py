@@ -957,23 +957,19 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 num_extra_cached_blocks * self.vllm_block_size
             )
 
-        # Phantom prefetch: nothing was ever stored to LMCache for this
-        # request (we only retrieved into blocks for APC warming and
-        # finished before any prefill). There's no in-flight STORE to
-        # await, so blocks can be freed immediately. Returning True here
-        # would leak them -- get_finished() never reports finished_sending
-        # for a request that did not store.
-        is_prefetch_only = bool(
-            params is not None and params.get("prefetch_only", False)
-        )
-
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
 
-        delay_blocks = not is_prefetch_only
-        return delay_blocks, return_params
+        # Always delay block free until the worker reports finished_sending.
+        # For prefetch_only requests that *did* store (LMCache miss → normal
+        # prefill path) this is required for correctness. For prefetch_only
+        # requests that did NOT store (async-load early-finalize path) the
+        # LMCache MP adapter's _process_finished_stores still emits a
+        # synthesized finished_sending for the req_id once the engine reports
+        # it as finished, so blocks free naturally then.
+        return True, return_params
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
