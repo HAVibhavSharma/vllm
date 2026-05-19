@@ -47,6 +47,12 @@ def register_generate_api_routers(app: FastAPI):
 
     register_cached_chat_api_router(app)
 
+    from vllm.entrypoints.openai.agent_chat.api_router import (
+        attach_router as register_agent_chat_api_router,
+    )
+
+    register_agent_chat_api_router(app)
+
     from vllm.entrypoints.anthropic.api_router import (
         attach_router as register_anthropic_api_router,
     )
