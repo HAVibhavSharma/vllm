@@ -23,7 +23,7 @@ import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.entrypoints.openai.agent_chat.protocol import (
@@ -270,6 +270,144 @@ async def create_agent_chat_completion(
     if isinstance(generator, ChatCompletionResponse):
         return JSONResponse(content=generator.model_dump())
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/v1/agents/reset_prefix_cache")
+async def reset_agent_prefix_cache(
+    raw_request: Request,
+    reset_apc: bool = Query(
+        default=True,
+        description="Reset vLLM's GPU paged-KV prefix cache.",
+    ),
+    reset_registry: bool = Query(
+        default=False,
+        description="Drop the in-process agent prefix registry. "
+        "Forces phantom prefetches to wait until the registry is "
+        "re-populated by subsequent calls.",
+    ),
+    reset_connector: bool = Query(
+        default=False,
+        description="Also reset the KV connector cache (LMCache CPU L1 "
+        "via the connector). Use with care -- this throws away data "
+        "the server holds in CPU memory.",
+    ),
+):
+    """Reset prefix-cache layers used by the agent prefetch path.
+
+    Useful for benchmarking: clear GPU APC so the next call goes cold,
+    but keep the agent registry and LMCache CPU pool so the prefetch
+    endpoint can demonstrate CPU->GPU warming.
+    """
+    started_ns = time.monotonic_ns()
+    actions: list[str] = []
+    result: dict[str, Any] = {
+        "requested": {
+            "reset_apc": reset_apc,
+            "reset_registry": reset_registry,
+            "reset_connector": reset_connector,
+        },
+        "actions": actions,
+        "apc": None,
+        "registry": None,
+        "duration_ms": None,
+    }
+
+    chat_handler = _chat_handler(raw_request)
+
+    # --- APC reset ---
+    if reset_apc:
+        if chat_handler is None:
+            logger.warning(
+                "agent_prefetch: reset_prefix_cache called but no chat "
+                "handler is available; cannot reset APC"
+            )
+            result["apc"] = {
+                "ok": False,
+                "reason": "engine_client_unavailable",
+            }
+            return JSONResponse(content=result, status_code=503)
+
+        logger.info(
+            "agent_prefetch: resetting vLLM APC "
+            "(reset_connector=%s)",
+            reset_connector,
+        )
+        apc_returned = await chat_handler.engine_client.reset_prefix_cache(
+            reset_running_requests=False,
+            reset_connector=reset_connector,
+        )
+        actions.append("apc_reset")
+        result["apc"] = {
+            "ok": bool(apc_returned),
+            "engine_returned": apc_returned,
+            "connector_reset": reset_connector,
+        }
+        logger.info(
+            "agent_prefetch: APC reset complete (engine returned %s)",
+            apc_returned,
+        )
+        if reset_connector:
+            actions.append("connector_reset")
+
+    # --- Registry reset ---
+    registry: AgentPrefixRegistry | None = getattr(
+        raw_request.app.state, _REGISTRY_ATTR, None
+    )
+    registry_before = registry.stats() if registry is not None else None
+
+    if reset_registry:
+        if registry is None:
+            logger.info(
+                "agent_prefetch: reset_registry requested but registry "
+                "has not been initialized yet -- no-op"
+            )
+        else:
+            registry.clear()
+            actions.append("registry_cleared")
+            logger.info(
+                "agent_prefetch: registry cleared (was: %s)",
+                registry_before,
+            )
+
+    result["registry"] = {
+        "before": registry_before,
+        "after": registry.stats() if registry is not None else None,
+    }
+
+    elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
+    result["duration_ms"] = round(elapsed_ms, 2)
+
+    logger.info(
+        "agent_prefetch: reset done in %.2fms actions=%s",
+        elapsed_ms,
+        actions,
+    )
+    return JSONResponse(content=result)
+
+
+@router.get("/v1/agents/registry_stats")
+async def get_agent_registry_stats(raw_request: Request):
+    """Inspect the in-process registry. Returns counts per agent so you
+    can verify phantoms have history to prefetch from before kicking
+    off a benchmark."""
+    registry = getattr(raw_request.app.state, _REGISTRY_ATTR, None)
+    if registry is None:
+        return JSONResponse(
+            content={"initialized": False, "agents": {}}
+        )
+    overall = registry.stats()
+    # Per-agent sizes via the public size accessor.
+    # We intentionally don't expose token_ids -- those can be large.
+    agent_sizes = {}
+    for agent_id in list(registry._by_agent.keys()):  # type: ignore[attr-defined]
+        agent_sizes[agent_id] = registry.agent_size(agent_id)
+    return JSONResponse(
+        content={
+            "initialized": True,
+            "overall": overall,
+            "per_agent_sizes": agent_sizes,
+        }
+    )
 
 
 def attach_router(app: FastAPI) -> None:
