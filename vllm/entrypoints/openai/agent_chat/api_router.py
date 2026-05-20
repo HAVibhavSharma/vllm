@@ -1,33 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HTTP route for the agent-scoped chat completion endpoint.
+"""HTTP routes for the agent-scoped chat completion + prefetch endpoints.
 
-Wraps the existing ``OpenAIServingChat`` pipeline with a thin layer
-that:
+This module exposes three POST routes plus one GET diagnostic:
 
-1. Tokenizes the incoming request to obtain ``prompt_token_ids``.
-2. Looks up the per-agent prefix registry and fires phantom
-   prefetches for the agent's most recent N prefixes (best-effort,
-   non-blocking).
-3. Delegates the real chat completion to ``OpenAIServingChat``.
-4. Records the new prompt's chunk-aligned prefix in the registry so
-   future calls from the same agent can pre-warm it.
+* ``POST /v1/agents/chat/completions`` -- a thin wrapper around the
+  existing ``OpenAIServingChat`` pipeline that:
+  1. Tokenizes the incoming request to obtain ``prompt_token_ids``.
+  2. Delegates the real chat completion to ``OpenAIServingChat``.
+  3. Records the new prompt's chunk-aligned prefix in the per-agent
+     registry so a *future* ``/v1/agents/prefetch`` call can warm it.
+  This endpoint **does not fire phantom prefetches**.
+
+* ``POST /v1/agents/prefetch`` -- the new explicit cache-warming
+  endpoint. Body contains ``{agent_id, prefetch_top_k?, wait?}``. Fans
+  out phantom prefetches for the agent's most recent prefixes and, by
+  default, blocks until all phantoms finish so APC is guaranteed warm
+  on return.
+
+* ``POST /v1/agents/reset_prefix_cache`` -- reset APC/registry/
+  connector. Useful for benchmarking.
+
+* ``GET /v1/agents/registry_stats`` -- inspect per-agent registry
+  sizes for diagnostics.
 
 The registry + submitter are lazily attached to ``app.state`` on the
-first request; no startup-hook surgery is required.
+first request that needs them; no startup-hook surgery is required.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.entrypoints.openai.agent_chat.protocol import (
     AgentChatCompletionRequest,
+    AgentPrefetchRequest,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
@@ -74,12 +87,12 @@ def _get_or_init_state(
         registry = AgentPrefixRegistry(
             default_top_k=20,
             max_agents=10_000,
-            max_per_agent=64,
+            max_per_agent=None,  # no per-agent cap
         )
         setattr(state, _REGISTRY_ATTR, registry)
         logger.info(
             "agent_prefetch: initialized registry "
-            "(default_top_k=20, max_agents=10000, max_per_agent=64)"
+            "(default_top_k=20, max_agents=10000, max_per_agent=unlimited)"
         )
     if submitter is None:
         submitter = PhantomPrefetchSubmitter(
@@ -121,24 +134,49 @@ async def _fan_out_prefetches(
     registry: AgentPrefixRegistry,
     submitter: PhantomPrefetchSubmitter,
     agent_id: str,
-    k: int,
-) -> int:
-    """Submit up to ``k`` phantom prefetches for ``agent_id``. Returns
-    the number actually submitted (after dedup)."""
-    if k <= 0:
-        return 0
-    descriptors = registry.top_k(agent_id, k=k)
-    submitted = 0
+    k: int | None,
+    wait: bool,
+) -> tuple[int, int]:
+    """Submit phantom prefetches for ``agent_id``.
+
+    When ``k`` is None, every prefix the registry has stored for the
+    agent is warmed (no top-K truncation). When ``k`` is a positive
+    int, only the ``k`` most-recently-used prefixes are warmed; ``k``
+    <= 0 is a no-op.
+
+    Returns ``(submitted, completed)`` -- ``submitted`` is the number
+    of phantoms actually handed to the engine after dedup; ``completed``
+    is how many ran to completion (equal to ``submitted`` when
+    ``wait=True``, else 0 because we did not block).
+    """
+    if k is None:
+        descriptors = registry.get_all(agent_id)
+    elif k <= 0:
+        return 0, 0
+    else:
+        descriptors = registry.top_k(agent_id, k=k)
+
+    tasks: list[asyncio.Task] = []
     for desc in descriptors:
-        ok = await submitter.submit(
+        task = await submitter.submit(
             agent_id=agent_id,
             token_ids=desc.token_ids,
             prefix_hash=desc.prefix_hash,
             cache_salt=desc.cache_salt,
         )
-        if ok:
-            submitted += 1
-    return submitted
+        if task is not None:
+            tasks.append(task)
+
+    submitted = len(tasks)
+    if not wait or not tasks:
+        return submitted, 0
+
+    # `_run_one` absorbs all exceptions except CancelledError, so
+    # gather will normally complete cleanly. `return_exceptions=True`
+    # is belt-and-braces in case a future refactor changes that.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    completed = sum(1 for r in results if not isinstance(r, BaseException))
+    return submitted, completed
 
 
 def _record_in_registry(
@@ -164,7 +202,11 @@ def _record_in_registry(
     return True
 
 
-def _resolve_cache_salt(req: AgentChatCompletionRequest) -> str:
+def _resolve_chat_cache_salt(req: AgentChatCompletionRequest) -> str:
+    return req.agent_cache_salt or f"agent::{req.agent_id}"
+
+
+def _resolve_prefetch_cache_salt(req: AgentPrefetchRequest) -> str:
     return req.agent_cache_salt or f"agent::{req.agent_id}"
 
 
@@ -185,6 +227,16 @@ async def create_agent_chat_completion(
     request: AgentChatCompletionRequest,
     raw_request: Request,
 ):
+    """Agent-scoped chat completion.
+
+    Delegates to the existing chat completion handler and, on success,
+    records the prompt's chunk-aligned prefix in the per-agent
+    registry so a subsequent ``POST /v1/agents/prefetch`` can warm it.
+
+    **Does not fire phantom prefetches.** Call
+    ``POST /v1/agents/prefetch`` explicitly if you want APC warmed
+    before this call.
+    """
     chat_handler = _chat_handler(raw_request)
     if chat_handler is None:
         return JSONResponse(
@@ -196,49 +248,31 @@ async def create_agent_chat_completion(
             status_code=HTTPStatus.NOT_IMPLEMENTED.value,
         )
 
-    registry, submitter = _get_or_init_state(raw_request, chat_handler)
+    registry, _submitter = _get_or_init_state(raw_request, chat_handler)
 
-    cache_salt = _resolve_cache_salt(request)
-    top_k = (
-        request.prefetch_top_k
-        if request.prefetch_top_k is not None
-        else registry.default_top_k
-    )
+    cache_salt = _resolve_chat_cache_salt(request)
 
-    # 1) Tokenize the incoming request. We need prompt_token_ids both
-    # for the post-call registry record and (potentially) for future
-    # phantom prefetches.
-    tokens_or_err = await _tokenize_prompt(chat_handler, request)
-    if isinstance(tokens_or_err, ErrorResponse):
-        return JSONResponse(
-            content=tokens_or_err.model_dump(),
-            status_code=tokens_or_err.error.code,
-        )
-    prompt_token_ids: list[int] = tokens_or_err
+    # 1) Tokenize the incoming request so we can record its prefix
+    # after delegation. Required even if record_in_registry is False
+    # would be wasteful -- so skip tokenization in that case.
+    prompt_token_ids: list[int] = []
+    if request.record_in_registry:
+        tokens_or_err = await _tokenize_prompt(chat_handler, request)
+        if isinstance(tokens_or_err, ErrorResponse):
+            return JSONResponse(
+                content=tokens_or_err.model_dump(),
+                status_code=tokens_or_err.error.code,
+            )
+        prompt_token_ids = tokens_or_err
 
-    # 2) Fire phantom prefetches for this agent's recent prefixes.
-    # Fire-and-forget: do not await completion.
-    submitted = await _fan_out_prefetches(
-        registry=registry,
-        submitter=submitter,
-        agent_id=request.agent_id,
-        k=top_k,
-    )
-    if submitted:
-        logger.debug(
-            "agent_prefetch: submitted %d phantom prefetches for agent %s",
-            submitted,
-            request.agent_id,
-        )
-
-    # 3) Delegate the real call to the existing chat completion handler.
+    # 2) Delegate the real call to the existing chat completion handler.
     inner = request.to_chat_completion_request()
     generator = await chat_handler.create_chat_completion(inner, raw_request)
 
-    # 4) Record this prompt's chunk-aligned prefix for future prefetches.
-    # Done *before* returning so it's already available for the next
-    # agent call regardless of streaming completion.
-    if request.record_in_registry:
+    # 3) Record this prompt's chunk-aligned prefix for future prefetches.
+    # Done before returning so it's available to the next call regardless
+    # of whether the response was fully streamed.
+    if request.record_in_registry and prompt_token_ids:
         try:
             recorded = _record_in_registry(
                 registry=registry,
@@ -262,7 +296,7 @@ async def create_agent_chat_completion(
                 request.agent_id,
             )
 
-    # 5) Return whatever the chat handler produced.
+    # 4) Return whatever the chat handler produced.
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
@@ -270,6 +304,104 @@ async def create_agent_chat_completion(
     if isinstance(generator, ChatCompletionResponse):
         return JSONResponse(content=generator.model_dump())
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post(
+    "/v1/agents/prefetch",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": None},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_IMPLEMENTED.value: {"model": ErrorResponse},
+    },
+)
+async def prefetch_agent_cache(
+    request: AgentPrefetchRequest,
+    raw_request: Request,
+):
+    """Warm APC for ``agent_id`` by submitting phantom prefetches.
+
+    Pulls the agent's most recent ``prefetch_top_k`` prefixes from the
+    registry and submits a phantom request per prefix. Each phantom
+    drives the LMCache -> GPU load that registers the prefix in APC.
+
+    When ``wait`` is True (default) the response is held until every
+    phantom finishes, so the caller can immediately follow up with a
+    chat completion and expect APC hits. When ``wait`` is False the
+    endpoint returns as soon as phantoms are submitted.
+
+    Response body::
+
+      {
+        "agent_id": "...",
+        "requested_top_k": 20,
+        "available_prefixes": 3,
+        "submitted": 3,
+        "completed": 3,
+        "waited": true,
+        "duration_ms": 142.5
+      }
+    """
+    started_ns = time.monotonic_ns()
+
+    chat_handler = _chat_handler(raw_request)
+    if chat_handler is None:
+        return JSONResponse(
+            content=ErrorResponse(
+                type="NotImplemented",
+                message="The model does not support Chat Completions API; "
+                "agent prefetch is unavailable.",
+                code=HTTPStatus.NOT_IMPLEMENTED.value,
+            ).model_dump(),
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
+
+    registry, submitter = _get_or_init_state(raw_request, chat_handler)
+
+    # None ≡ "warm every prefix the registry has for this agent"; the
+    # request validator enforces ge=0 so non-None values are truncating
+    # caps (mostly useful for benchmarking).
+    top_k = request.prefetch_top_k
+    available = registry.agent_size(request.agent_id)
+    top_k_repr = "all" if top_k is None else str(top_k)
+
+    logger.info(
+        "agent_prefetch: prefetch request for agent=%s top_k=%s "
+        "available=%d wait=%s",
+        request.agent_id,
+        top_k_repr,
+        available,
+        request.wait,
+    )
+
+    submitted, completed = await _fan_out_prefetches(
+        registry=registry,
+        submitter=submitter,
+        agent_id=request.agent_id,
+        k=top_k,
+        wait=request.wait,
+    )
+
+    elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
+    body: dict[str, Any] = {
+        "agent_id": request.agent_id,
+        # "all" when no cap was provided; an int otherwise.
+        "requested_top_k": top_k_repr,
+        "available_prefixes": available,
+        "submitted": submitted,
+        "completed": completed,
+        "waited": request.wait,
+        "duration_ms": round(elapsed_ms, 2),
+    }
+    logger.info(
+        "agent_prefetch: prefetch done agent=%s submitted=%d completed=%d "
+        "elapsed=%.2fms",
+        request.agent_id,
+        submitted,
+        completed,
+        elapsed_ms,
+    )
+    return JSONResponse(content=body)
 
 
 @router.post("/v1/agents/reset_prefix_cache")

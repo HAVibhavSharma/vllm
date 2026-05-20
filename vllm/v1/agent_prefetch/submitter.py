@@ -73,20 +73,25 @@ class PhantomPrefetchSubmitter:
         token_ids: Sequence[int],
         prefix_hash: bytes,
         cache_salt: str,
-    ) -> bool:
+    ) -> asyncio.Task | None:
         """Submit one phantom prefetch.
 
-        Returns True if the request was submitted, False if it was
-        skipped (already in flight or quota exceeded). Never raises;
-        all failures are logged and absorbed -- prefetch is best-effort
-        and must not break the real call.
+        Returns the spawned ``asyncio.Task`` on success, or ``None`` if
+        the request was skipped (already in flight or quota exceeded).
+        Callers can either ignore the task (fire-and-forget) or
+        ``await`` it to block until the phantom completes -- at which
+        point the prefix is guaranteed to be registered in APC.
+
+        Never raises; all failures inside the spawned task are logged
+        and absorbed -- prefetch is best-effort and must not break the
+        real call.
         """
         request_id = build_prefetch_request_id(agent_id, prefix_hash)
 
         async with self._lock:
             inflight_for_agent = self._inflight.setdefault(agent_id, set())
             if request_id in inflight_for_agent:
-                return False
+                return None
             if len(inflight_for_agent) >= self._max_inflight_per_agent:
                 logger.debug(
                     "agent_prefetch: in-flight cap reached for agent %s "
@@ -95,7 +100,7 @@ class PhantomPrefetchSubmitter:
                     self._max_inflight_per_agent,
                     request_id,
                 )
-                return False
+                return None
             inflight_for_agent.add(request_id)
 
         params = SamplingParams(
@@ -120,7 +125,7 @@ class PhantomPrefetchSubmitter:
         )
         # Avoid the task being silently GC'd before completion.
         task.add_done_callback(lambda _t: None)
-        return True
+        return task
 
     async def _run_one(
         self,

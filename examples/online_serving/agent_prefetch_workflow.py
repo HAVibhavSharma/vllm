@@ -18,9 +18,13 @@ Three modes:
   --mode warmup     Issue a dummy max_tokens=1 warmup before each call.
                     The "old way" -- pays one prefill per warmup.
 
-  --mode prefetch   POST to /v1/agents/chat/completions with
-                    {agent_id, prefetch_top_k}. Requires the Commit-2/3
-                    engine + endpoint changes.
+  --mode prefetch   Two-step explicit warm + call:
+                    1) POST /v1/agents/prefetch with
+                       {agent_id, prefetch_top_k, wait: true} so the
+                       server warms APC from LMCache CPU L1.
+                    2) POST /v1/agents/chat/completions with
+                       {agent_id, messages} so the chat handler runs
+                       and the prefix is recorded for future warms.
 
 To make the cost visible, dial up preamble length:
 
@@ -138,6 +142,12 @@ class CallResult:
     response_preview: str
     round_idx: int = 0
     call_idx: int = 0  # 1-based index in the full predetermined schedule
+    # In prefetch mode: ms spent in the explicit /v1/agents/prefetch
+    # call that precedes the chat. NaN for other modes.
+    prefetch_ms: float = float("nan")
+    prefetch_submitted: int = 0
+    prefetch_completed: int = 0
+    available_prefixes: int = 0
 
     @property
     def inferred_hit(self) -> bool:
@@ -227,14 +237,54 @@ def call_warmup_then_real(base_url: str, model: str, system: str,
     return _run_streaming(url, payload)
 
 
+def call_prefetch_warm(base_url: str, agent_id: str,
+                       prefetch_top_k: int | None,
+                       wait: bool = True
+                       ) -> tuple[float, dict | None]:
+    """POST to /v1/agents/prefetch and time the round-trip.
+
+    Returns ``(elapsed_ms, response_body | None)``. ``response_body``
+    is the parsed JSON metadata the server returns (counts of
+    submitted/completed phantoms). ``None`` on HTTP error.
+
+    ``prefetch_top_k=None`` (or omitted) tells the server to warm every
+    prefix the registry has stored for this agent.
+    """
+    url = f"{base_url.rstrip('/')}/v1/agents/prefetch"
+    payload: dict = {"agent_id": agent_id, "wait": wait}
+    if prefetch_top_k is not None:
+        payload["prefetch_top_k"] = prefetch_top_k
+    start_ns = time.perf_counter_ns()
+    try:
+        body = _post_json(url, payload)
+    except urllib.error.HTTPError as e:
+        print(f"  [warn] prefetch failed for {agent_id}: {e}",
+              file=sys.stderr)
+        return float("nan"), None
+    elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
+    return elapsed_ms, body
+
+
 def call_prefetch(base_url: str, model: str, agent_id: str, system: str,
-                  query: str, max_tokens: int, prefetch_top_k: int
-                  ) -> tuple[float, float, str, dict | None]:
-    url = f"{base_url.rstrip('/')}/v1/agents/chat/completions"
+                  query: str, max_tokens: int,
+                  prefetch_top_k: int | None
+                  ) -> tuple[float, float, str, dict | None,
+                             float, dict | None]:
+    """Two-step prefetch + chat call.
+
+    Returns ``(chat_ttft_ms, chat_total_ms, preview, chat_prefetch_meta,
+    prefetch_ms, prefetch_response_body)`` so the caller can attribute
+    timing to the warm vs. the chat phase.
+    """
+    prefetch_ms, prefetch_body = call_prefetch_warm(
+        base_url, agent_id=agent_id, prefetch_top_k=prefetch_top_k,
+        wait=True,
+    )
+    chat_url = f"{base_url.rstrip('/')}/v1/agents/chat/completions"
     payload = _build_chat_payload(model, system, query, max_tokens=max_tokens)
     payload["agent_id"] = agent_id
-    payload["prefetch_top_k"] = prefetch_top_k
-    return _run_streaming(url, payload)
+    ttft_ms, total_ms, preview, meta = _run_streaming(chat_url, payload)
+    return ttft_ms, total_ms, preview, meta, prefetch_ms, prefetch_body
 
 
 def _run_streaming(url: str, payload: dict
@@ -338,7 +388,7 @@ def run_workflow(args: argparse.Namespace) -> int:
         f"variants/agent: {args.variants_per_agent} | "
         f"preamble_lines: {args.preamble_lines} "
         f"(~{est_tokens} tokens per preamble) | "
-        f"top_k: {args.prefetch_top_k}"
+        f"top_k: {args.prefetch_top_k if args.prefetch_top_k is not None else 'all'}"
     )
     print(f"Target: {args.base_url} | model: {args.model}")
     if args.sleep_between_rounds > 0:
@@ -367,6 +417,9 @@ def run_workflow(args: argparse.Namespace) -> int:
 
         system = preambles[pair]
 
+        prefetch_ms = float("nan")
+        prefetch_body: dict | None = None
+
         if args.mode == "baseline":
             ttft, total, preview, meta = call_baseline(
                 args.base_url, args.model, system, query,
@@ -376,7 +429,8 @@ def run_workflow(args: argparse.Namespace) -> int:
                 args.base_url, args.model, system, query,
                 args.max_tokens)
         elif args.mode == "prefetch":
-            ttft, total, preview, meta = call_prefetch(
+            (ttft, total, preview, meta,
+             prefetch_ms, prefetch_body) = call_prefetch(
                 args.base_url, args.model, agent_id, system, query,
                 args.max_tokens, prefetch_top_k=args.prefetch_top_k)
         else:
@@ -394,6 +448,11 @@ def run_workflow(args: argparse.Namespace) -> int:
             response_preview=preview,
             round_idx=round_idx,
             call_idx=call_idx,
+            prefetch_ms=prefetch_ms,
+            prefetch_submitted=(prefetch_body or {}).get("submitted", 0),
+            prefetch_completed=(prefetch_body or {}).get("completed", 0),
+            available_prefixes=(prefetch_body or {}).get(
+                "available_prefixes", 0),
         )
         results.append(r)
 
@@ -405,10 +464,21 @@ def run_workflow(args: argparse.Namespace) -> int:
                 f" | apc={r.apc_hit_tokens} "
                 f"lmc_extra={r.lmcache_extra_tokens}"
             )
+        prefetch_tag = ""
+        if args.mode == "prefetch":
+            if prefetch_ms == prefetch_ms:  # not NaN
+                prefetch_tag = (
+                    f" prefetch={prefetch_ms:7.1f}ms"
+                    f"(sub={r.prefetch_submitted}/"
+                    f"done={r.prefetch_completed}/"
+                    f"avail={r.available_prefixes})"
+                )
+            else:
+                prefetch_tag = " prefetch=<err>"
         print(
             f"  [{call_idx:03d}] {agent_id} v{variant} q{q_idx} "
-            f"[{first_visit_tag:4s}|{hit_tag}]: "
-            f"ttft={ttft:8.1f}ms total={total:8.1f}ms"
+            f"[{first_visit_tag:4s}|{hit_tag}]:"
+            f"{prefetch_tag} ttft={ttft:8.1f}ms total={total:8.1f}ms"
             f"{extra}  | {preview}"
         )
     print()
@@ -488,6 +558,23 @@ def _print_summary(results: list[CallResult]) -> None:
                 f"  revisit MISSES (cache evicted?): "
                 f"{revisit_misses}"
             )
+
+    # Prefetch round-trip stats (separate column -- only meaningful in
+    # --mode prefetch). Lets the operator see how much of the wallclock
+    # is being spent in the explicit warm call vs. the chat call.
+    prefetch_ms_values = [r.prefetch_ms for r in results
+                          if r.prefetch_ms == r.prefetch_ms]
+    if prefetch_ms_values:
+        no_op = sum(1 for r in results
+                    if r.prefetch_ms == r.prefetch_ms
+                    and r.prefetch_submitted == 0)
+        print(
+            f"  prefetch round-trip (n={len(prefetch_ms_values):3d}): "
+            f"median={statistics.median(prefetch_ms_values):8.1f}ms  "
+            f"min={min(prefetch_ms_values):8.1f}  "
+            f"max={max(prefetch_ms_values):8.1f}  "
+            f"no_op_calls={no_op}"
+        )
 
 
 def _plot_results(results: list[CallResult],
@@ -603,7 +690,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["baseline", "warmup", "prefetch"],
                    default="baseline")
     p.add_argument("--rounds", type=int, default=2)
-    p.add_argument("--prefetch-top-k", type=int, default=20)
+    p.add_argument(
+        "--prefetch-top-k", type=int, default=None,
+        help="Optional cap on how many of the agent's registered "
+        "prefixes to warm per prefetch call. Default: omit -- the "
+        "server warms every prefix it has stored for the agent.",
+    )
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument(
         "--preamble-lines", type=int, default=80,

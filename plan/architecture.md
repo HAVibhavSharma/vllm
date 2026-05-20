@@ -7,12 +7,25 @@ see `agent_prefetch_plan.md`; for runnable commands, see `commands.md`.
 
 ## 1. Goal
 
-Add a new HTTP endpoint, `POST /v1/agents/chat/completions`, that
-proactively warms vLLM's GPU prefix cache (APC) from LMCache CPU L1
-**before the real chat completion's prefill stage runs**. The endpoint
-takes the same body as `/v1/chat/completions` plus an `agent_id` and a
-`prefetch_top_k`, and uses a per-agent registry of recent prefixes to
-decide what to warm.
+Expose two HTTP endpoints that, used together, proactively warm
+vLLM's GPU prefix cache (APC) from LMCache CPU L1 **before the real
+chat completion's prefill stage runs**:
+
+* `POST /v1/agents/prefetch` — body `{agent_id, prefetch_top_k?,
+  wait?}`. Looks up every prefix the per-agent registry has stored
+  for the caller and fans out one phantom request per prefix to drive
+  the LMCache → GPU load. There is no implicit top-K cap: omitting
+  `prefetch_top_k` warms **all** of the agent's prefixes; the field
+  is now only a manual truncation knob for benchmarking. By default
+  the endpoint blocks until every phantom finishes so APC is
+  guaranteed warm on return.
+* `POST /v1/agents/chat/completions` — same body as
+  `/v1/chat/completions` plus an `agent_id`. Delegates to the existing
+  chat handler and records the prompt's chunk-aligned prefix in the
+  registry so a *future* prefetch call can warm it. **This endpoint
+  no longer fires phantoms** — that responsibility was lifted out into
+  the explicit prefetch endpoint above so callers can pipeline warming
+  separately from the chat call (e.g., warm during user typing).
 
 In the demo workflow (3 agents × multiple persona variants × long
 preambles), this turns the second-onward call of each agent from a
@@ -41,7 +54,8 @@ vllm/v1/agent_prefetch/
 vllm/entrypoints/openai/agent_chat/
 ├── __init__.py
 ├── protocol.py          # AgentChatCompletionRequest (superset of ChatCompletionRequest)
-└── api_router.py        # 3 endpoints + lazy app.state init
+│                        # + AgentPrefetchRequest (body for /v1/agents/prefetch)
+└── api_router.py        # 4 endpoints + lazy app.state init
 ```
 
 Registered from:
@@ -99,6 +113,7 @@ graph TB
         direction TB
 
         subgraph HTTP["FastAPI routes"]
+            EP_PREF["/v1/agents/prefetch"]
             EP_AGENT["/v1/agents/chat/completions"]
             EP_RESET["/v1/agents/reset_prefix_cache"]
             EP_STATS["/v1/agents/registry_stats"]
@@ -127,12 +142,13 @@ graph TB
 
     GPU[(GPU HBM)]
 
-    DEMO -->|messages,<br/>agent_id, prefetch_top_k| EP_AGENT
+    DEMO -->|step 1:<br/>agent_id, prefetch_top_k| EP_PREF
+    DEMO -->|step 2:<br/>messages, agent_id| EP_AGENT
     DEMO -.->|between runs| EP_RESET
     DEMO -.->|diagnostic| EP_STATS
 
-    EP_AGENT -->|top_k| REG
-    EP_AGENT -->|fan out phantoms| SUB
+    EP_PREF -->|top_k| REG
+    EP_PREF -->|fan out phantoms<br/>+ optionally await| SUB
     EP_AGENT -->|delegate real call| EP_CHAT
     EP_AGENT -->|record prefix| REG
     SUB -->|prefetch_only:true| SCHED
@@ -151,7 +167,7 @@ graph TB
     EP_STATS -->|stats| REG
 
     classDef new fill:#9f9,stroke:#333,stroke-width:2px
-    class EP_AGENT,EP_RESET,EP_STATS,REG,SUB,HASH new
+    class EP_PREF,EP_AGENT,EP_RESET,EP_STATS,REG,SUB,HASH new
 ```
 
 Green = new code added for the agent prefetch.
@@ -160,51 +176,61 @@ Green = new code added for the agent prefetch.
 
 ## 4. Per-call request lifecycle
 
+Now a two-call sequence: an explicit prefetch followed by the real
+chat completion. The endpoints share the same registry + submitter on
+`app.state` but no longer pipeline together in one request handler.
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
-    participant EP as agent endpoint
+    participant PRE as /v1/agents/prefetch
+    participant CHAT as /v1/agents/chat/completions
     participant REG as Registry
     participant SUB as Submitter
     participant ENG as Engine + Connector
     participant LMC as lmcache server
     participant APC as GPU APC
 
-    C->>EP: POST agent_id, prefetch_top_k, messages
-    EP->>EP: render_chat_request → prompt_token_ids
-    EP->>REG: top_k(agent_id)
-    REG-->>EP: K descriptors
+    rect rgb(240,255,240)
+        Note over C,PRE: Step 1 — explicit warm
+        C->>PRE: POST agent_id, prefetch_top_k, wait=true
+        PRE->>REG: top_k(agent_id)
+        REG-->>PRE: K descriptors
+        PRE->>SUB: submit(desc_i) for each → list[Task]
 
-    par Fire and forget
-        EP->>SUB: submit(desc_i) for each
-        SUB-)ENG: generate(prompt_token_ids,<br/>kv_transfer_params={prefetch_only:true})
-    and Real call
-        EP->>ENG: chat_handler.create_chat_completion(inner)
+        loop for each phantom
+            SUB-)ENG: generate(prompt_token_ids,<br/>kv_transfer_params={prefetch_only:true})
+            ENG->>LMC: LMCache lookup
+            LMC-->>ENG: hit / miss
+
+            alt phantom hit (async-load)
+                ENG->>ENG: allocate blocks,<br/>status=WAITING_FOR_REMOTE_KVS
+                LMC->>APC: CPU→GPU memcpy into blocks
+                LMC-->>ENG: finished_recving
+                ENG->>APC: cache_blocks (register prefix)
+                ENG->>ENG: _finalize_prefetch_only_request<br/>(emit STOP, free request)
+            else phantom miss (cache_salt mismatch / evicted)
+                ENG->>ENG: full prefill then sample 1 token
+            end
+        end
+
+        PRE->>PRE: asyncio.gather(*tasks)<br/>(wait=true only)
+        PRE-->>C: 200 {submitted, completed, duration_ms}
     end
 
-    Note over ENG,LMC: Phantoms and real call admitted concurrently
-
-    ENG->>LMC: LMCache lookup for each
-    LMC-->>ENG: hit / miss per request
-
-    alt phantom hit (async-load)
-        ENG->>ENG: allocate blocks,<br/>status=WAITING_FOR_REMOTE_KVS
-        LMC->>APC: CPU→GPU memcpy into blocks
-        LMC-->>ENG: finished_recving
-        ENG->>APC: cache_blocks (register prefix)
-        ENG->>ENG: _finalize_prefetch_only_request<br/>(emit STOP, free request)
-    else phantom miss (cache_salt mismatch / evicted)
-        ENG->>ENG: full prefill (~22K tokens)<br/>then sample 1 token
+    rect rgb(240,240,255)
+        Note over C,CHAT: Step 2 — real chat call
+        C->>CHAT: POST agent_id, messages
+        CHAT->>CHAT: render_chat_request → prompt_token_ids
+        CHAT->>ENG: chat_handler.create_chat_completion(inner)
+        Note over ENG: APC already has the prefix → fast prefill
+        ENG-->>CHAT: stream chunks
+        CHAT->>REG: record(agent_id, this_call's_prefix)
+        CHAT-->>C: stream
     end
 
-    Note over ENG: For the real call:<br/>by the time get_num_new_matched_tokens<br/>runs, APC may already have the prefix<br/>(if phantom finished first)
-
-    ENG-->>EP: stream chunks (real call)
-    EP->>REG: record(agent_id, this_call's_prefix)
-    EP-->>C: stream
-
-    Note over C: TTFT ≈ 100-150 ms<br/>(vs. ~950 ms baseline cold)
+    Note over C: TTFT of step 2 ≈ 100-150 ms<br/>(vs. ~950 ms baseline cold)
 ```
 
 ---
@@ -228,13 +254,25 @@ Two helpers.
 - **`PrefixDescriptor`** — frozen dataclass with `token_ids`,
   `prefix_hash`, `cache_salt`, `last_used_ns`. Identity is `prefix_hash`.
 - **`AgentPrefixRegistry`** — `OrderedDict[agent_id, OrderedDict[hash, desc]]`.
-  - `record(agent_id, desc)` — O(1) insert/promote, evicts LRU within
-    agent when `max_per_agent` exceeded, evicts LRU agent across all
-    when `max_agents` exceeded.
+  - `record(agent_id, desc)` — O(1) insert/promote. When the optional
+    `max_per_agent` cap is set, evicts LRU within the agent on
+    overflow. When unset (default) the inner map grows without
+    truncation. Always evicts the LRU agent across all when
+    `max_agents` is exceeded.
   - `top_k(agent_id, k) -> list[desc]` — **side-effect-free** read,
-    newest-first. (Important: fanning out phantoms must not perturb LRU
-    order on the prefixes being read.)
-  - Caps: `default_top_k=20`, `max_agents=10_000`, `max_per_agent=64`.
+    newest-first. Used only when the prefetch request supplies an
+    explicit truncation cap.
+  - `get_all(agent_id) -> list[desc]` — side-effect-free read of
+    **every** prefix the agent has registered, newest-first. This is
+    the default code path for the prefetch endpoint.
+  - Caps: `max_agents=10_000`. `max_per_agent` defaults to `None`
+    (unlimited) and the production init in
+    `_get_or_init_state` passes `None` -- the registry no longer
+    drops per-agent prefixes silently. Pass an int from a test
+    fixture if you want the old eviction behavior. `default_top_k`
+    is unused on the hot path -- the prefetch endpoint goes through
+    `get_all` -- and remains only as a convenience default for
+    direct `top_k()` callers.
   - Thread-safe via `threading.RLock`.
 
 ### 5.3 `vllm/v1/agent_prefetch/submitter.py`
@@ -254,38 +292,63 @@ Two helpers.
 
 ### 5.4 `vllm/entrypoints/openai/agent_chat/protocol.py`
 
-- **`AgentChatCompletionRequest`** — extends `ChatCompletionRequest` with
-  `agent_id` (required), `prefetch_top_k` (optional int, default ←
-  registry default), `agent_cache_salt` (optional), `record_in_registry`
-  (default True).
-- `to_chat_completion_request()` — strips the agent-only fields and
-  validates back to a plain `ChatCompletionRequest` for delegation.
+Two request models now live here:
+
+- **`AgentChatCompletionRequest`** — extends `ChatCompletionRequest`
+  with `agent_id` (required), `agent_cache_salt` (optional),
+  `record_in_registry` (default True). **No `prefetch_top_k` field**
+  — phantom fan-out moved out of this endpoint.
+- **`AgentPrefetchRequest`** — `BaseModel` with `agent_id` (required),
+  `prefetch_top_k` (optional int; **omit/null = warm every prefix the
+  agent has registered**, no top-K cap), `agent_cache_salt`
+  (optional), `wait` (default True). Body for the new explicit warm
+  endpoint.
+- `AgentChatCompletionRequest.to_chat_completion_request()` — strips
+  the agent-only fields and validates back to a plain
+  `ChatCompletionRequest` for delegation.
 
 ### 5.5 `vllm/entrypoints/openai/agent_chat/api_router.py`
 
-Three routes, plus lazy `app.state` initialization for the registry and
-submitter on first call.
+Four routes, plus lazy `app.state` initialization for the registry and
+submitter shared between them.
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/v1/agents/chat/completions` | POST | Main endpoint. Fan out phantoms, delegate real call, record on completion. |
+| `/v1/agents/prefetch` | POST | Explicit warm. Fan out phantoms for `agent_id`, optionally `await` completion. |
+| `/v1/agents/chat/completions` | POST | Delegate to real chat handler, record prefix on completion. **No phantoms.** |
 | `/v1/agents/reset_prefix_cache` | POST | Reset APC and/or registry and/or connector cache. Returns rich JSON with before/after state. |
 | `/v1/agents/registry_stats` | GET | Inspect per-agent registry sizes. |
 
-The agent endpoint flow:
+The prefetch endpoint flow:
+
+1. Resolve `prefetch_top_k` from the request (`None` ≡ "warm
+   everything" — the default); capture `agent_size(agent_id)` for
+   diagnostics.
+2. `_fan_out_prefetches` — chooses `registry.get_all(agent_id)` when
+   the cap is `None`, otherwise `registry.top_k(agent_id, k)`. Each
+   descriptor is fed to `submitter.submit(...)`, which now returns
+   the spawned `asyncio.Task` (or `None` if deduped / capped); the
+   endpoint collects these into a list.
+3. If `wait=True`, `await asyncio.gather(*tasks,
+   return_exceptions=True)` to block until every phantom finalizes
+   (so APC is guaranteed populated on return). If `wait=False`, return
+   immediately and let phantoms drain in the background.
+4. Return `{agent_id, requested_top_k, available_prefixes, submitted,
+   completed, waited, duration_ms}`. `requested_top_k` echoes back as
+   the string `"all"` when no cap was supplied.
+
+The agent chat-completion endpoint flow:
 
 1. `_tokenize_prompt` — uses `chat_handler.render_chat_request(inner)`
-   to apply the chat template and get `prompt_token_ids`. Same path the
-   real call will internally use.
-2. `_fan_out_prefetches` — `top_k(agent_id, k)` → `submitter.submit(...)`
-   for each descriptor. Awaited only to receive the per-task booleans;
-   actual phantom completion is *not* awaited.
-3. Delegate to `chat_handler.create_chat_completion(inner, raw_request)`.
-4. `_record_in_registry` — chunk-align the just-tokenized prompt, hash,
-   record under `agent_id`. Happens before the streaming response
-   finishes, so subsequent calls see this prefix immediately.
-5. Return the chat handler's `StreamingResponse | ChatCompletionResponse |
-   ErrorResponse` unchanged.
+   to apply the chat template and get `prompt_token_ids`. **Skipped
+   entirely when `record_in_registry=False`** so the endpoint becomes
+   a near-zero-overhead pass-through.
+2. Delegate to `chat_handler.create_chat_completion(inner, raw_request)`.
+3. `_record_in_registry` — chunk-align the just-tokenized prompt,
+   hash, record under `agent_id`. Happens before the streaming
+   response finishes, so subsequent calls see this prefix immediately.
+4. Return the chat handler's `StreamingResponse |
+   ChatCompletionResponse | ErrorResponse` unchanged.
 
 ### 5.6 `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py`
 
@@ -368,7 +431,38 @@ stateDiagram-v2
 
 ## 7. Operational endpoints
 
-### 7.1 `POST /v1/agents/chat/completions`
+### 7.1 `POST /v1/agents/prefetch`
+
+```jsonc
+// Request body
+{
+  "agent_id": "agent1",       // required
+  "prefetch_top_k": null,     // optional; null/omitted = warm ALL the
+                              // agent's stored prefixes. Pass an int
+                              // only to artificially truncate.
+  "agent_cache_salt": null,   // optional, default "agent::<agent_id>"
+  "wait": true                // optional, default true
+}
+```
+
+```jsonc
+// Response body
+{
+  "agent_id": "agent1",
+  "requested_top_k": "all",    // "all" when no cap was supplied, else the int
+  "available_prefixes": 3,     // how many entries are in the registry for this agent
+  "submitted": 3,              // phantoms actually handed to the engine
+  "completed": 3,              // phantoms that ran to completion (wait=true only)
+  "waited": true,
+  "duration_ms": 142.5
+}
+```
+
+If the registry has no entries for `agent_id` yet, the call is a
+no-op (`submitted=0`) — the very first chat call for an agent must
+populate the registry before prefetch becomes useful.
+
+### 7.2 `POST /v1/agents/chat/completions`
 
 ```jsonc
 // Request body — superset of OpenAI ChatCompletionRequest
@@ -376,7 +470,6 @@ stateDiagram-v2
   "model": "Qwen/Qwen3-8B",
   "messages": [...],
   "agent_id": "agent1",                // required
-  "prefetch_top_k": 20,                // optional, default 20
   "agent_cache_salt": null,            // optional, default "agent::<agent_id>"
   "record_in_registry": true,          // optional, default true
   // ...all standard ChatCompletionRequest fields...
@@ -384,9 +477,11 @@ stateDiagram-v2
 ```
 
 Response is exactly a `ChatCompletionResponse` (or SSE stream of
-`ChatCompletionStreamResponse` chunks) — no schema breakage.
+`ChatCompletionStreamResponse` chunks) — no schema breakage. Phantom
+prefetches are *not* fired from this endpoint; call
+`POST /v1/agents/prefetch` first if you want APC warmed.
 
-### 7.2 `POST /v1/agents/reset_prefix_cache`
+### 7.3 `POST /v1/agents/reset_prefix_cache`
 
 Query parameters:
 
@@ -415,14 +510,14 @@ Logs three INFO lines per call:
 - `agent_prefetch: APC reset complete (engine returned True)`
 - `agent_prefetch: reset done in 12.40ms actions=['apc_reset']`
 
-### 7.3 `GET /v1/agents/registry_stats`
+### 7.4 `GET /v1/agents/registry_stats`
 
 ```json
 {
   "initialized": true,
   "overall": {
     "num_agents": 3, "total_descriptors": 9,
-    "max_agents": 10000, "max_per_agent": 64, "default_top_k": 20
+    "max_agents": 10000, "max_per_agent": null, "default_top_k": 20
   },
   "per_agent_sizes": {"agent1": 3, "agent2": 2, "agent3": 4}
 }

@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-agent LRU registry of recently-seen prefix descriptors.
+"""Per-agent registry of recently-seen prefix descriptors.
 
-Tracks, per ``agent_id``, the last N chunk-aligned prefixes the agent
-used. When a new request arrives the API layer pulls the top-K
-descriptors and fires phantom prefetches for them, so vLLM's APC is
-warm by the time the real call reaches prefill.
+Tracks, per ``agent_id``, every distinct chunk-aligned prefix the
+agent has used. When a new prefetch request arrives the API layer
+pulls **all** of an agent's descriptors and fires one phantom request
+per prefix, so vLLM's APC is warm by the time the real call reaches
+prefill.
 
-The registry is in-memory only and bounded along two axes:
+The registry is in-memory only. By default it is bounded along one
+axis:
 
-* ``max_per_agent`` -- LRU depth within a single agent.
-* ``max_agents``    -- across-agent LRU eviction once too many agents
-  are tracked.
+* ``max_agents`` -- across-agent LRU eviction once too many distinct
+  agents are tracked.
+
+A second optional axis -- ``max_per_agent`` -- exists for tests and
+for operators who want to bound memory per agent. It defaults to
+``None`` (no cap): the agent's inner map grows without per-agent
+eviction.
 
 Thread-safety: all public methods take an ``RLock``. The HTTP server
 calls in from many async workers, and engine callbacks (e.g. response
@@ -67,7 +73,7 @@ class AgentPrefixRegistry:
         self,
         default_top_k: int = 20,
         max_agents: int = 10_000,
-        max_per_agent: int = 64,
+        max_per_agent: int | None = None,
     ) -> None:
         if default_top_k < 0:
             raise ValueError(
@@ -75,11 +81,11 @@ class AgentPrefixRegistry:
             )
         if max_agents <= 0:
             raise ValueError(f"max_agents must be positive, got {max_agents}")
-        if max_per_agent <= 0:
+        if max_per_agent is not None and max_per_agent <= 0:
             raise ValueError(
-                f"max_per_agent must be positive, got {max_per_agent}"
+                f"max_per_agent must be positive or None, got {max_per_agent}"
             )
-        if default_top_k > max_per_agent:
+        if max_per_agent is not None and default_top_k > max_per_agent:
             raise ValueError(
                 "default_top_k cannot exceed max_per_agent "
                 f"({default_top_k} > {max_per_agent})"
@@ -87,6 +93,7 @@ class AgentPrefixRegistry:
 
         self.default_top_k = default_top_k
         self.max_agents = max_agents
+        # ``None`` ≡ no per-agent cap; the inner map grows unbounded.
         self.max_per_agent = max_per_agent
 
         self._lock = threading.RLock()
@@ -125,14 +132,15 @@ class AgentPrefixRegistry:
                 agent_map.move_to_end(desc.prefix_hash)
             else:
                 agent_map[desc.prefix_hash] = desc
-                while len(agent_map) > self.max_per_agent:
-                    evicted_hash, _ = agent_map.popitem(last=False)
-                    logger.debug(
-                        "agent_prefetch: evicted prefix %s from agent %s "
-                        "(per-agent LRU)",
-                        evicted_hash.hex()[:12],
-                        agent_id,
-                    )
+                if self.max_per_agent is not None:
+                    while len(agent_map) > self.max_per_agent:
+                        evicted_hash, _ = agent_map.popitem(last=False)
+                        logger.debug(
+                            "agent_prefetch: evicted prefix %s from "
+                            "agent %s (per-agent LRU)",
+                            evicted_hash.hex()[:12],
+                            agent_id,
+                        )
 
     def evict_agent(self, agent_id: str) -> bool:
         """Drop all entries for an agent. Returns True if anything was
@@ -171,6 +179,22 @@ class AgentPrefixRegistry:
             descriptors = list(agent_map.values())
             return list(reversed(descriptors[-k:]))
 
+    def get_all(self, agent_id: str) -> list[PrefixDescriptor]:
+        """Return *every* descriptor registered for ``agent_id``,
+        newest-first.
+
+        Side-effect-free (does not promote LRU). Returns an empty list
+        for unknown agents. Use this in place of ``top_k`` when the
+        caller wants no truncation -- the prefetch endpoint uses this
+        whenever ``prefetch_top_k`` is omitted, so every stored prefix
+        gets warmed.
+        """
+        with self._lock:
+            agent_map = self._by_agent.get(agent_id)
+            if not agent_map:
+                return []
+            return list(reversed(list(agent_map.values())))
+
     def agent_size(self, agent_id: str) -> int:
         with self._lock:
             agent_map = self._by_agent.get(agent_id)
@@ -180,7 +204,7 @@ class AgentPrefixRegistry:
         with self._lock:
             return len(self._by_agent)
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | None]:
         with self._lock:
             return {
                 "num_agents": len(self._by_agent),
@@ -188,6 +212,7 @@ class AgentPrefixRegistry:
                     len(m) for m in self._by_agent.values()
                 ),
                 "max_agents": self.max_agents,
+                # ``None`` is JSON-serialized as ``null`` ≡ unlimited.
                 "max_per_agent": self.max_per_agent,
                 "default_top_k": self.default_top_k,
             }
