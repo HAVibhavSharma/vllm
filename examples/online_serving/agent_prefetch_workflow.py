@@ -30,7 +30,7 @@ To make the cost visible, dial up preamble length:
 
   python examples/online_serving/agent_prefetch_workflow.py \\
       --base-url http://<vllm-host>:8000 \\
-      --model Qwen/Qwen3-8B \\
+      --model Qwen/Qwen2.5-72B-Instruct-AWQ \\
       --mode baseline \\
       --preamble-lines 1000 \\
       --variants-per-agent 4 \\
@@ -52,7 +52,6 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-
 
 # TTFT threshold (ms) under which a call is considered a "cache hit".
 # The observed warm floor on Qwen3-8B is ~18-70 ms depending on prefix
@@ -85,9 +84,7 @@ def build_preamble(role: str, variant: int, lines: int) -> str:
         "verbose assistant. Always think step by step before answering. "
         "Cite sources only when relevant. "
     )
-    filler = " ".join(
-        _LINE_TEMPLATE.format(variant=variant, i=i) for i in range(lines)
-    )
+    filler = " ".join(_LINE_TEMPLATE.format(variant=variant, i=i) for i in range(lines))
     return header + filler
 
 
@@ -164,7 +161,9 @@ class CallResult:
 def _post_json(url: str, payload: dict, timeout: float = 600.0) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=body, method="POST",
+        url,
+        data=body,
+        method="POST",
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -174,7 +173,9 @@ def _post_json(url: str, payload: dict, timeout: float = 600.0) -> dict:
 def _post_stream(url: str, payload: dict, timeout: float = 600.0):
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=body, method="POST",
+        url,
+        data=body,
+        method="POST",
         headers={
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
@@ -185,7 +186,7 @@ def _post_stream(url: str, payload: dict, timeout: float = 600.0):
             line = raw_line.decode("utf-8").strip()
             if not line.startswith("data:"):
                 continue
-            data = line[len("data:"):].strip()
+            data = line[len("data:") :].strip()
             if data == "[DONE]":
                 yield (time.perf_counter_ns(), None)
                 return
@@ -195,8 +196,7 @@ def _post_stream(url: str, payload: dict, timeout: float = 600.0):
                 continue
 
 
-def _build_chat_payload(model: str, system: str, query: str,
-                       max_tokens: int) -> dict:
+def _build_chat_payload(model: str, system: str, query: str, max_tokens: int) -> dict:
     return {
         "model": model,
         "messages": [
@@ -214,20 +214,19 @@ def _build_chat_payload(model: str, system: str, query: str,
 # ---------------------------------------------------------------------------
 
 
-def call_baseline(base_url: str, model: str, system: str,
-                  query: str, max_tokens: int) -> tuple[float, float, str,
-                                                        dict | None]:
+def call_baseline(
+    base_url: str, model: str, system: str, query: str, max_tokens: int
+) -> tuple[float, float, str, dict | None]:
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
     payload = _build_chat_payload(model, system, query, max_tokens=max_tokens)
     return _run_streaming(url, payload)
 
 
-def call_warmup_then_real(base_url: str, model: str, system: str,
-                          query: str, max_tokens: int
-                          ) -> tuple[float, float, str, dict | None]:
+def call_warmup_then_real(
+    base_url: str, model: str, system: str, query: str, max_tokens: int
+) -> tuple[float, float, str, dict | None]:
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
-    warmup_payload = _build_chat_payload(
-        model, system, query="warmup", max_tokens=1)
+    warmup_payload = _build_chat_payload(model, system, query="warmup", max_tokens=1)
     warmup_payload["stream"] = False
     try:
         _post_json(url, warmup_payload)
@@ -237,10 +236,9 @@ def call_warmup_then_real(base_url: str, model: str, system: str,
     return _run_streaming(url, payload)
 
 
-def call_prefetch_warm(base_url: str, agent_id: str,
-                       prefetch_top_k: int | None,
-                       wait: bool = True
-                       ) -> tuple[float, dict | None]:
+def call_prefetch_warm(
+    base_url: str, agent_id: str, prefetch_top_k: int | None, wait: bool = True
+) -> tuple[float, dict | None]:
     """POST to /v1/agents/prefetch and time the round-trip.
 
     Returns ``(elapsed_ms, response_body | None)``. ``response_body``
@@ -258,18 +256,21 @@ def call_prefetch_warm(base_url: str, agent_id: str,
     try:
         body = _post_json(url, payload)
     except urllib.error.HTTPError as e:
-        print(f"  [warn] prefetch failed for {agent_id}: {e}",
-              file=sys.stderr)
+        print(f"  [warn] prefetch failed for {agent_id}: {e}", file=sys.stderr)
         return float("nan"), None
     elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
     return elapsed_ms, body
 
 
-def call_prefetch(base_url: str, model: str, agent_id: str, system: str,
-                  query: str, max_tokens: int,
-                  prefetch_top_k: int | None
-                  ) -> tuple[float, float, str, dict | None,
-                             float, dict | None]:
+def call_prefetch(
+    base_url: str,
+    model: str,
+    agent_id: str,
+    system: str,
+    query: str,
+    max_tokens: int,
+    prefetch_top_k: int | None,
+) -> tuple[float, float, str, dict | None, float, dict | None]:
     """Two-step prefetch + chat call.
 
     Returns ``(chat_ttft_ms, chat_total_ms, preview, chat_prefetch_meta,
@@ -277,7 +278,9 @@ def call_prefetch(base_url: str, model: str, agent_id: str, system: str,
     timing to the warm vs. the chat phase.
     """
     prefetch_ms, prefetch_body = call_prefetch_warm(
-        base_url, agent_id=agent_id, prefetch_top_k=prefetch_top_k,
+        base_url,
+        agent_id=agent_id,
+        prefetch_top_k=prefetch_top_k,
         wait=True,
     )
     chat_url = f"{base_url.rstrip('/')}/v1/agents/chat/completions"
@@ -287,8 +290,7 @@ def call_prefetch(base_url: str, model: str, agent_id: str, system: str,
     return ttft_ms, total_ms, preview, meta, prefetch_ms, prefetch_body
 
 
-def _run_streaming(url: str, payload: dict
-                   ) -> tuple[float, float, str, dict | None]:
+def _run_streaming(url: str, payload: dict) -> tuple[float, float, str, dict | None]:
     """Returns (ttft_ms, total_ms, preview_text, prefetch_meta)."""
     start_ns = time.perf_counter_ns()
     first_token_ns: int | None = None
@@ -314,7 +316,8 @@ def _run_streaming(url: str, payload: dict
     end_ns = time.perf_counter_ns()
     ttft_ms = (
         (first_token_ns - start_ns) / 1e6
-        if first_token_ns is not None else float("nan")
+        if first_token_ns is not None
+        else float("nan")
     )
     total_ms = (end_ns - start_ns) / 1e6
     preview = "".join(text_chunks)[:80].replace("\n", " ")
@@ -343,9 +346,7 @@ def _build_schedule(
             for q_idx, query in enumerate(AGENT_QUERIES[agent_id]):
                 variant = q_idx % variants_per_agent
                 call_idx += 1
-                schedule.append(
-                    (call_idx, round_idx, agent_id, variant, q_idx, query)
-                )
+                schedule.append((call_idx, round_idx, agent_id, variant, q_idx, query))
     return schedule
 
 
@@ -365,10 +366,7 @@ def _print_schedule(
             print(f"  Round {round_idx + 1}:")
         # Truncate the query so the path stays scannable.
         short = query if len(query) <= 56 else query[:53] + "..."
-        print(
-            f"    [{call_idx:03d}] {agent_id} v{variant} q{q_idx}"
-            f"  | {short}"
-        )
+        print(f"    [{call_idx:03d}] {agent_id} v{variant} q{q_idx}  | {short}")
     print(f"  Total: {len(schedule)} calls\n")
 
 
@@ -378,7 +376,8 @@ def run_workflow(args: argparse.Namespace) -> int:
     for agent_id in AGENT_QUERIES:
         for variant in range(args.variants_per_agent):
             preambles[(agent_id, variant)] = build_preamble(
-                agent_id, variant, args.preamble_lines)
+                agent_id, variant, args.preamble_lines
+            )
 
     sample_text = next(iter(preambles.values()))
     est_tokens = estimate_tokens(sample_text)
@@ -405,8 +404,10 @@ def run_workflow(args: argparse.Namespace) -> int:
     for call_idx, round_idx, agent_id, variant, q_idx, query in schedule:
         if round_idx != current_round:
             if current_round >= 0 and args.sleep_between_rounds > 0:
-                print(f"  ...sleeping {args.sleep_between_rounds}s before "
-                      f"round {round_idx + 1}...")
+                print(
+                    f"  ...sleeping {args.sleep_between_rounds}s before "
+                    f"round {round_idx + 1}..."
+                )
                 time.sleep(args.sleep_between_rounds)
             print(f"=== Round {round_idx + 1} ===")
             current_round = round_idx
@@ -422,17 +423,22 @@ def run_workflow(args: argparse.Namespace) -> int:
 
         if args.mode == "baseline":
             ttft, total, preview, meta = call_baseline(
-                args.base_url, args.model, system, query,
-                args.max_tokens)
+                args.base_url, args.model, system, query, args.max_tokens
+            )
         elif args.mode == "warmup":
             ttft, total, preview, meta = call_warmup_then_real(
-                args.base_url, args.model, system, query,
-                args.max_tokens)
+                args.base_url, args.model, system, query, args.max_tokens
+            )
         elif args.mode == "prefetch":
-            (ttft, total, preview, meta,
-             prefetch_ms, prefetch_body) = call_prefetch(
-                args.base_url, args.model, agent_id, system, query,
-                args.max_tokens, prefetch_top_k=args.prefetch_top_k)
+            (ttft, total, preview, meta, prefetch_ms, prefetch_body) = call_prefetch(
+                args.base_url,
+                args.model,
+                agent_id,
+                system,
+                query,
+                args.max_tokens,
+                prefetch_top_k=args.prefetch_top_k,
+            )
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -451,8 +457,7 @@ def run_workflow(args: argparse.Namespace) -> int:
             prefetch_ms=prefetch_ms,
             prefetch_submitted=(prefetch_body or {}).get("submitted", 0),
             prefetch_completed=(prefetch_body or {}).get("completed", 0),
-            available_prefixes=(prefetch_body or {}).get(
-                "available_prefixes", 0),
+            available_prefixes=(prefetch_body or {}).get("available_prefixes", 0),
         )
         results.append(r)
 
@@ -460,10 +465,7 @@ def run_workflow(args: argparse.Namespace) -> int:
         hit_tag = "HIT " if r.inferred_hit else "miss"
         extra = ""
         if r.apc_hit_tokens is not None:
-            extra = (
-                f" | apc={r.apc_hit_tokens} "
-                f"lmc_extra={r.lmcache_extra_tokens}"
-            )
+            extra = f" | apc={r.apc_hit_tokens} lmc_extra={r.lmcache_extra_tokens}"
         prefetch_tag = ""
         if args.mode == "prefetch":
             if prefetch_ms == prefetch_ms:  # not NaN
@@ -501,10 +503,12 @@ def run_workflow(args: argparse.Namespace) -> int:
 
 
 def _print_summary(results: list[CallResult]) -> None:
-    cold_ttfts = [r.ttft_ms for r in results
-                  if r.first_visit and r.ttft_ms == r.ttft_ms]
-    warm_ttfts = [r.ttft_ms for r in results
-                  if not r.first_visit and r.ttft_ms == r.ttft_ms]
+    cold_ttfts = [
+        r.ttft_ms for r in results if r.first_visit and r.ttft_ms == r.ttft_ms
+    ]
+    warm_ttfts = [
+        r.ttft_ms for r in results if not r.first_visit and r.ttft_ms == r.ttft_ms
+    ]
 
     print("=== Summary ===")
     if cold_ttfts:
@@ -523,10 +527,7 @@ def _print_summary(results: list[CallResult]) -> None:
         )
     if cold_ttfts and warm_ttfts:
         delta = statistics.median(cold_ttfts) - statistics.median(warm_ttfts)
-        print(
-            f"  cold tax (median first-visit - median revisit): "
-            f"{delta:+.1f}ms"
-        )
+        print(f"  cold tax (median first-visit - median revisit): {delta:+.1f}ms")
         print(
             "  ^ this is the per-call cold-prefill cost that a working "
             "prefetch endpoint would eliminate."
@@ -549,25 +550,22 @@ def _print_summary(results: list[CallResult]) -> None:
         first_visit_hits = sum(1 for r in hits if r.first_visit)
         revisit_misses = sum(1 for r in misses if not r.first_visit)
         if first_visit_hits:
-            print(
-                f"  first-visit HITS (prefetch worked): "
-                f"{first_visit_hits}"
-            )
+            print(f"  first-visit HITS (prefetch worked): {first_visit_hits}")
         if revisit_misses:
-            print(
-                f"  revisit MISSES (cache evicted?): "
-                f"{revisit_misses}"
-            )
+            print(f"  revisit MISSES (cache evicted?): {revisit_misses}")
 
     # Prefetch round-trip stats (separate column -- only meaningful in
     # --mode prefetch). Lets the operator see how much of the wallclock
     # is being spent in the explicit warm call vs. the chat call.
-    prefetch_ms_values = [r.prefetch_ms for r in results
-                          if r.prefetch_ms == r.prefetch_ms]
+    prefetch_ms_values = [
+        r.prefetch_ms for r in results if r.prefetch_ms == r.prefetch_ms
+    ]
     if prefetch_ms_values:
-        no_op = sum(1 for r in results
-                    if r.prefetch_ms == r.prefetch_ms
-                    and r.prefetch_submitted == 0)
+        no_op = sum(
+            1
+            for r in results
+            if r.prefetch_ms == r.prefetch_ms and r.prefetch_submitted == 0
+        )
         print(
             f"  prefetch round-trip (n={len(prefetch_ms_values):3d}): "
             f"median={statistics.median(prefetch_ms_values):8.1f}ms  "
@@ -577,8 +575,7 @@ def _print_summary(results: list[CallResult]) -> None:
         )
 
 
-def _plot_results(results: list[CallResult],
-                  args: argparse.Namespace) -> None:
+def _plot_results(results: list[CallResult], args: argparse.Namespace) -> None:
     """Render two PNGs:
 
     1. <plot>.timeline.png -- TTFT per call across the schedule, colored
@@ -608,7 +605,9 @@ def _plot_results(results: list[CallResult],
     ax.bar(xs, ys, color=colors, edgecolor=edges, linewidth=1.2)
     ax.axhline(
         HIT_TTFT_THRESHOLD_MS,
-        color="gray", linestyle="--", linewidth=1,
+        color="gray",
+        linestyle="--",
+        linewidth=1,
         label=f"hit threshold ({HIT_TTFT_THRESHOLD_MS:.0f} ms)",
     )
 
@@ -616,11 +615,15 @@ def _plot_results(results: list[CallResult],
     last_round = -1
     for r in results:
         if r.round_idx != last_round:
-            ax.axvline(r.call_idx - 0.5, color="lightgray",
-                       linestyle=":", linewidth=0.8)
+            ax.axvline(
+                r.call_idx - 0.5, color="lightgray", linestyle=":", linewidth=0.8
+            )
             ax.text(
-                r.call_idx, ax.get_ylim()[1] * 0.95 if ys else 1.0,
-                f" R{r.round_idx + 1}", color="gray", fontsize=8,
+                r.call_idx,
+                ax.get_ylim()[1] * 0.95 if ys else 1.0,
+                f" R{r.round_idx + 1}",
+                color="gray",
+                fontsize=8,
             )
             last_round = r.round_idx
 
@@ -634,11 +637,13 @@ def _plot_results(results: list[CallResult],
     )
     # Manual legend so first-visit outline + green/red both appear.
     from matplotlib.patches import Patch
+
     legend_handles = [
         Patch(facecolor="#2ca02c", label="cache hit (inferred)"),
         Patch(facecolor="#d62728", label="cache miss (inferred)"),
-        Patch(facecolor="white", edgecolor="black",
-              label="first visit (black outline)"),
+        Patch(
+            facecolor="white", edgecolor="black", label="first visit (black outline)"
+        ),
     ]
     ax.legend(handles=legend_handles, loc="upper right")
     ax.grid(True, axis="y", alpha=0.3)
@@ -653,26 +658,39 @@ def _plot_results(results: list[CallResult],
     cold_med = []
     warm_med = []
     for agent_id in agents:
-        cold = [r.ttft_ms for r in results
-                if r.agent_id == agent_id and r.first_visit
-                and r.ttft_ms == r.ttft_ms]
-        warm = [r.ttft_ms for r in results
-                if r.agent_id == agent_id and not r.first_visit
-                and r.ttft_ms == r.ttft_ms]
+        cold = [
+            r.ttft_ms
+            for r in results
+            if r.agent_id == agent_id and r.first_visit and r.ttft_ms == r.ttft_ms
+        ]
+        warm = [
+            r.ttft_ms
+            for r in results
+            if r.agent_id == agent_id and not r.first_visit and r.ttft_ms == r.ttft_ms
+        ]
         cold_med.append(statistics.median(cold) if cold else 0.0)
         warm_med.append(statistics.median(warm) if warm else 0.0)
 
     x = list(range(len(agents)))
     width = 0.4
-    ax.bar([xi - width / 2 for xi in x], cold_med, width,
-           color="#d62728", label="first-visit (cold) median")
-    ax.bar([xi + width / 2 for xi in x], warm_med, width,
-           color="#2ca02c", label="revisit (warm) median")
+    ax.bar(
+        [xi - width / 2 for xi in x],
+        cold_med,
+        width,
+        color="#d62728",
+        label="first-visit (cold) median",
+    )
+    ax.bar(
+        [xi + width / 2 for xi in x],
+        warm_med,
+        width,
+        color="#2ca02c",
+        label="revisit (warm) median",
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(agents)
     ax.set_ylabel("Median TTFT (ms)")
-    ax.set_title(
-        f"Per-agent TTFT: cold vs warm -- mode={args.mode}")
+    ax.set_title(f"Per-agent TTFT: cold vs warm -- mode={args.mode}")
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
@@ -684,39 +702,50 @@ def _plot_results(results: list[CallResult],
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run an agent1 -> agent2 -> agent3 workflow against "
-        "vLLM, optionally exercising the agent-prefetch endpoint.")
+        "vLLM, optionally exercising the agent-prefetch endpoint."
+    )
     p.add_argument("--base-url", default="http://localhost:8000")
-    p.add_argument("--model", default="Qwen/Qwen3-8B")
-    p.add_argument("--mode", choices=["baseline", "warmup", "prefetch"],
-                   default="baseline")
+    p.add_argument("--model", default="Qwen/Qwen2.5-72B-Instruct-AWQ")
+    p.add_argument(
+        "--mode", choices=["baseline", "warmup", "prefetch"], default="baseline"
+    )
     p.add_argument("--rounds", type=int, default=2)
     p.add_argument(
-        "--prefetch-top-k", type=int, default=None,
+        "--prefetch-top-k",
+        type=int,
+        default=None,
         help="Optional cap on how many of the agent's registered "
         "prefixes to warm per prefetch call. Default: omit -- the "
         "server warms every prefix it has stored for the agent.",
     )
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument(
-        "--preamble-lines", type=int, default=80,
+        "--preamble-lines",
+        type=int,
+        default=80,
         help="Per-variant system-preamble length, in template lines "
         "(~20 tokens each). 80 is short; 1000+ is what you want to "
         "make cold-prefill cost obvious.",
     )
     p.add_argument(
-        "--variants-per-agent", type=int, default=1,
+        "--variants-per-agent",
+        type=int,
+        default=1,
         help="Distinct system-preamble variants per agent. The workflow "
         "cycles through variants based on query index, so each agent "
         "exercises this many distinct prefixes per round.",
     )
     p.add_argument(
-        "--sleep-between-rounds", type=float, default=0.0,
+        "--sleep-between-rounds",
+        type=float,
+        default=0.0,
         help="Seconds to sleep between rounds. Useful with concurrent "
         "load from other clients -- lets APC age out so revisits "
         "fall back to LMCache.",
     )
     p.add_argument(
-        "--plot", default=None,
+        "--plot",
+        default=None,
         help="If set, write timeline + per-agent PNGs using this as "
         "the filename base. Requires matplotlib. Example: --plot "
         "/tmp/agent_workflow",
