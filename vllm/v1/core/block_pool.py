@@ -11,6 +11,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.agent_prefetch.eviction import get_eviction_policy
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -255,6 +256,13 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        # Tag freshly-cached blocks with the owning agent so the
+        # agent-aware early-eviction policy can target them later.
+        # ``request.agent_id`` is None for non-agent requests; in that
+        # case ``tag_block`` is a cheap no-op.
+        eviction_policy = get_eviction_policy()
+        owning_request_id = request.request_id
+
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null blocks when enabling sparse attention like
             # sliding window attention, or Mamba models with prefix-caching in
@@ -270,6 +278,7 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            eviction_policy.tag_block(blk.block_id, owning_request_id)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -333,7 +342,23 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # ---- Agent-aware early-eviction prefix ----------------------
+        # Before pulling LRU victims off the head, ask the global agent
+        # eviction policy for any cached blocks whose owning agent's
+        # aggregated probability is below the active threshold.  Those
+        # blocks become first-class eviction candidates regardless of
+        # their LRU position.  This only kicks in when caching is on --
+        # otherwise blocks have no agent identity worth respecting.
+        prioritized: list[KVCacheBlock] = []
+        if self.enable_caching:
+            prioritized = self._claim_low_probability_blocks(num_blocks)
+
+        remaining = num_blocks - len(prioritized)
+        if remaining > 0:
+            tail = self.free_block_queue.popleft_n(remaining)
+        else:
+            tail = []
+        ret: list[KVCacheBlock] = prioritized + tail
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -350,6 +375,55 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def _claim_low_probability_blocks(
+        self, num_blocks: int
+    ) -> list[KVCacheBlock]:
+        """Pull cached blocks whose owning agent is below the eviction
+        threshold out of the free list, O(1) per block.
+
+        Returns at most ``num_blocks`` blocks. Each returned block is
+        verified to be in S3 (``ref_cnt == 0`` and non-null); blocks
+        that fail the check are ignored and the caller's LRU pop will
+        backfill the deficit.
+        """
+        if num_blocks <= 0:
+            return []
+        policy = get_eviction_policy()
+        # Ask for more candidates than we strictly need so we can skip
+        # stale tags (block reallocated since we last tagged it) without
+        # leaving the pool short.
+        candidate_ids = policy.evictable_blocks(num_blocks * 2)
+        if not candidate_ids:
+            return []
+        out: list[KVCacheBlock] = []
+        seen: set[int] = set()
+        for block_id in candidate_ids:
+            if block_id in seen:
+                continue
+            seen.add(block_id)
+            if block_id < 0 or block_id >= len(self.blocks):
+                continue
+            block = self.blocks[block_id]
+            if block.is_null:
+                continue
+            # Only blocks currently sitting in the free queue are
+            # eligible -- ref_cnt > 0 blocks are held by a running
+            # request and untouchable.
+            if block.ref_cnt != 0:
+                continue
+            if (
+                block.prev_free_block is None
+                and block.next_free_block is None
+            ):
+                # Defensive: not currently linked into the free queue
+                # (e.g. the null block, or sink blocks). Skip.
+                continue
+            self.free_block_queue.remove(block)
+            out.append(block)
+            if len(out) >= num_blocks:
+                break
+        return out
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -377,6 +451,10 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        # Drop the agent->block tag now that the block's identity is
+        # gone. Future writes into the same block_id will retag it under
+        # whichever agent (if any) the new owner belongs to.
+        get_eviction_policy().untag_block(block.block_id)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -464,6 +542,9 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        # Drop every agent->block tag in one shot.
+        get_eviction_policy().clear_all_blocks()
 
         if self.metrics_collector:
             self.metrics_collector.reset()

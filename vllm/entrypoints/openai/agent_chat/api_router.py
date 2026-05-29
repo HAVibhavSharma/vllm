@@ -56,6 +56,7 @@ from vllm.v1.agent_prefetch import (
     PrefixDescriptor,
     chunk_align,
     compute_prefix_hash,
+    get_eviction_policy,
 )
 
 if TYPE_CHECKING:
@@ -515,6 +516,26 @@ async def reset_agent_prefix_cache(
         actions,
     )
     return JSONResponse(content=result)
+
+
+@router.get("/v1/agents/eviction_stats")
+async def get_agent_eviction_stats(raw_request: Request):
+    """Inspect the agent-aware early-eviction policy state.
+
+    Returns the number of currently-active agent requests feeding the
+    probability aggregator, the number of cached blocks currently
+    tagged with an agent id, and the number of distinct agents the
+    policy is tracking. Useful for verifying that requests issued
+    through ``/v1/agents/chat/completions`` are actually reaching the
+    engine with their ``agent_probabilities`` payload intact."""
+    policy = get_eviction_policy()
+    return JSONResponse(
+        content={
+            **policy.stats(),
+            "low_probability_agents": sorted(policy.low_probability_agents()),
+            "effective_threshold": policy.effective_threshold(),
+        }
+    )
 
 
 @router.get("/v1/agents/registry_stats")

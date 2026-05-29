@@ -1,0 +1,405 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Agent-aware early-eviction policy.
+
+This module implements a cross-request, in-process policy that lets the
+GPU block pool evict cached blocks **before** they reach the LRU head if
+their owning agent is unlikely to be the next one to fire.
+
+Mental model::
+
+    Each live ``/v1/agents/chat/completions`` request can carry an
+    ``agent_probabilities`` dict: ``agent_id -> P(agent fires in the
+    next N turns)``. The policy maintains a global view of these
+    per-agent probabilities aggregated across every live request.
+
+    A block in state S3 (free-cached -- see ``plan/block_lifecycle.md``)
+    that is owned by an agent whose aggregated probability is below
+    ``eviction_threshold`` becomes liable for *early* eviction: the
+    block pool prefers it over arbitrary LRU victims when satisfying a
+    ``get_new_blocks`` request. This frees up cached GPU memory for
+    prefixes that are actually likely to be reused soon.
+
+The policy is a process-wide singleton because the scheduler /
+block-pool live in a single process; the API endpoint feeds info in via
+``register_request`` / ``unregister_request`` and the engine's block
+pool queries it from ``get_new_blocks`` / ``cache_full_blocks``.
+
+Thread-safety: every public method takes an ``RLock``.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Mapping
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+DEFAULT_EVICTION_WINDOW = 3
+"""Default `next-N-turns` window used when the request doesn't override it."""
+
+DEFAULT_EVICTION_THRESHOLD = 0.5
+"""Default probability threshold below which an agent's blocks are
+liable for early eviction."""
+
+DEFAULT_PROBABILITY_TTL_SECONDS = 60.0
+"""Default TTL on a live request's probability vote. After this many
+seconds the vote is treated as stale -- it stops contributing to
+``aggregated_probability`` and is opportunistically removed from
+``_active`` on the next query. Pass ``None`` to opt out of expiry."""
+
+
+@dataclass(frozen=True)
+class ActiveRequestInfo:
+    """Per-live-request data feeding the global aggregator."""
+
+    request_id: str
+    agent_id: str
+    # Agent id -> P(agent fires in the next ``window`` turns).
+    # An agent missing from this map is treated as probability 0 by the
+    # aggregator (i.e. eligible for eviction unless some other live
+    # request lifts it above the threshold).
+    agent_probabilities: dict[str, float] = field(default_factory=dict)
+    window: int = DEFAULT_EVICTION_WINDOW
+    threshold: float = DEFAULT_EVICTION_THRESHOLD
+    # Monotonic-ns wall when the vote was registered. Used together
+    # with ``ttl_ns`` to age out stale votes.
+    registered_at_ns: int = field(default_factory=time.monotonic_ns)
+    # Vote lifetime in nanoseconds. ``None`` means "never expires" --
+    # the historical behavior before TTL was added. Positive values
+    # are checked against ``time.monotonic_ns() - registered_at_ns``.
+    ttl_ns: int | None = None
+
+    def is_expired(self, now_ns: int) -> bool:
+        if self.ttl_ns is None:
+            return False
+        return (now_ns - self.registered_at_ns) >= self.ttl_ns
+
+
+class AgentEvictionPolicy:
+    """In-process registry of agent probabilities + block ownership.
+
+    Holds three correlated indices:
+
+    * ``_active``: live-request info (agent id, probabilities, window,
+      threshold). Populated when the scheduler admits a request,
+      removed when the request finishes.
+    * ``_block_owner``: which agent owns a given cached block. Set when
+      a block becomes cached (`cache_full_blocks`); cleared when the
+      block leaves the prefix cache (`_maybe_evict_cached_block` or
+      `reset_prefix_cache`).
+    * ``_agent_blocks``: reverse index ``agent_id -> set[block_id]``,
+      ordered LRU so we can hand the LRU-first set of an agent's blocks
+      back to the pool.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._active: dict[str, ActiveRequestInfo] = {}
+        # request_id -> agent_id, kept as a fast lookup for tag_block
+        # paths where we only have the request_id at hand.
+        self._request_to_agent: dict[str, str] = {}
+        self._block_owner: dict[int, str] = {}
+        # Use OrderedDict-as-set so we can keep LRU-ish order of when a
+        # block was tagged; popping from the head gives the oldest first.
+        self._agent_blocks: dict[str, OrderedDict[int, None]] = {}
+
+    # -- live-request registry -------------------------------------------
+
+    def register_request(
+        self,
+        request_id: str,
+        agent_id: str,
+        agent_probabilities: Mapping[str, float] | None = None,
+        window: int = DEFAULT_EVICTION_WINDOW,
+        threshold: float = DEFAULT_EVICTION_THRESHOLD,
+        ttl_seconds: float | None = DEFAULT_PROBABILITY_TTL_SECONDS,
+    ) -> None:
+        """Register a live agent request with the policy.
+
+        Idempotent: re-registering the same request_id overwrites the
+        previous info (useful when probabilities are refined mid-flight,
+        though the current API doesn't do this).
+
+        ``ttl_seconds`` controls how long the request's vote counts
+        toward the aggregator. ``None`` or non-positive values disable
+        expiry. Past the TTL the entry is treated as stale: it is
+        ignored by ``aggregated_probability`` /
+        ``low_probability_agents`` / ``effective_threshold`` and the
+        next access opportunistically drops it from ``_active``.
+        Block-ownership tags survive expiry -- only the *vote* goes
+        away.
+        """
+        if not agent_id:
+            return
+        probs = dict(agent_probabilities) if agent_probabilities else {}
+        ttl_ns: int | None
+        if ttl_seconds is None or ttl_seconds <= 0:
+            ttl_ns = None
+        else:
+            ttl_ns = int(ttl_seconds * 1_000_000_000)
+        info = ActiveRequestInfo(
+            request_id=request_id,
+            agent_id=agent_id,
+            agent_probabilities=probs,
+            window=max(1, int(window)) if window is not None else DEFAULT_EVICTION_WINDOW,
+            threshold=float(threshold) if threshold is not None else DEFAULT_EVICTION_THRESHOLD,
+            registered_at_ns=time.monotonic_ns(),
+            ttl_ns=ttl_ns,
+        )
+        with self._lock:
+            self._active[request_id] = info
+            self._request_to_agent[request_id] = agent_id
+            self._agent_blocks.setdefault(agent_id, OrderedDict())
+        logger.debug(
+            "agent_eviction: register request=%s agent=%s probs=%s "
+            "window=%d threshold=%.3f ttl_ns=%s",
+            request_id, agent_id, probs, info.window, info.threshold, ttl_ns,
+        )
+
+    def unregister_request(self, request_id: str) -> None:
+        """Drop the live-request entry. Block ownership is left intact
+        so any cached blocks the request produced can still be targeted
+        for low-probability eviction after the request finishes."""
+        with self._lock:
+            self._active.pop(request_id, None)
+            self._request_to_agent.pop(request_id, None)
+        logger.debug("agent_eviction: unregister request=%s", request_id)
+
+    # -- block-ownership tagging -----------------------------------------
+
+    def tag_block(self, block_id: int, request_id: str) -> None:
+        """Mark ``block_id`` as owned by the agent that owns
+        ``request_id``. No-op if the request isn't agent-tagged."""
+        with self._lock:
+            agent_id = self._request_to_agent.get(request_id)
+            if agent_id is None:
+                return
+            prev_agent = self._block_owner.get(block_id)
+            if prev_agent == agent_id:
+                # Refresh LRU position.
+                bucket = self._agent_blocks.setdefault(agent_id, OrderedDict())
+                if block_id in bucket:
+                    bucket.move_to_end(block_id)
+                return
+            if prev_agent is not None:
+                # Remove from previous owner's bucket.
+                prev_bucket = self._agent_blocks.get(prev_agent)
+                if prev_bucket is not None:
+                    prev_bucket.pop(block_id, None)
+            self._block_owner[block_id] = agent_id
+            self._agent_blocks.setdefault(agent_id, OrderedDict())[block_id] = None
+
+    def tag_block_explicit(self, block_id: int, agent_id: str) -> None:
+        """Tag a block directly with an agent id, without going through
+        a live request. Used by tests and by paths that have the agent
+        id but not the request id at hand."""
+        if not agent_id:
+            return
+        with self._lock:
+            prev_agent = self._block_owner.get(block_id)
+            if prev_agent == agent_id:
+                bucket = self._agent_blocks.setdefault(agent_id, OrderedDict())
+                if block_id in bucket:
+                    bucket.move_to_end(block_id)
+                return
+            if prev_agent is not None:
+                prev_bucket = self._agent_blocks.get(prev_agent)
+                if prev_bucket is not None:
+                    prev_bucket.pop(block_id, None)
+            self._block_owner[block_id] = agent_id
+            self._agent_blocks.setdefault(agent_id, OrderedDict())[block_id] = None
+
+    def untag_block(self, block_id: int) -> None:
+        """Drop an agent->block association. Called when the prefix
+        cache evicts a block or when ``reset_prefix_cache`` runs."""
+        with self._lock:
+            agent_id = self._block_owner.pop(block_id, None)
+            if agent_id is None:
+                return
+            bucket = self._agent_blocks.get(agent_id)
+            if bucket is not None:
+                bucket.pop(block_id, None)
+                if not bucket:
+                    # Keep the bucket even if empty -- the agent may
+                    # still be referenced by a live request. Small.
+
+                    pass
+
+    def clear_all_blocks(self) -> None:
+        """Drop every block-ownership association. Used by
+        ``reset_prefix_cache``."""
+        with self._lock:
+            self._block_owner.clear()
+            for bucket in self._agent_blocks.values():
+                bucket.clear()
+
+    # -- queries ---------------------------------------------------------
+
+    def _sweep_stale_locked(self, now_ns: int | None = None) -> None:
+        """Drop expired vote entries from ``_active``. Caller holds the
+        lock. ``now_ns`` defaults to the current monotonic ns; we
+        accept it as an arg so all read paths in a single query share a
+        single timestamp."""
+        if now_ns is None:
+            now_ns = time.monotonic_ns()
+        stale = [
+            req_id
+            for req_id, info in self._active.items()
+            if info.is_expired(now_ns)
+        ]
+        for req_id in stale:
+            self._active.pop(req_id, None)
+            self._request_to_agent.pop(req_id, None)
+        if stale:
+            logger.debug(
+                "agent_eviction: swept %d stale vote(s): %s",
+                len(stale), stale,
+            )
+
+    def aggregated_probability(self, agent_id: str) -> float:
+        """Return the max probability assigned to ``agent_id`` across
+        every live request.
+
+        Max (rather than mean/sum) is the most generous aggregator: if
+        any live request thinks an agent is likely, we protect its
+        blocks. Returns 0.0 when no live request mentions the agent --
+        which makes its blocks immediately eligible for eviction once a
+        threshold check is applied.
+
+        Each live request also implicitly votes ``1.0`` for **its own**
+        ``agent_id``: an agent that's currently running cannot
+        sensibly be classified as "low probability." Explicit votes
+        still win if higher (capped at 1.0 anyway).
+
+        Stale votes (older than each request's ``ttl_seconds``) are
+        skipped and opportunistically dropped from ``_active``.
+        """
+        with self._lock:
+            self._sweep_stale_locked()
+            if not self._active:
+                return 0.0
+            best = 0.0
+            for info in self._active.values():
+                p = info.agent_probabilities.get(agent_id, 0.0)
+                if info.agent_id == agent_id and p < 1.0:
+                    p = 1.0
+                if p > best:
+                    best = p
+            return best
+
+    def effective_threshold(self) -> float:
+        """Compute the threshold to apply for the current eviction
+        decision. When multiple live requests disagree on the
+        threshold, we take the **min** -- the most lenient one. This
+        means a block is liable for early eviction only when *every*
+        live request is willing to evict at that probability.
+
+        Stale votes are skipped (and swept) before the min is taken.
+        """
+        with self._lock:
+            self._sweep_stale_locked()
+            if not self._active:
+                return DEFAULT_EVICTION_THRESHOLD
+            return min(info.threshold for info in self._active.values())
+
+    def _low_probability_agents_locked(self) -> set[str]:
+        """Return the set of agent ids whose aggregated probability is
+        strictly below the effective threshold. Caller must hold
+        ``self._lock``. Sweeps stale votes first."""
+        self._sweep_stale_locked()
+        if not self._active:
+            return set()
+        threshold = min(info.threshold for info in self._active.values())
+        # Union of every agent we have block ownership for and every
+        # agent any live request talks about.
+        candidates: set[str] = set(self._agent_blocks.keys())
+        for info in self._active.values():
+            candidates.update(info.agent_probabilities.keys())
+            candidates.add(info.agent_id)
+        low: set[str] = set()
+        for agent_id in candidates:
+            best = 0.0
+            for info in self._active.values():
+                p = info.agent_probabilities.get(agent_id, 0.0)
+                if info.agent_id == agent_id and p < 1.0:
+                    # A request implicitly votes 1.0 for its own
+                    # agent_id -- the agent is actively running and
+                    # must never be classified as low-probability.
+                    p = 1.0
+                if p > best:
+                    best = p
+            if best < threshold:
+                low.add(agent_id)
+        return low
+
+    def low_probability_agents(self) -> set[str]:
+        """Public wrapper around ``_low_probability_agents_locked``."""
+        with self._lock:
+            return self._low_probability_agents_locked()
+
+    def evictable_blocks(self, num_needed: int) -> list[int]:
+        """Return up to ``num_needed`` block ids whose owning agent is
+        below the eviction threshold, in LRU-tag order (oldest first).
+
+        The pool then has to verify each block is actually a valid
+        eviction target (``ref_cnt == 0`` and in the free queue) --
+        a block we tagged may have been reallocated to a busy request
+        since we last looked. The pool ignores any block that fails
+        that check and falls back to the LRU head for the remainder.
+        """
+        if num_needed <= 0:
+            return []
+        with self._lock:
+            if not self._active:
+                return []
+            low = self._low_probability_agents_locked()
+            if not low:
+                return []
+            picks: list[int] = []
+            for agent_id in low:
+                bucket = self._agent_blocks.get(agent_id)
+                if not bucket:
+                    continue
+                for block_id in bucket.keys():
+                    picks.append(block_id)
+                    if len(picks) >= num_needed:
+                        return picks
+            return picks
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "active_requests": len(self._active),
+                "tagged_blocks": len(self._block_owner),
+                "tracked_agents": len(self._agent_blocks),
+            }
+
+
+# Module-level singleton -------------------------------------------------
+
+_POLICY_LOCK = threading.Lock()
+_POLICY_SINGLETON: AgentEvictionPolicy | None = None
+
+
+def get_eviction_policy() -> AgentEvictionPolicy:
+    """Return the process-wide ``AgentEvictionPolicy`` instance,
+    creating it on first access."""
+    global _POLICY_SINGLETON
+    if _POLICY_SINGLETON is None:
+        with _POLICY_LOCK:
+            if _POLICY_SINGLETON is None:
+                _POLICY_SINGLETON = AgentEvictionPolicy()
+    return _POLICY_SINGLETON
+
+
+def reset_eviction_policy_for_tests() -> None:
+    """Drop the singleton so unit tests can start from a clean state."""
+    global _POLICY_SINGLETON
+    with _POLICY_LOCK:
+        _POLICY_SINGLETON = None

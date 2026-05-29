@@ -51,6 +51,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.agent_prefetch.eviction import (
+    DEFAULT_EVICTION_THRESHOLD,
+    DEFAULT_EVICTION_WINDOW,
+    DEFAULT_PROBABILITY_TTL_SECONDS,
+    get_eviction_policy,
+)
 from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
@@ -1927,8 +1933,45 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            self._register_agent_eviction(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    @staticmethod
+    def _register_agent_eviction(request: Request) -> None:
+        """Register an agent-tagged request with the global eviction
+        policy so cross-request probability aggregation can see it.
+
+        A request only **engages** the policy when it supplies a
+        non-empty ``agent_probabilities`` dict. A bare
+        ``/v1/agents/chat/completions`` call (just ``agent_id``) leaves
+        the policy untouched -- behavior degrades cleanly to plain LRU
+        eviction. This guarantees that callers who don't opt in to the
+        eviction signal can't accidentally have their blocks classified
+        as low-probability just by existing.
+        """
+        agent_id = request.agent_id
+        if agent_id is None:
+            return
+        agent_probabilities = request.agent_probabilities
+        if not agent_probabilities:
+            # Opted out: no probabilities supplied, so this request must
+            # not influence the global aggregator and its blocks must
+            # not be tagged for early eviction.
+            return
+        ttl_seconds = request.probability_ttl_seconds
+        if ttl_seconds is None or ttl_seconds == 0:
+            ttl_seconds = DEFAULT_PROBABILITY_TTL_SECONDS
+        get_eviction_policy().register_request(
+            request_id=request.request_id,
+            agent_id=agent_id,
+            agent_probabilities=agent_probabilities,
+            window=request.eviction_window or DEFAULT_EVICTION_WINDOW,
+            threshold=request.eviction_threshold
+            if request.eviction_threshold is not None
+            else DEFAULT_EVICTION_THRESHOLD,
+            ttl_seconds=ttl_seconds,
+        )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2016,6 +2059,12 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
         self._external_runs.pop(request.request_id, None)
+        # Drop the live-request entry from the global eviction policy.
+        # Block ownership stays tagged on cached blocks so an agent's
+        # post-finish cached blocks can still be targeted for early
+        # eviction by a future request.
+        if request.agent_id is not None:
+            get_eviction_policy().unregister_request(request.request_id)
 
     @property
     def pause_state(self) -> PauseState:

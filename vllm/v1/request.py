@@ -263,6 +263,72 @@ class Request:
             return self.pooling_params.skip_reading_prefix_cache
         return False
 
+    @property
+    def agent_id(self) -> str | None:
+        """Agent id supplied by ``/v1/agents/chat/completions`` via
+        ``kv_transfer_params``. ``None`` for non-agent requests."""
+        if self.kv_transfer_params is None:
+            return None
+        value = self.kv_transfer_params.get("agent_id")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def agent_probabilities(self) -> dict[str, float] | None:
+        """Per-agent probabilities supplied by the caller for the
+        agent-aware early-eviction policy. ``None`` if absent."""
+        if self.kv_transfer_params is None:
+            return None
+        value = self.kv_transfer_params.get("agent_probabilities")
+        if not isinstance(value, dict):
+            return None
+        # Defensive copy + numeric coercion. Drop any non-numeric / NaN
+        # entries to keep the policy simple.
+        out: dict[str, float] = {}
+        for agent, prob in value.items():
+            if not isinstance(agent, str):
+                continue
+            try:
+                p = float(prob)
+            except (TypeError, ValueError):
+                continue
+            if p != p:  # NaN check (NaN != NaN)
+                continue
+            out[agent] = max(0.0, min(1.0, p))
+        return out or None
+
+    @property
+    def eviction_window(self) -> int | None:
+        if self.kv_transfer_params is None:
+            return None
+        value = self.kv_transfer_params.get("eviction_window")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def eviction_threshold(self) -> float | None:
+        if self.kv_transfer_params is None:
+            return None
+        value = self.kv_transfer_params.get("eviction_threshold")
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def probability_ttl_seconds(self) -> float | None:
+        """TTL on this request's probability vote, in seconds.
+        ``None`` (or absent) means use the server default; non-positive
+        means "no expiry"."""
+        if self.kv_transfer_params is None:
+            return None
+        value = self.kv_transfer_params.get("probability_ttl_seconds")
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
 

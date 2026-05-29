@@ -20,6 +20,15 @@ The phantom-request submitter and the public HTTP route land in
 follow-up commits; see ``plan/agent_prefetch_plan.md``.
 """
 
+from vllm.v1.agent_prefetch.eviction import (
+    DEFAULT_EVICTION_THRESHOLD,
+    DEFAULT_EVICTION_WINDOW,
+    DEFAULT_PROBABILITY_TTL_SECONDS,
+    ActiveRequestInfo,
+    AgentEvictionPolicy,
+    get_eviction_policy,
+    reset_eviction_policy_for_tests,
+)
 from vllm.v1.agent_prefetch.hashing import (
     DEFAULT_CHUNK_SIZE,
     chunk_align,
@@ -35,11 +44,18 @@ from vllm.v1.agent_prefetch.submitter import (
 )
 
 __all__ = [
+    "ActiveRequestInfo",
+    "AgentEvictionPolicy",
     "AgentPrefixRegistry",
     "DEFAULT_CHUNK_SIZE",
+    "DEFAULT_EVICTION_THRESHOLD",
+    "DEFAULT_EVICTION_WINDOW",
+    "DEFAULT_PROBABILITY_TTL_SECONDS",
     "PhantomPrefetchSubmitter",
     "PrefixDescriptor",
     "build_prefetch_request_id",
     "chunk_align",
     "compute_prefix_hash",
+    "get_eviction_policy",
+    "reset_eviction_policy_for_tests",
 ]
