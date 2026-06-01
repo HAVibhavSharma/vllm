@@ -210,6 +210,36 @@ def _resolve_prefetch_cache_salt(req: AgentPrefetchRequest) -> str:
     return req.agent_cache_salt or f"agent::{req.agent_id}"
 
 
+def _render_seed_text_to_token_ids(
+    chat_handler: "OpenAIServingChat",
+    text: str,
+) -> list[int] | None:
+    """Wrap ``text`` as a system message and apply the served model's
+    chat template, returning the token ids.
+
+    ``add_generation_prompt=False`` so the output is the system block
+    only — guaranteed to be a strict prefix of any real chat that
+    starts with the same system content. Returns ``None`` if the
+    tokenizer is unavailable or the template fails.
+    """
+    tokenizer = chat_handler.renderer.tokenizer
+    if tokenizer is None:
+        return None
+    messages = [{"role": "system", "content": text}]
+    try:
+        token_ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        logger.exception(
+            "agent_prefetch: apply_chat_template failed for seed text"
+        )
+        return None
+    return list(token_ids)
+
+
 @router.post(
     "/v1/agents/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -358,17 +388,58 @@ async def prefetch_agent_cache(
 
     registry, submitter = _get_or_init_state(raw_request, chat_handler)
 
-    # None ≡ "warm every prefix the registry has for this agent"; the
-    # request validator enforces ge=0 so non-None values are truncating
-    # caps (mostly useful for benchmarking).
-    top_k = request.prefetch_top_k
+    cache_salt = _resolve_prefetch_cache_salt(request)
+    seeded = False
+
+    # Optional registry seed from raw prefix text.
+    if request.text is not None:
+        token_ids = _render_seed_text_to_token_ids(chat_handler, request.text)
+        if token_ids is None:
+            return JSONResponse(
+                content=ErrorResponse(
+                    type="BadRequest",
+                    message="Failed to render/tokenize seed text via chat "
+                    "template.",
+                    code=HTTPStatus.BAD_REQUEST.value,
+                ).model_dump(),
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
+        # Non-react: enforce single-prefix invariant by dropping the
+        # agent's existing entries before recording the new seed. React
+        # mode keeps the existing MRU set and just promotes/inserts.
+        if request.agent_kind == "non-react":
+            registry.evict_agent(request.agent_id)
+        try:
+            seeded = _record_in_registry(
+                registry=registry,
+                agent_id=request.agent_id,
+                cache_salt=cache_salt,
+                model_name=chat_handler.model_config.model,
+                prompt_token_ids=token_ids,
+            )
+        except Exception:
+            logger.exception(
+                "agent_prefetch: failed to record seed text for agent %s",
+                request.agent_id,
+            )
+
+    # Effective top_k: non-react forces 1 regardless of what the caller
+    # passed (the single-prefix invariant means there's nothing else to
+    # warm). React mode honours the request's prefetch_top_k as before.
+    if request.agent_kind == "non-react":
+        effective_top_k: int | None = 1
+    else:
+        effective_top_k = request.prefetch_top_k
+
     available = registry.agent_size(request.agent_id)
-    top_k_repr = "all" if top_k is None else str(top_k)
+    top_k_repr = "all" if effective_top_k is None else str(effective_top_k)
 
     logger.info(
-        "agent_prefetch: prefetch request for agent=%s top_k=%s "
-        "available=%d wait=%s",
+        "agent_prefetch: prefetch request for agent=%s kind=%s seeded=%s "
+        "top_k=%s available=%d wait=%s",
         request.agent_id,
+        request.agent_kind,
+        seeded,
         top_k_repr,
         available,
         request.wait,
@@ -378,13 +449,15 @@ async def prefetch_agent_cache(
         registry=registry,
         submitter=submitter,
         agent_id=request.agent_id,
-        k=top_k,
+        k=effective_top_k,
         wait=request.wait,
     )
 
     elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
     body: dict[str, Any] = {
         "agent_id": request.agent_id,
+        "agent_kind": request.agent_kind,
+        "seeded_from_text": seeded,
         # "all" when no cap was provided; an int otherwise.
         "requested_top_k": top_k_repr,
         "available_prefixes": available,

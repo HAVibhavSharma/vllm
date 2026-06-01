@@ -18,11 +18,15 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
 )
+
+AgentKind = Literal["react", "non-react"]
 
 
 class AgentChatCompletionRequest(ChatCompletionRequest):
@@ -83,4 +87,25 @@ class AgentPrefetchRequest(BaseModel):
         description="If True (default) the endpoint awaits all phantom "
         "tasks before responding -- so APC is guaranteed warm on "
         "return. Set to False for fire-and-forget."
+    )
+    agent_kind: AgentKind = Field(
+        default="react",
+        description="Agent shape. ``react`` (default) keeps the existing "
+        "behaviour: multiple prefixes accumulate in the registry and "
+        "prefetch warms up to ``prefetch_top_k`` of them. ``non-react`` "
+        "assumes a single static prefix per agent: the agent's existing "
+        "registry entries are dropped before recording the new seed "
+        "(if ``text`` is supplied), and the effective prefetch fan-out "
+        "is forced to 1 regardless of ``prefetch_top_k``."
+    )
+    text: str | None = Field(
+        default=None, min_length=1, max_length=1_048_576,
+        description="Optional raw prefix text. When provided, the server "
+        "wraps it as a system message, applies the served model's chat "
+        "template (with ``add_generation_prompt=False`` so the tokens are "
+        "a clean prefix of any real chat that starts with the same "
+        "system content), tokenizes, and records the chunk-aligned "
+        "result in the registry under ``agent_id`` before fanning out "
+        "phantom prefetches. Omit to use whatever the registry already "
+        "holds for the agent."
     )

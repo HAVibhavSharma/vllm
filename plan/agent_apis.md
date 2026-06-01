@@ -204,19 +204,33 @@ prefixes through the engine as zero-output phantom requests.
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `agent_id` | string (1–128) | **yes** | — | Selects which agent's prefixes to warm. |
-| `prefetch_top_k` | int ≥ 0 or null | no | `null` (= all) | Cap on how many of the agent's most-recently-used prefixes to warm. `null` warms **every** prefix the registry has for this agent. `0` is a no-op. |
-| `agent_cache_salt` | string (≤256) or null | no | `"agent::<agent_id>"` | Should match whatever salt was used at chat time, or LMCache will miss. |
+| `prefetch_top_k` | int ≥ 0 or null | no | `null` (= all) | Cap on how many of the agent's most-recently-used prefixes to warm. `null` warms **every** prefix the registry has for this agent. `0` is a no-op. Ignored when `agent_kind == "non-react"` (forced to 1). |
+| `agent_cache_salt` | string (≤256) or null | no | `"agent::<agent_id>"` | Should match whatever salt was used at chat time, or LMCache will miss. Also used when seeding via `text`. |
 | `wait` | bool | no | `true` | `true` → block until every phantom finishes (APC is warm on return). `false` → fire-and-forget; server returns as soon as phantoms are queued. |
+| `agent_kind` | `"react"` \| `"non-react"` | no | `"react"` | `"react"` keeps the multi-prefix MRU behaviour. `"non-react"` enforces a single-prefix-per-agent invariant: when `text` is supplied the agent's existing registry entries are dropped before recording the new seed, and prefetch fan-out is forced to 1 regardless of `prefetch_top_k`. |
+| `text` | string (1–1,048,576) or null | no | `null` | Optional raw prefix text. When present, the server wraps it as a system message, applies the served model's chat template with `add_generation_prompt=False`, tokenizes the result, chunk-aligns it, and records it in the registry under `agent_id` **before** fanning out prefetches. Omit to use whatever the registry already holds. |
 
 ### Behaviour
 
-1. Looks up descriptors for `agent_id` in the registry (sorted MRU).
-2. Truncates to `prefetch_top_k` if provided.
-3. For each descriptor, calls `PhantomPrefetchSubmitter.submit(...)`.
+1. If `text` is provided:
+   - Wraps it as `[{"role": "system", "content": text}]` and renders
+     via the served model's chat template with
+     `add_generation_prompt=False` (guarantees the tokens are a strict
+     prefix of any real chat starting with the same system content).
+   - If `agent_kind == "non-react"`, evicts the agent's existing
+     registry entries first.
+   - Chunk-aligns the rendered tokens, computes the prefix hash, and
+     records a `PrefixDescriptor` under `agent_id`. Failures are logged
+     and don't abort the prefetch.
+2. Looks up descriptors for `agent_id` in the registry (sorted MRU).
+3. Computes the effective top_k: forced to `1` when
+   `agent_kind == "non-react"`; otherwise `prefetch_top_k` (or all when
+   omitted). Truncates the descriptor list accordingly.
+4. For each descriptor, calls `PhantomPrefetchSubmitter.submit(...)`.
    The submitter de-duplicates: if a phantom for the same
    `(agent_id, prefix_hash)` is already in flight, the new submission
    is dropped silently.
-4. With `wait=true`, `await asyncio.gather(*tasks)` blocks until all
+5. With `wait=true`, `await asyncio.gather(*tasks)` blocks until all
    phantoms finish. With `wait=false`, the endpoint returns
    immediately and the phantoms keep running in the background.
 
@@ -225,6 +239,8 @@ prefixes through the engine as zero-output phantom requests.
 ```json
 {
   "agent_id": "agent1",
+  "agent_kind": "react",
+  "seeded_from_text": false,
   "requested_top_k": "all",
   "available_prefixes": 4,
   "submitted": 4,
@@ -236,8 +252,10 @@ prefixes through the engine as zero-output phantom requests.
 
 | Field | Meaning |
 |---|---|
-| `requested_top_k` | `"all"` if `prefetch_top_k` was null/omitted; otherwise the integer cap echoed back. |
-| `available_prefixes` | Total prefixes currently registered for this agent. |
+| `agent_kind` | Echoes the request's `agent_kind`. |
+| `seeded_from_text` | `true` if a `text` field was provided and successfully recorded in the registry on this call; `false` otherwise. |
+| `requested_top_k` | `"all"` if `prefetch_top_k` was null/omitted; otherwise the integer cap echoed back. For `agent_kind="non-react"` this is `"1"` (the forced cap). |
+| `available_prefixes` | Total prefixes currently registered for this agent (after any seed insert). |
 | `submitted` | Number of phantoms actually handed to the engine after dedup. |
 | `completed` | Number that ran to completion. Equals `submitted` when `wait=true`; `0` when `wait=false`. |
 | `waited` | Echoes the `wait` flag. |
@@ -270,6 +288,46 @@ curl -s -X POST http://localhost:8000/v1/agents/prefetch \
   -d '{"agent_id": "agent1", "prefetch_top_k": 5, "wait": false}' \
   | python3 -m json.tool
 ```
+
+### Example — curl, non-react seed (single static prefix)
+
+Use this when an agent's prefix never changes. The first call records
+the prefix from `text`; subsequent calls can omit `text` and just
+warm the single stored entry.
+
+```bash
+curl -s -X POST http://localhost:8000/v1/agents/prefetch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "agent_id": "policy_bot",
+    "agent_kind": "non-react",
+    "text": "You are policy_bot. Long static system preamble here..."
+  }' | python3 -m json.tool
+```
+
+The server will:
+1. Drop any existing registry entries for `policy_bot`.
+2. Render `text` as a system message through the chat template,
+   tokenize with `add_generation_prompt=False`, chunk-align, and
+   record the single resulting prefix.
+3. Submit exactly one phantom prefetch for that prefix and (by
+   default) wait for it.
+
+### Example — curl, react seed (add a new prefix to the MRU set)
+
+```bash
+curl -s -X POST http://localhost:8000/v1/agents/prefetch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "agent_id": "agent1",
+    "agent_kind": "react",
+    "text": "Static system preamble shared by every tool-use turn.",
+    "prefetch_top_k": 20
+  }' | python3 -m json.tool
+```
+
+The seed is appended (or promoted, if its hash already exists) and
+then the top-20 MRU prefixes are warmed.
 
 ### Example — Python helper for a chat-prefetch cycle
 
