@@ -60,14 +60,15 @@ jq -n \
   | python3 -m json.tool
 
 metric() {
-    # Print the integer value of a single vLLM Prometheus counter.
-    # Returns 0 if the metric is absent (server may not have served any
-    # request yet).
+    # Sum every Prometheus sample whose name starts with $1 (allowing an
+    # optional `_total` suffix), across all label combinations. Skips
+    # comment lines and HELP/TYPE annotations. Returns 0 if no match.
     local name="$1"
-    local val
-    val=$(curl -sS "$HOST/metrics" \
-            | awk -v n="^${name}( |\\{)" '$0 ~ n && $1 !~ /^#/ { print $NF; exit }')
-    printf '%s' "${val:-0}"
+    curl -sS "$HOST/metrics" \
+      | awk -v n="^${name}(_total)?(\\{| )" '
+          $0 !~ /^#/ && $0 ~ n { sum += $NF }
+          END { printf "%d", (sum ? sum : 0) }
+        '
 }
 
 hr "3a. Prefix-cache counters BEFORE chat"

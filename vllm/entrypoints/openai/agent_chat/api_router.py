@@ -210,61 +210,68 @@ def _resolve_prefetch_cache_salt(req: AgentPrefetchRequest) -> str:
     return req.agent_cache_salt or f"agent::{req.agent_id}"
 
 
-def _render_seed_text_to_token_ids(
+async def _render_seed_text_to_token_ids(
     chat_handler: "OpenAIServingChat",
+    model_name: str,
     text: str,
 ) -> list[int] | None:
-    """Wrap ``text`` as a system message and apply the served model's
-    chat template, returning the token ids.
+    """Wrap ``text`` as a system message and run it through the same
+    renderer path the chat endpoint uses, returning the token ids.
 
-    ``add_generation_prompt=False`` so the output is the system block
-    only — guaranteed to be a strict prefix of any real chat that
-    starts with the same system content. Returns ``None`` if the
-    tokenizer is unavailable or the template fails.
+    Critically, we go through ``chat_handler.render_chat_request`` (not
+    the raw tokenizer) so the resulting tokens are byte-identical to
+    what a real ``/v1/agents/chat/completions`` call would produce for
+    the same system content. ``add_generation_prompt=False`` is forced
+    via ``chat_template_kwargs`` so the render stops after the system
+    block — making the output a strict prefix of any chat whose first
+    message has the same system content.
     """
-    tokenizer = chat_handler.renderer.tokenizer
-    if tokenizer is None:
-        logger.warning(
-            "agent_prefetch: seed text supplied but tokenizer is None"
-        )
-        return None
-    messages = [{"role": "system", "content": text}]
-    # Two-step render: vLLM's tokenizer wrapper does not reliably
-    # tokenize chat-template output when ``tokenize=True`` is passed
-    # (it returns only the special-token framing on some versions).
-    # Render to a string first, then encode.
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+
     try:
-        rendered = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
+        inner = ChatCompletionRequest(
+            model=model_name,
+            messages=[{"role": "system", "content": text}],
+            chat_template_kwargs={"add_generation_prompt": False},
         )
     except Exception:
         logger.exception(
-            "agent_prefetch: apply_chat_template failed for seed text"
+            "agent_prefetch: failed to build seed ChatCompletionRequest"
         )
         return None
-    if not rendered:
-        logger.warning(
-            "agent_prefetch: apply_chat_template returned empty rendering "
-            "for seed text (text_chars=%d)",
-            len(text),
-        )
-        return None
+
     try:
-        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+        rendered = await chat_handler.render_chat_request(inner)
     except Exception:
         logger.exception(
-            "agent_prefetch: tokenizer.encode failed for rendered seed"
+            "agent_prefetch: render_chat_request failed for seed text"
         )
         return None
-    out = list(token_ids)
+
+    if isinstance(rendered, ErrorResponse):
+        logger.warning(
+            "agent_prefetch: render_chat_request returned ErrorResponse "
+            "for seed text: %s",
+            rendered.error.message if rendered.error else "<no message>",
+        )
+        return None
+
+    _conversation, engine_inputs = rendered
+    if not engine_inputs:
+        logger.warning(
+            "agent_prefetch: render produced no engine inputs for seed text"
+        )
+        return None
+
+    components = chat_handler._extract_prompt_components(engine_inputs[0])
+    out = list(components.token_ids or [])
     logger.info(
         "agent_prefetch: seed text rendered to %d tokens "
-        "(text_chars=%d, rendered_chars=%d, chunk_size=%d)",
+        "(text_chars=%d, chunk_size=%d, path=render_chat_request)",
         len(out),
         len(text),
-        len(rendered),
         DEFAULT_CHUNK_SIZE,
     )
     return out
@@ -429,7 +436,11 @@ async def prefetch_agent_cache(
 
     # Optional registry seed from raw prefix text.
     if request.text is not None:
-        token_ids = _render_seed_text_to_token_ids(chat_handler, request.text)
+        token_ids = await _render_seed_text_to_token_ids(
+            chat_handler,
+            chat_handler.model_config.model,
+            request.text,
+        )
         if token_ids is None:
             return JSONResponse(
                 content=ErrorResponse(
