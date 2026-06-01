@@ -229,10 +229,14 @@ def _render_seed_text_to_token_ids(
         )
         return None
     messages = [{"role": "system", "content": text}]
+    # Two-step render: vLLM's tokenizer wrapper does not reliably
+    # tokenize chat-template output when ``tokenize=True`` is passed
+    # (it returns only the special-token framing on some versions).
+    # Render to a string first, then encode.
     try:
-        token_ids = tokenizer.apply_chat_template(
+        rendered = tokenizer.apply_chat_template(
             messages,
-            tokenize=True,
+            tokenize=False,
             add_generation_prompt=False,
         )
     except Exception:
@@ -240,12 +244,27 @@ def _render_seed_text_to_token_ids(
             "agent_prefetch: apply_chat_template failed for seed text"
         )
         return None
+    if not rendered:
+        logger.warning(
+            "agent_prefetch: apply_chat_template returned empty rendering "
+            "for seed text (text_chars=%d)",
+            len(text),
+        )
+        return None
+    try:
+        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+    except Exception:
+        logger.exception(
+            "agent_prefetch: tokenizer.encode failed for rendered seed"
+        )
+        return None
     out = list(token_ids)
     logger.info(
         "agent_prefetch: seed text rendered to %d tokens "
-        "(text_chars=%d, chunk_size=%d)",
+        "(text_chars=%d, rendered_chars=%d, chunk_size=%d)",
         len(out),
         len(text),
+        len(rendered),
         DEFAULT_CHUNK_SIZE,
     )
     return out
