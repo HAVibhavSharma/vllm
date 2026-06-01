@@ -224,6 +224,9 @@ def _render_seed_text_to_token_ids(
     """
     tokenizer = chat_handler.renderer.tokenizer
     if tokenizer is None:
+        logger.warning(
+            "agent_prefetch: seed text supplied but tokenizer is None"
+        )
         return None
     messages = [{"role": "system", "content": text}]
     try:
@@ -237,7 +240,15 @@ def _render_seed_text_to_token_ids(
             "agent_prefetch: apply_chat_template failed for seed text"
         )
         return None
-    return list(token_ids)
+    out = list(token_ids)
+    logger.info(
+        "agent_prefetch: seed text rendered to %d tokens "
+        "(text_chars=%d, chunk_size=%d)",
+        len(out),
+        len(text),
+        DEFAULT_CHUNK_SIZE,
+    )
+    return out
 
 
 @router.post(
@@ -390,6 +401,12 @@ async def prefetch_agent_cache(
 
     cache_salt = _resolve_prefetch_cache_salt(request)
     seeded = False
+
+    logger.info(
+        "agent_prefetch: seed payload presence: text=%s (chars=%s)",
+        request.text is not None,
+        len(request.text) if request.text is not None else 0,
+    )
 
     # Optional registry seed from raw prefix text.
     if request.text is not None:
