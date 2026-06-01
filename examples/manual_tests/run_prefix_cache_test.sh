@@ -59,15 +59,35 @@ jq -n \
       --data-binary @- \
   | python3 -m json.tool
 
-hr "3. Chat with same prefix + new user turn (expect cached_tokens > 0)"
+metric() {
+    # Print the integer value of a single vLLM Prometheus counter.
+    # Returns 0 if the metric is absent (server may not have served any
+    # request yet).
+    local name="$1"
+    local val
+    val=$(curl -sS "$HOST/metrics" \
+            | awk -v n="^${name}( |\\{)" '$0 ~ n && $1 !~ /^#/ { print $NF; exit }')
+    printf '%s' "${val:-0}"
+}
+
+hr "3a. Prefix-cache counters BEFORE chat"
+HITS_BEFORE=$(metric vllm:gpu_prefix_cache_hits)
+QUERIES_BEFORE=$(metric vllm:gpu_prefix_cache_queries)
+printf '  hits_before    = %s\n  queries_before = %s\n' \
+    "$HITS_BEFORE" "$QUERIES_BEFORE"
+
+hr "3b. Chat with same prefix + new user turn"
+# record_in_registry=false keeps the registry at exactly 1 entry (the
+# step-2 seed), so step 4's count is clean.
 jq -n \
     --arg model "$MODEL" \
     --arg agent "$AGENT_ID" \
     --arg sys   "$PREFIX_TEXT" \
     --arg usr   "$USER_QUESTION" \
     '{
-        model:       $model,
-        agent_id:    $agent,
+        model:               $model,
+        agent_id:            $agent,
+        record_in_registry:  false,
         messages: [
             {role: "system", content: $sys},
             {role: "user",   content: $usr}
@@ -80,6 +100,19 @@ jq -n \
       -H 'Content-Type: application/json' \
       --data-binary @- \
   | python3 -m json.tool
+
+hr "3c. Prefix-cache counters AFTER chat (delta = cache effect of step 3)"
+HITS_AFTER=$(metric vllm:gpu_prefix_cache_hits)
+QUERIES_AFTER=$(metric vllm:gpu_prefix_cache_queries)
+HITS_DELTA=$(python3 -c "print(int(float('$HITS_AFTER')) - int(float('$HITS_BEFORE')))")
+QUERIES_DELTA=$(python3 -c "print(int(float('$QUERIES_AFTER')) - int(float('$QUERIES_BEFORE')))")
+printf '  hits_after     = %s   (delta = %s)\n' "$HITS_AFTER" "$HITS_DELTA"
+printf '  queries_after  = %s   (delta = %s)\n' "$QUERIES_AFTER" "$QUERIES_DELTA"
+if [[ "$HITS_DELTA" -gt 0 ]]; then
+    printf '  RESULT: cache hit observed (%s tokens reused)\n' "$HITS_DELTA"
+else
+    printf '  RESULT: NO cache hit — investigate prefetch path\n'
+fi
 
 hr "4. Registry stats (expect 1 prefix for $AGENT_ID)"
 curl -sS "$HOST/v1/agents/registry_stats" | python3 -m json.tool
