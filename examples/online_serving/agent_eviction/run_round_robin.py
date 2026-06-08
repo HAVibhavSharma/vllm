@@ -155,10 +155,22 @@ def call_once(
     Returns ``(ttft_ms, total_ms, output_tokens, preview, error)``.
     ``error`` is ``None`` on success.
     """
-    url = f"{base_url.rstrip('/')}/v1/agents/chat/completions"
+    # We hit the standard /v1/chat/completions endpoint and feed the
+    # agent-eviction policy via kv_transfer_params. The dedicated
+    # /v1/agents/chat/completions wrapper would do the same forwarding,
+    # but in the KVCOMM-VLLM fork it breaks prefix-cache hashing so each
+    # request is treated as unique. Going direct avoids that bug while
+    # still exercising the engine-side policy.
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    kv_params: dict = {"agent_id": agent_id}
+    if probabilities is not None:
+        kv_params["agent_probabilities"] = probabilities
+        if eviction_window is not None:
+            kv_params["eviction_window"] = eviction_window
+        if eviction_threshold is not None:
+            kv_params["eviction_threshold"] = eviction_threshold
     payload: dict = {
         "model": model,
-        "agent_id": agent_id,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query},
@@ -166,13 +178,8 @@ def call_once(
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": True,
+        "kv_transfer_params": kv_params,
     }
-    if probabilities is not None:
-        payload["agent_probabilities"] = probabilities
-        if eviction_window is not None:
-            payload["eviction_window"] = eviction_window
-        if eviction_threshold is not None:
-            payload["eviction_threshold"] = eviction_threshold
 
     start_ns = time.perf_counter_ns()
     first_token_ns: int | None = None

@@ -35,6 +35,21 @@ TTFT gap on every request after the first full rotation.
   the demo scales to arbitrary `N`.
 - `README.md` — this file.
 
+## How it talks to vLLM
+
+The runner hits the standard `POST /v1/chat/completions` endpoint and
+passes the agent-eviction inputs (`agent_id`, `agent_probabilities`,
+`eviction_window`, `eviction_threshold`) inside `kv_transfer_params`.
+The scheduler's `_register_agent_eviction` reads those fields off
+`Request.kv_transfer_params` and registers a vote with the policy — the
+exact same code path the dedicated `/v1/agents/chat/completions` wrapper
+would have taken. We bypass the wrapper because, in some forks (notably
+`KVCOMM-VLLM`), the wrapper breaks prefix-cache hashing and prevents the
+cache hits this demo is trying to measure. Use `GET
+/v1/agents/eviction_stats` to confirm the policy is actually seeing
+votes (`active_requests` / `tagged_blocks` should be non-zero during a
+treatment run).
+
 ## Hardware target: H100 80 GB + Qwen2.5-72B-AWQ
 
 This demo is sized for an **H100 (80 GB) running Qwen2.5-72B-Instruct
