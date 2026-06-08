@@ -363,11 +363,21 @@ class BlockPool:
         # request needs a meaningful fraction of free space.
         prioritized: list[KVCacheBlock] = []
         if self.enable_caching:
-            # Heuristic: only fire the policy when this request would
-            # consume more than 1/4 of the currently-free pool. Below
-            # that, normal LRU eviction from the queue tail is plenty
-            # and won't disturb recently-cached prefixes.
-            if num_blocks * 4 >= self.get_num_free_blocks():
+            # Only consult the policy when we'd actually have to evict
+            # *cached* blocks to satisfy this request.
+            # ``get_num_free_blocks()`` lumps fresh (never-used) and
+            # cached-but-free blocks together, so we estimate the fresh
+            # portion by subtracting the number of currently-tagged
+            # blocks: ``fresh ≈ total_free - tagged``. If that
+            # estimate already covers ``num_blocks``, the natural LRU
+            # popleft will hand us fresh blocks and the policy has
+            # nothing useful to add (and would only cannibalise cached
+            # content). Otherwise, ask the policy to bias the eviction
+            # toward low-probability agents.
+            total_free = self.get_num_free_blocks()
+            tagged = get_eviction_policy().stats()["tagged_blocks"]
+            fresh_free_estimate = max(0, total_free - tagged)
+            if fresh_free_estimate < num_blocks:
                 prioritized = self._claim_low_probability_blocks(num_blocks)
 
         remaining = num_blocks - len(prioritized)
