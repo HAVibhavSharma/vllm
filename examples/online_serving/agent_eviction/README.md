@@ -99,6 +99,36 @@ vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ \
     --max-model-len 32768
 ```
 
+### Tuning the policy at launch — `VLLM_AGENT_EVICTION_FRESH_RATIO`
+
+The block pool only consults the agent-aware policy when uncached free
+space is tight. The trigger is exposed as an env var so operators can
+tune aggressiveness without code edits:
+
+| Value | Behaviour |
+| --- | --- |
+| `1.0` (default) | Policy fires when `fresh_free < num_blocks` — i.e. only when an allocation would otherwise have to evict cached content. Conservative. |
+| `>1.0` (e.g. `2.0`) | Policy fires sooner — when `fresh_free < num_blocks * ratio`. Biases the cache toward protecting predicted-popular agents before pressure becomes acute. |
+| `<1.0` (e.g. `0.5`) | Policy fires later. Rarely useful. |
+| `0` (or `off` / `disabled`) | Policy is bypassed entirely. Pure LRU eviction. Use this for the baseline arm of an A/B test instead of running two separate vLLM builds. |
+
+Examples:
+
+```bash
+# Default (conservative)
+vllm serve ...
+
+# Aggressive — protect popular agents earlier under any pressure
+VLLM_AGENT_EVICTION_FRESH_RATIO=2.0 vllm serve ...
+
+# Disabled — baseline LRU, ignores any agent_probabilities the client sends
+VLLM_AGENT_EVICTION_FRESH_RATIO=0 vllm serve ...
+```
+
+The chosen value is logged once at startup (`agent_eviction:
+fresh-ratio trigger = ...`) so you can confirm which mode the server
+is running in.
+
 First load takes 1–3 minutes — that's the model, not the demo.
 
 > The 32K `--max-model-len` is intentional. Each filler line in

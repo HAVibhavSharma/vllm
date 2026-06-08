@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -12,6 +13,58 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.agent_prefetch.eviction import get_eviction_policy
+
+
+def _agent_eviction_fresh_ratio() -> float:
+    """Read the agent-eviction trigger ratio from the environment.
+
+    ``VLLM_AGENT_EVICTION_FRESH_RATIO`` controls how aggressively the
+    agent-aware early-eviction policy is consulted in
+    :py:meth:`BlockPool.get_new_blocks`:
+
+    - ``0`` (or ``"off"`` / ``"disabled"``)  -> policy disabled, pure LRU
+      eviction. Useful as the baseline arm of an A/B test.
+    - ``1.0`` (default) -> policy fires when an allocation would have to
+      touch cached blocks (``fresh_free < num_blocks``). Conservative.
+    - ``>1.0``          -> policy fires sooner. ``2.0`` means fire when
+      ``fresh_free < num_blocks * 2``, which biases the cache toward
+      protecting high-probability agents even before pressure is acute.
+    - ``<1.0``          -> policy fires later (rarely useful).
+
+    Parsed once at module import. Restart the server to change it.
+    Invalid values fall back to ``1.0`` with a logged warning.
+    """
+    raw = os.environ.get("VLLM_AGENT_EVICTION_FRESH_RATIO")
+    if raw is None:
+        return 1.0
+    raw = raw.strip().lower()
+    if raw in ("off", "disabled", "false", "no"):
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "VLLM_AGENT_EVICTION_FRESH_RATIO=%r is not a number; "
+            "defaulting to 1.0 (conservative).",
+            raw,
+        )
+        return 1.0
+    if value < 0:
+        logger.warning(
+            "VLLM_AGENT_EVICTION_FRESH_RATIO=%s is negative; "
+            "treating as 0 (policy disabled).",
+            value,
+        )
+        return 0.0
+    return value
+
+
+_AGENT_EVICTION_FRESH_RATIO: float = _agent_eviction_fresh_ratio()
+logger.info(
+    "agent_eviction: fresh-ratio trigger = %.3f "
+    "(0 = policy disabled, 1.0 = default, >1 = fire sooner)",
+    _AGENT_EVICTION_FRESH_RATIO,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -362,22 +415,22 @@ class BlockPool:
         # cannibalizes the previous one's tags. Only consult once the
         # request needs a meaningful fraction of free space.
         prioritized: list[KVCacheBlock] = []
-        if self.enable_caching:
-            # Only consult the policy when we'd actually have to evict
-            # *cached* blocks to satisfy this request.
-            # ``get_num_free_blocks()`` lumps fresh (never-used) and
-            # cached-but-free blocks together, so we estimate the fresh
-            # portion by subtracting the number of currently-tagged
-            # blocks: ``fresh ≈ total_free - tagged``. If that
-            # estimate already covers ``num_blocks``, the natural LRU
-            # popleft will hand us fresh blocks and the policy has
-            # nothing useful to add (and would only cannibalise cached
-            # content). Otherwise, ask the policy to bias the eviction
-            # toward low-probability agents.
+        # The agent-aware eviction policy is opt-in via the
+        # ``VLLM_AGENT_EVICTION_FRESH_RATIO`` env var. ``0`` disables
+        # the policy entirely (fall through to pure LRU). Otherwise we
+        # only consult it when we'd actually have to evict cached
+        # blocks to satisfy this request. ``get_num_free_blocks()``
+        # lumps fresh (never-used) and cached-but-free blocks together,
+        # so we estimate the fresh portion by subtracting the number
+        # of currently-tagged blocks: ``fresh ≈ total_free - tagged``.
+        # The trigger fires when ``fresh < num_blocks * ratio`` -- a
+        # ratio above 1.0 makes the policy proactive (protect popular
+        # agents earlier), below 1.0 makes it more conservative.
+        if self.enable_caching and _AGENT_EVICTION_FRESH_RATIO > 0:
             total_free = self.get_num_free_blocks()
             tagged = get_eviction_policy().stats()["tagged_blocks"]
             fresh_free_estimate = max(0, total_free - tagged)
-            if fresh_free_estimate < num_blocks:
+            if fresh_free_estimate < num_blocks * _AGENT_EVICTION_FRESH_RATIO:
                 prioritized = self._claim_low_probability_blocks(num_blocks)
 
         remaining = num_blocks - len(prioritized)
