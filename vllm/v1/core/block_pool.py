@@ -349,9 +349,26 @@ class BlockPool:
         # blocks become first-class eviction candidates regardless of
         # their LRU position.  This only kicks in when caching is on --
         # otherwise blocks have no agent identity worth respecting.
+        #
+        # IMPORTANT: only consult the policy when the free queue is
+        # genuinely tight. If we have plenty of free blocks to satisfy
+        # this allocation many times over, those blocks are mostly
+        # uncached scratch space that the LRU head will hand us
+        # naturally -- and reaching into the policy here would
+        # *destroy* cached blocks we just put there, even though we
+        # never needed to. Empirically, dropping into the policy
+        # whenever it's available causes the cache to collapse to a
+        # single prompt in round-robin workloads: every new request
+        # cannibalizes the previous one's tags. Only consult once the
+        # request needs a meaningful fraction of free space.
         prioritized: list[KVCacheBlock] = []
         if self.enable_caching:
-            prioritized = self._claim_low_probability_blocks(num_blocks)
+            # Heuristic: only fire the policy when this request would
+            # consume more than 1/4 of the currently-free pool. Below
+            # that, normal LRU eviction from the queue tail is plenty
+            # and won't disturb recently-cached prefixes.
+            if num_blocks * 4 >= self.get_num_free_blocks():
+                prioritized = self._claim_low_probability_blocks(num_blocks)
 
         remaining = num_blocks - len(prioritized)
         if remaining > 0:
