@@ -172,9 +172,12 @@ _FILLER_TEMPLATE = (
 def build_system_prompt(agent_id: str, filler_lines: int = 220) -> str:
     """Return the long, stable system prompt for ``agent_id``.
 
-    ``filler_lines=220`` lands at roughly 4K tokens for English; bump it
-    for larger GPUs that can absorb more pressure. Decrease it on small
-    models or short ``--max-model-len`` settings.
+    Each filler line tokenizes to ~33 tokens on Qwen tokenizers, so
+    ``filler_lines=220`` lands at roughly 7K tokens, and ``500`` at
+    ~16K tokens. Bump it for larger GPUs that can absorb more pressure;
+    decrease it on small models or tight ``--max-model-len`` settings.
+    Make sure the server's ``--max-model-len`` leaves room for the
+    prompt + ``--max-output-tokens`` (e.g. 32K for ``--filler-lines 500``).
     """
     # Recover the index so synthesized personas stay stable.
     idx = _index_for(agent_id)

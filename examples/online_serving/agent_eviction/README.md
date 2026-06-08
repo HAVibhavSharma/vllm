@@ -59,8 +59,8 @@ Rough KV math at the recommended settings:
 | KV pool at `--gpu-memory-utilization 0.95` | ~38 GB |
 | KV bytes/token (80 layers, 8 KV heads, dim 128, fp16 KV) | ~327 KB |
 | ⇒ cache capacity | ~115K tokens |
-| Working set (16 agents × ~9K-token prompts) | ~144K tokens |
-| ⇒ cache holds ~12 of 16 prompts → 4 forced evictions per cycle | ✔ |
+| Working set (16 agents × ~16K-token prompts at `--filler-lines 500`) | ~263K tokens |
+| ⇒ cache holds ~7 of 16 prompts → 9 forced evictions per cycle | ✔ |
 
 > AWQ quantizes weights only; the KV cache is still fp16, which is why
 > per-token KV cost stays high.
@@ -81,10 +81,16 @@ VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ \
     --quantization awq_marlin \
     --gpu-memory-utilization 0.95 \
-    --max-model-len 16384
+    --max-model-len 32768
 ```
 
 First load takes 1–3 minutes — that's the model, not the demo.
+
+> The 32K `--max-model-len` is intentional. Each filler line in
+> `prompts.py` is ~33 tokens, so 500 lines lands at ~16.4K tokens — a
+> 16K context window would reject the request. 32K gives headroom for
+> the prompt + the 16-token output and lets you push `--filler-lines`
+> higher if you want even more cache pressure.
 
 ## Run the demo
 
@@ -132,7 +138,19 @@ The script prints per-call TTFT and a final summary table with:
 | Run       | Hit rate | Mean TTFT | What's happening |
 | --------- | -------- | --------- | ---------------- |
 | baseline  | near 0%  | ~2000 ms (cold prefill every call) | LRU evicts the next agent every cycle |
-| treatment | `~(N-1)/N` ≈ 94% at N=16 | ~200–300 ms (warm hit) | Policy evicts only the genuinely-stale agent |
+| treatment | `~K/N` (≈44% if cache holds 7 of 16) | mixed: hits ~200–300 ms, misses ~2000 ms | Policy protects the predicted-next agent and evicts the just-fired one |
+
+`K` is how many full prompts the prefix cache can hold at once — set by
+the KV-pool size and the per-prompt token count. The treatment ceiling
+is around `K/N` because the current forecast in `run_round_robin.py`
+only marks the *previous* agent as low-probability (probability 0.0);
+every other agent stays at the neutral 0.5. A smarter forecast that
+ramps probability with cycle distance would push the ceiling higher
+— that's a follow-up worth doing if you want a louder demo number.
+
+What's load-bearing for the presentation is the **gap**: baseline ~0%
+vs treatment ~40%+, with the TTFT delta dominated by cold prefills on
+baseline.
 
 If baseline still shows hits, the cache isn't pressured enough — bump
 `--num-agents` (16 → 20 → 24) or `--filler-lines` (500 → 700 → 1000) and
@@ -156,7 +174,7 @@ before measuring the treatment win.
 | `--mode {baseline,treatment}` | LRU vs agent-aware | required |
 | `--num-agents` | Distinct agents in the rotation; main pressure knob | 4 |
 | `--rounds` | Full rotations to run | 5 |
-| `--filler-lines` | Lines of filler in each agent prompt (~18 tok/line) | 220 |
+| `--filler-lines` | Lines of filler in each agent prompt (~33 tok/line) | 220 |
 | `--hit-threshold-ms` | TTFT below this counts as a cache hit | 200 |
 | `--warm-up-rounds` | Initial rounds excluded from summary stats | 1 |
 | `--max-output-tokens` | Response length per call | 16 |
