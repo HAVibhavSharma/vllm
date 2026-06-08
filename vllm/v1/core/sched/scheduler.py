@@ -1950,15 +1950,41 @@ class Scheduler(SchedulerInterface):
         eviction signal can't accidentally have their blocks classified
         as low-probability just by existing.
         """
+        import sys
+        print(
+            f"DBG _register_agent_eviction: req={request.request_id} "
+            f"kv={request.kv_transfer_params}",
+            file=sys.stderr,
+            flush=True,
+        )
         agent_id = request.agent_id
         if agent_id is None:
+            print(
+                f"DBG _register_agent_eviction: req={request.request_id} "
+                f"-> early return: agent_id is None",
+                file=sys.stderr,
+                flush=True,
+            )
             return
         agent_probabilities = request.agent_probabilities
         if not agent_probabilities:
             # Opted out: no probabilities supplied, so this request must
             # not influence the global aggregator and its blocks must
             # not be tagged for early eviction.
+            print(
+                f"DBG _register_agent_eviction: req={request.request_id} "
+                f"-> early return: agent_probabilities empty (agent_id={agent_id})",
+                file=sys.stderr,
+                flush=True,
+            )
             return
+        print(
+            f"DBG _register_agent_eviction: req={request.request_id} "
+            f"-> REGISTERING agent_id={agent_id} "
+            f"probs={agent_probabilities}",
+            file=sys.stderr,
+            flush=True,
+        )
         ttl_seconds = request.probability_ttl_seconds
         if ttl_seconds is None or ttl_seconds == 0:
             ttl_seconds = DEFAULT_PROBABILITY_TTL_SECONDS
