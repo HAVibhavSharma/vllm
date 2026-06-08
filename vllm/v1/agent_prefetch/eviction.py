@@ -179,7 +179,21 @@ class AgentEvictionPolicy:
         with self._lock:
             agent_id = self._request_to_agent.get(request_id)
             if agent_id is None:
+                import sys
+                print(
+                    f"DBG tag_block: block={block_id} req={request_id} "
+                    f"-> NO AGENT MAPPED (known reqs: {list(self._request_to_agent.keys())[:3]})",
+                    file=sys.stderr, flush=True,
+                )
                 return
+            import sys
+            # Only print every ~100th tag to avoid spam (one prompt = ~1500 blocks)
+            if block_id % 100 == 0:
+                print(
+                    f"DBG tag_block: block={block_id} req={request_id} agent={agent_id} "
+                    f"(total tagged so far: {len(self._block_owner)})",
+                    file=sys.stderr, flush=True,
+                )
             prev_agent = self._block_owner.get(block_id)
             if prev_agent == agent_id:
                 # Refresh LRU position.
@@ -353,13 +367,25 @@ class AgentEvictionPolicy:
         since we last looked. The pool ignores any block that fails
         that check and falls back to the LRU head for the remainder.
         """
+        import sys
         if num_needed <= 0:
             return []
         with self._lock:
             if not self._active:
+                print(
+                    f"DBG evictable_blocks(num_needed={num_needed}) "
+                    f"-> [] : _active is EMPTY",
+                    file=sys.stderr, flush=True,
+                )
                 return []
             low = self._low_probability_agents_locked()
             if not low:
+                print(
+                    f"DBG evictable_blocks(num_needed={num_needed}) "
+                    f"-> [] : no low-prob agents "
+                    f"(active={len(self._active)}, tagged_agents={list(self._agent_blocks.keys())})",
+                    file=sys.stderr, flush=True,
+                )
                 return []
             picks: list[int] = []
             for agent_id in low:
@@ -369,7 +395,17 @@ class AgentEvictionPolicy:
                 for block_id in bucket.keys():
                     picks.append(block_id)
                     if len(picks) >= num_needed:
+                        print(
+                            f"DBG evictable_blocks(num_needed={num_needed}) "
+                            f"-> {len(picks)} blocks from low-prob agents {low}",
+                            file=sys.stderr, flush=True,
+                        )
                         return picks
+            print(
+                f"DBG evictable_blocks(num_needed={num_needed}) "
+                f"-> {len(picks)} blocks (low={low}, short of need)",
+                file=sys.stderr, flush=True,
+            )
             return picks
 
     def stats(self) -> dict[str, int]:
