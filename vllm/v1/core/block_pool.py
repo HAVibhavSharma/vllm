@@ -13,6 +13,24 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.agent_prefetch.eviction import get_eviction_policy
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    BlockHashList,
+    BlockHashListWithBlockSize,
+    BlockHashWithGroupId,
+    ExternalBlockHash,
+    FreeKVCacheBlockQueue,
+    KVCacheBlock,
+    generate_block_hash_extra_keys,
+    get_block_hash,
+    get_group_id,
+    make_block_hash_with_group_id,
+    maybe_convert_block_hash,
+)
+from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _agent_eviction_fresh_ratio() -> float:
@@ -22,14 +40,15 @@ def _agent_eviction_fresh_ratio() -> float:
     agent-aware early-eviction policy is consulted in
     :py:meth:`BlockPool.get_new_blocks`:
 
-    - ``0`` (or ``"off"`` / ``"disabled"``)  -> policy disabled, pure LRU
-      eviction. Useful as the baseline arm of an A/B test.
-    - ``1.0`` (default) -> policy fires when an allocation would have to
-      touch cached blocks (``fresh_free < num_blocks``). Conservative.
-    - ``>1.0``          -> policy fires sooner. ``2.0`` means fire when
-      ``fresh_free < num_blocks * 2``, which biases the cache toward
+    - ``0`` (or ``"off"`` / ``"disabled"``) -> policy disabled, pure
+      LRU eviction. Useful as the baseline arm of an A/B test.
+    - ``1.0`` (default) -> policy fires when an allocation would have
+      to touch cached blocks (``fresh_free < num_blocks``).
+      Conservative.
+    - ``>1.0`` -> policy fires sooner. ``2.0`` means fire when
+      ``fresh_free < num_blocks * 2``, biasing the cache toward
       protecting high-probability agents even before pressure is acute.
-    - ``<1.0``          -> policy fires later (rarely useful).
+    - ``<1.0`` -> policy fires later (rarely useful).
 
     Parsed once at module import. Restart the server to change it.
     Invalid values fall back to ``1.0`` with a logged warning.
@@ -65,24 +84,6 @@ logger.info(
     "(0 = policy disabled, 1.0 = default, >1 = fire sooner)",
     _AGENT_EVICTION_FRESH_RATIO,
 )
-from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
-    BlockHashList,
-    BlockHashListWithBlockSize,
-    BlockHashWithGroupId,
-    ExternalBlockHash,
-    FreeKVCacheBlockQueue,
-    KVCacheBlock,
-    generate_block_hash_extra_keys,
-    get_block_hash,
-    get_group_id,
-    make_block_hash_with_group_id,
-    maybe_convert_block_hash,
-)
-from vllm.v1.request import Request
-
-logger = init_logger(__name__)
 
 
 class BlockHashToBlockMap:
