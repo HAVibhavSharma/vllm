@@ -91,28 +91,48 @@ def build_probabilities(
     previous_agent: str | None,
     rotation: list[str],
 ) -> dict[str, float]:
-    """Forecast for the next ``len(rotation)`` turns.
+    """Distance-aware forecast for round-robin firing order.
 
-    In a strict round-robin the next agent is deterministic, so we vote:
+    For a strict round-robin of N agents, each agent's distance from the
+    current one is well-defined: dist=1 is the next to fire, dist=N-1
+    is the one that just fired. We give every agent a probability that
+    linearly decreases with cycle distance:
 
-    - next agent -> 1.0 (protect its cache)
-    - agent that just fired (and isn't us) -> 0.0 (free to evict)
-    - everyone else -> 0.5 (neutral; default threshold won't evict them
-      and won't pin them either)
+        prob(dist) = (N - dist) / (N - 1)
 
-    The current agent doesn't need to be in the dict -- the policy
+    So:
+        dist=1 (next)   -> 1.0   (must protect — fires imminently)
+        dist=N-1 (prev) -> 0.0   (won't fire again until full cycle)
+        dist in between -> linear ramp
+
+    The naive "previous=0, next=1, rest=0.5" forecast we used before
+    caused thrashing: when each agent fired it evicted the *just-fired*
+    one — even with cache room to spare — and by the time the cycle
+    came back around N-1 turns later, that agent's blocks were gone.
+    The distance-aware ramp instead reflects the true cycle structure:
+    only the agents *farthest* from re-firing become evictable, so the
+    cache holds the upcoming ones.
+
+    With the default threshold of 0.5, agents whose probability is
+    strictly below 0.5 become evictable — that means the most-recently
+    fired half of the cycle becomes the eviction pool.
+
+    The current agent doesn't need to be in the dict — the policy
     implicitly self-votes 1.0 for its own ``agent_id``.
     """
+    del previous_agent  # no longer needed; distance encodes it
+    n = len(rotation)
+    if n < 2:
+        return {}
     idx = rotation.index(current_agent)
-    next_agent = rotation[(idx + 1) % len(rotation)]
     probs: dict[str, float] = {}
-    for agent in rotation:
-        if agent == next_agent:
-            probs[agent] = 1.0
-        elif agent == previous_agent and agent != current_agent:
-            probs[agent] = 0.0
-        else:
-            probs[agent] = 0.5
+    for i, agent in enumerate(rotation):
+        if agent == current_agent:
+            continue  # self, auto-protected by the policy
+        # Cycle distance in firing order: dist=1 is next, dist=N-1 is
+        # the one that just fired. Always in [1, N-1].
+        dist = (i - idx) % n
+        probs[agent] = (n - dist) / (n - 1)
     return probs
 
 
