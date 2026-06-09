@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from vllm.sampling_params import SamplingParams
@@ -73,6 +73,10 @@ class PhantomPrefetchSubmitter:
         token_ids: Sequence[int],
         prefix_hash: bytes,
         cache_salt: str,
+        agent_probabilities: Mapping[str, float] | None = None,
+        eviction_window: int | None = None,
+        eviction_threshold: float | None = None,
+        probability_ttl_seconds: float | None = None,
     ) -> asyncio.Task | None:
         """Submit one phantom prefetch.
 
@@ -103,15 +107,37 @@ class PhantomPrefetchSubmitter:
                 return None
             inflight_for_agent.add(request_id)
 
+        # Forwarding agent_id + non-empty agent_probabilities is what
+        # gets the phantom past _register_agent_eviction's "opted out"
+        # gate; without it the phantom's blocks come back with no
+        # owner, tag_block logs "NO AGENT MAPPED", and the warmed
+        # prefix is evictable under plain LRU. Callers can pass an
+        # explicit vote (e.g. the forecast the next real chat would
+        # carry); when they don't, fall back to a {agent_id: 1.0}
+        # self-vote -- benign because the aggregator already
+        # implicitly self-votes 1.0 for a request's own agent_id.
+        votes: dict[str, float] = (
+            dict(agent_probabilities)
+            if agent_probabilities
+            else {agent_id: 1.0}
+        )
+        kv_params: dict[str, Any] = {
+            "prefetch_only": True,
+            "cache_salt": cache_salt,
+            "agent_id": agent_id,
+            "agent_probabilities": votes,
+        }
+        if eviction_window is not None:
+            kv_params["eviction_window"] = int(eviction_window)
+        if eviction_threshold is not None:
+            kv_params["eviction_threshold"] = float(eviction_threshold)
+        if probability_ttl_seconds is not None:
+            kv_params["probability_ttl_seconds"] = float(probability_ttl_seconds)
+
         params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
-            extra_args={
-                "kv_transfer_params": {
-                    "prefetch_only": True,
-                    "cache_salt": cache_salt,
-                },
-            },
+            extra_args={"kv_transfer_params": kv_params},
         )
 
         task = asyncio.create_task(

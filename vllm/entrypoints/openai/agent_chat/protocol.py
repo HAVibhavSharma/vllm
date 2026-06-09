@@ -151,3 +151,34 @@ class AgentPrefetchRequest(BaseModel):
         "tasks before responding -- so APC is guaranteed warm on "
         "return. Set to False for fire-and-forget."
     )
+    agent_probabilities: dict[str, float] | None = Field(
+        default=None,
+        description="Optional vote that every phantom request issued by "
+        "this call carries into the engine. Forwarded as "
+        "`agent_probabilities` in the phantom's `kv_transfer_params`, "
+        "where it both (a) flips the eviction policy's 'opted out' "
+        "gate so the phantom's blocks are tagged with `agent_id`, and "
+        "(b) contributes to the cross-request probability aggregator "
+        "for as long as the phantom is in flight. Omit (or leave null) "
+        "to fall back to a self-vote of `{agent_id: 1.0}` -- the "
+        "minimum needed for the phantom to register at all."
+    )
+    eviction_window: int | None = Field(
+        default=None, ge=1, le=1024,
+        description="Window (number of upcoming turns) the probabilities "
+        "in `agent_probabilities` were computed over. Only meaningful "
+        "when `agent_probabilities` is set. Defaults to 3."
+    )
+    eviction_threshold: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Probability cutoff for early eviction. Only "
+        "meaningful when `agent_probabilities` is set. Defaults to 0.5."
+    )
+    probability_ttl_seconds: float | None = Field(
+        default=None, ge=0.0,
+        description="TTL on the phantom's vote in the global aggregator. "
+        "Past the TTL the vote stops contributing; block-ownership tags "
+        "survive. Only meaningful when `agent_probabilities` is set. "
+        "Defaults to the server default (60s); pass 0 to use the "
+        "server default explicitly."
+    )

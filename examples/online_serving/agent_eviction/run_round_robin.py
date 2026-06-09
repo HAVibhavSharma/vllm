@@ -92,8 +92,17 @@ def prefetch_agent(
     *,
     wait: bool = False,
     prefetch_top_k: int | None = None,
+    probabilities: dict[str, float] | None = None,
+    eviction_window: int | None = None,
+    eviction_threshold: float | None = None,
 ) -> dict | None:
     """POST /v1/agents/prefetch for ``agent_id``. Errors are swallowed.
+
+    When ``probabilities`` is supplied, the server forwards it into
+    every phantom's ``kv_transfer_params`` so the eviction policy
+    registers the phantom and tags its loaded blocks. Omitting
+    ``probabilities`` falls back to a server-side ``{agent_id: 1.0}``
+    self-vote -- enough for registration but no cross-agent signal.
 
     Returns the response body on success, ``None`` on failure. Prefetch
     is best-effort -- the benchmark must continue even if warming fails.
@@ -102,6 +111,12 @@ def prefetch_agent(
     payload: dict = {"agent_id": agent_id, "wait": wait}
     if prefetch_top_k is not None:
         payload["prefetch_top_k"] = prefetch_top_k
+    if probabilities is not None:
+        payload["agent_probabilities"] = probabilities
+        if eviction_window is not None:
+            payload["eviction_window"] = eviction_window
+        if eviction_threshold is not None:
+            payload["eviction_threshold"] = eviction_threshold
     try:
         return _post_json(url, payload, timeout=60.0)
     except urllib.error.HTTPError as e:
@@ -362,9 +377,26 @@ def run(
             # Fire-and-forget prefetch for the next agent in the
             # rotation, scored rounds only. wait=false lets the phantom
             # warm in the background while we set up the next HTTP call.
+            # In treatment mode we also hand the phantom the same
+            # forecast the next agent's real chat would carry, so the
+            # eviction policy sees a consistent view between the
+            # warm-up phantom and the real call that follows.
             if is_scored:
                 next_agent = rotation[(slot_idx + 1) % len(rotation)]
-                prefetch_agent(base_url, next_agent, wait=False)
+                if mode == "treatment":
+                    next_probs: dict[str, float] | None = build_probabilities(
+                        next_agent, agent_id, rotation
+                    )
+                else:
+                    next_probs = None
+                prefetch_agent(
+                    base_url,
+                    next_agent,
+                    wait=False,
+                    probabilities=next_probs,
+                    eviction_window=eviction_window,
+                    eviction_threshold=eviction_threshold,
+                )
             previous_agent = agent_id
     return summary
 
