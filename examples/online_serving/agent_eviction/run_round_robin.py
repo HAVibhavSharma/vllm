@@ -170,11 +170,24 @@ def call_once(
     probabilities: dict[str, float] | None,
     eviction_window: int | None,
     eviction_threshold: float | None,
+    prefetch_agent_id: str | None = None,
+    prefetch_system_prompt: str | None = None,
+    prefetch_threads_out: list[threading.Thread] | None = None,
 ) -> tuple[float, float, int, str, str | None]:
     """Issue one chat call and time TTFT + total wall time.
 
     Returns ``(ttft_ms, total_ms, output_tokens, preview, error)``.
     ``error`` is ``None`` on success.
+
+    If ``prefetch_agent_id`` is set, a fire-and-forget phantom prefetch
+    for that agent is launched **the moment the first token of the real
+    call arrives**, not before. Firing the prefetch before the real call
+    is admitted causes the engine to serialize them in submission order,
+    so the real call waits for the prefetch's prefill to finish (~7 s
+    for a 16K prompt) — exactly the latency we're trying to hide.
+    Deferring the prefetch until TTFT guarantees the real call gets the
+    engine's attention first; the prefetch then overlaps with the real
+    call's decode and the wall-clock gap before the next slot.
     """
     # We hit the standard /v1/chat/completions endpoint and feed the
     # agent-eviction policy via kv_transfer_params. The dedicated
@@ -217,6 +230,22 @@ def call_once(
                 continue
             if first_token_ns is None:
                 first_token_ns = time.perf_counter_ns()
+                # Fire the next-agent prefetch only AFTER the real call
+                # has produced its first token. By now the engine has
+                # admitted and prefilled this request, so the prefetch
+                # we queue next won't block it.
+                if (
+                    prefetch_agent_id is not None
+                    and prefetch_system_prompt is not None
+                ):
+                    pt = fire_prefetch(
+                        base_url=base_url,
+                        model=model,
+                        agent_id=prefetch_agent_id,
+                        system_prompt=prefetch_system_prompt,
+                    )
+                    if prefetch_threads_out is not None:
+                        prefetch_threads_out.append(pt)
             pieces.append(content)
             output_tokens += 1
     except urllib.error.HTTPError as e:
@@ -351,24 +380,15 @@ def run(
             else:
                 probs = None
 
-            # Kick off a phantom prefetch for the next agent in the
-            # rotation *before* firing the real call, so prefill of
-            # next-agent's prefix overlaps with the current call's
-            # decode on the engine side. The prefetch is fire-and-forget
-            # -- we don't wait for it. With the tag-only registration
-            # in the scheduler, the prefetched blocks are tagged with
-            # next_agent_id and managed by the eviction policy.
+            # Compute next-agent prefetch target; call_once will fire
+            # it after first-token so it does not starve the real call.
+            prefetch_agent_id: str | None = None
+            prefetch_sys_prompt: str | None = None
             if prefetch_next and len(rotation) >= 2:
-                next_agent = rotation[(slot_idx + 1) % len(rotation)]
-                if next_agent != agent_id:
-                    prefetch_threads.append(
-                        fire_prefetch(
-                            base_url=base_url,
-                            model=model,
-                            agent_id=next_agent,
-                            system_prompt=system_prompts[next_agent],
-                        )
-                    )
+                cand = rotation[(slot_idx + 1) % len(rotation)]
+                if cand != agent_id:
+                    prefetch_agent_id = cand
+                    prefetch_sys_prompt = system_prompts[cand]
 
             ttft_ms, total_ms, out_tokens, preview, err = call_once(
                 base_url=base_url,
@@ -380,6 +400,9 @@ def run(
                 probabilities=probs,
                 eviction_window=eviction_window,
                 eviction_threshold=eviction_threshold,
+                prefetch_agent_id=prefetch_agent_id,
+                prefetch_system_prompt=prefetch_sys_prompt,
+                prefetch_threads_out=prefetch_threads,
             )
             result = CallResult(
                 call_idx=call_idx,
