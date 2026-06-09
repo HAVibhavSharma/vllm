@@ -621,6 +621,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "'json_schema' field must be provided.",
                     parameter="response_format",
                 )
+            inner_schema = (
+                json_schema.get("schema")
+                if isinstance(json_schema, dict)
+                else getattr(json_schema, "json_schema", None)
+            )
+            if inner_schema is None:
+                raise VLLMValidationError(
+                    "When response_format type is 'json_schema', the "
+                    "'json_schema.schema' field must be provided and "
+                    "non-null.",
+                    parameter="response_format",
+                )
 
         return data
 

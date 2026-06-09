@@ -45,7 +45,10 @@ class AgentChatCompletionRequest(ChatCompletionRequest):
     def to_chat_completion_request(self) -> ChatCompletionRequest:
         """Strip agent fields and return a plain ChatCompletionRequest
         the existing serving_chat handler can consume."""
-        data = self.model_dump()
+        # by_alias=True preserves wire-format keys (e.g. `schema` on
+        # JsonSchemaResponseFormat) so the round-trip through
+        # model_validate doesn't silently drop aliased fields.
+        data = self.model_dump(by_alias=True, exclude_none=True)
         for key in (
             "agent_id",
             "agent_cache_salt",
