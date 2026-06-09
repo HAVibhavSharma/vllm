@@ -162,6 +162,32 @@ class AgentEvictionPolicy:
             request_id, agent_id, probs, info.window, info.threshold, ttl_ns,
         )
 
+    def register_request_for_tagging(
+        self, request_id: str, agent_id: str
+    ) -> None:
+        """Register a request for block-tagging only, without giving it a
+        vote in the probability aggregator.
+
+        Used by paths (notably phantom prefetches) that own an
+        ``agent_id`` but should not influence which agents are
+        considered low-probability. The blocks they produce still need
+        to be tagged so the policy can protect or evict them based on
+        *other* requests' votes.
+
+        Idempotent: re-registering the same request_id overwrites the
+        previous mapping. ``_active`` is left untouched, so no vote is
+        contributed.
+        """
+        if not agent_id:
+            return
+        with self._lock:
+            self._request_to_agent[request_id] = agent_id
+            self._agent_blocks.setdefault(agent_id, OrderedDict())
+        logger.debug(
+            "agent_eviction: tag-only register request=%s agent=%s",
+            request_id, agent_id,
+        )
+
     def unregister_request(self, request_id: str) -> None:
         """Drop the live-request entry. Block ownership is left intact
         so any cached blocks the request produced can still be targeted

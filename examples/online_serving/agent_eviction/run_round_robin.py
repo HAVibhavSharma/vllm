@@ -23,6 +23,7 @@ import argparse
 import json
 import statistics
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -237,6 +238,65 @@ def call_once(
 
 
 # ---------------------------------------------------------------------------
+# Phantom prefetch (parallel cache warming for the next agent).
+# ---------------------------------------------------------------------------
+
+
+def fire_prefetch(
+    base_url: str,
+    model: str,
+    agent_id: str,
+    system_prompt: str,
+) -> threading.Thread:
+    """Fire a fire-and-forget prefetch for ``agent_id`` in a background
+    thread and return the thread immediately so the caller can move on
+    to the real completion request.
+
+    The prefetch is a regular ``/v1/chat/completions`` call with
+    ``max_tokens=1`` and ``kv_transfer_params={"prefetch_only": True,
+    "agent_id": ...}``. The engine treats it as a phantom prefetch:
+    prefill computes the prefix's KV, caches it, and the (trivial)
+    response is discarded.
+
+    Because the request carries ``agent_id`` but no
+    ``agent_probabilities``, the scheduler routes it through the
+    tag-only branch of ``_register_agent_eviction``. That ensures the
+    blocks the prefetch caches are tagged with ``agent_id`` so the
+    eviction policy can manage them based on *other* requests' votes.
+    The prefetch itself contributes no vote -- its blocks live or die
+    by whoever is currently saying things about ``agent_id``.
+    """
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "."},
+        ],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "stream": False,
+        "kv_transfer_params": {
+            "prefetch_only": True,
+            "agent_id": agent_id,
+        },
+    }
+
+    def _run() -> None:
+        try:
+            _post_json(url, payload, timeout=600.0)
+        except Exception:
+            # Best-effort: prefetch failures must never break the run.
+            pass
+
+    t = threading.Thread(
+        target=_run, daemon=True, name=f"prefetch:{agent_id}"
+    )
+    t.start()
+    return t
+
+
+# ---------------------------------------------------------------------------
 # Run loop.
 # ---------------------------------------------------------------------------
 
@@ -268,6 +328,7 @@ def run(
     eviction_window: int | None,
     eviction_threshold: float | None,
     filler_lines: int,
+    prefetch_next: bool,
 ) -> RunSummary:
     summary = RunSummary(
         mode=mode,
@@ -278,6 +339,7 @@ def run(
     system_prompts = {a: build_system_prompt(a, filler_lines) for a in rotation}
     previous_agent: str | None = None
     call_idx = 0
+    prefetch_threads: list[threading.Thread] = []
 
     for round_idx in range(1, rounds + 1):
         for slot_idx, agent_id in enumerate(rotation):
@@ -288,6 +350,26 @@ def run(
                 probs = build_probabilities(agent_id, previous_agent, rotation)
             else:
                 probs = None
+
+            # Kick off a phantom prefetch for the next agent in the
+            # rotation *before* firing the real call, so prefill of
+            # next-agent's prefix overlaps with the current call's
+            # decode on the engine side. The prefetch is fire-and-forget
+            # -- we don't wait for it. With the tag-only registration
+            # in the scheduler, the prefetched blocks are tagged with
+            # next_agent_id and managed by the eviction policy.
+            if prefetch_next and len(rotation) >= 2:
+                next_agent = rotation[(slot_idx + 1) % len(rotation)]
+                if next_agent != agent_id:
+                    prefetch_threads.append(
+                        fire_prefetch(
+                            base_url=base_url,
+                            model=model,
+                            agent_id=next_agent,
+                            system_prompt=system_prompts[next_agent],
+                        )
+                    )
+
             ttft_ms, total_ms, out_tokens, preview, err = call_once(
                 base_url=base_url,
                 model=model,
@@ -326,6 +408,16 @@ def run(
                     file=sys.stderr,
                 )
             previous_agent = agent_id
+
+    # Drain any prefetches still in flight at the end of the run so
+    # they finish their HTTP roundtrip before the process exits.
+    # Daemon threads would be killed abruptly otherwise; a short join
+    # keeps the run clean without blocking the user if something hung.
+    if prefetch_threads:
+        deadline = time.monotonic() + 5.0
+        for t in prefetch_threads:
+            remaining = max(0.1, deadline - time.monotonic())
+            t.join(timeout=remaining)
     return summary
 
 
@@ -447,6 +539,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Optional eviction_threshold (treatment mode only)")
     p.add_argument("--skip-eviction-stats", action="store_true",
                    help="Don't fetch /v1/agents/eviction_stats at the end")
+    p.add_argument("--prefetch-next", action="store_true",
+                   help="Fire a fire-and-forget phantom prefetch for the "
+                        "next agent in the rotation in parallel with each "
+                        "real completion call. Pre-warms the next prefix "
+                        "and (with the tag-only registration patch) tags "
+                        "its blocks with the next agent's id so the "
+                        "eviction policy can manage them.")
     return p.parse_args(argv)
 
 
@@ -485,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         eviction_window=args.eviction_window,
         eviction_threshold=args.eviction_threshold,
         filler_lines=args.filler_lines,
+        prefetch_next=args.prefetch_next,
     )
     print_summary(summary)
     if not args.skip_eviction_stats:

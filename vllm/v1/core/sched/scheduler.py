@@ -1968,6 +1968,22 @@ class Scheduler(SchedulerInterface):
             return
         agent_probabilities = request.agent_probabilities
         if not agent_probabilities:
+            # Phantom prefetches carry an agent_id but no probabilities.
+            # They should not vote in the aggregator, but the blocks they
+            # warm into the cache still need to be tagged so the policy
+            # can manage them based on *other* requests' votes.
+            if Scheduler._is_prefetch_only_request(request):
+                print(
+                    f"DBG _register_agent_eviction: req={request.request_id} "
+                    f"-> TAG-ONLY (prefetch) agent_id={agent_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                get_eviction_policy().register_request_for_tagging(
+                    request_id=request.request_id,
+                    agent_id=agent_id,
+                )
+                return
             # Opted out: no probabilities supplied, so this request must
             # not influence the global aggregator and its blocks must
             # not be tagged for early eviction.

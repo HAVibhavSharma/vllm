@@ -226,3 +226,4 @@ before measuring the treatment win.
 | `--eviction-window` | The N in "next N turns" (treatment mode) | server default (3) |
 | `--eviction-threshold` | Below this probability ⇒ evict (treatment mode) | server default (0.5) |
 | `--skip-eviction-stats` | Don't fetch `/v1/agents/eviction_stats` at the end | off |
+| `--prefetch-next` | Fire a phantom prefetch for the next agent in parallel with each real call. Pre-warms the next prefix on the engine side and (with the tag-only registration patch) tags those blocks under the policy. | off |
