@@ -82,6 +82,42 @@ def _post_stream(url: str, payload: dict, timeout: float = 600.0):
 
 
 # ---------------------------------------------------------------------------
+# Prefetch helper.
+# ---------------------------------------------------------------------------
+
+
+def prefetch_agent(
+    base_url: str,
+    agent_id: str,
+    *,
+    wait: bool = False,
+    prefetch_top_k: int | None = None,
+) -> dict | None:
+    """POST /v1/agents/prefetch for ``agent_id``. Errors are swallowed.
+
+    Returns the response body on success, ``None`` on failure. Prefetch
+    is best-effort -- the benchmark must continue even if warming fails.
+    """
+    url = f"{base_url.rstrip('/')}/v1/agents/prefetch"
+    payload: dict = {"agent_id": agent_id, "wait": wait}
+    if prefetch_top_k is not None:
+        payload["prefetch_top_k"] = prefetch_top_k
+    try:
+        return _post_json(url, payload, timeout=60.0)
+    except urllib.error.HTTPError as e:
+        print(
+            f"  (prefetch agent={agent_id} failed: HTTP {e.code} {e.reason})",
+            file=sys.stderr,
+        )
+    except urllib.error.URLError as e:
+        print(
+            f"  (prefetch agent={agent_id} failed: {e.reason})",
+            file=sys.stderr,
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Forecast construction.
 # ---------------------------------------------------------------------------
 
@@ -175,20 +211,11 @@ def call_once(
     Returns ``(ttft_ms, total_ms, output_tokens, preview, error)``.
     ``error`` is ``None`` on success.
     """
-    # We hit the standard /v1/chat/completions endpoint and feed the
-    # agent-eviction policy via kv_transfer_params. The dedicated
-    # /v1/agents/chat/completions wrapper would do the same forwarding,
-    # but in the KVCOMM-VLLM fork it breaks prefix-cache hashing so each
-    # request is treated as unique. Going direct avoids that bug while
-    # still exercising the engine-side policy.
-    url = f"{base_url.rstrip('/')}/v1/chat/completions"
-    kv_params: dict = {"agent_id": agent_id}
-    if probabilities is not None:
-        kv_params["agent_probabilities"] = probabilities
-        if eviction_window is not None:
-            kv_params["eviction_window"] = eviction_window
-        if eviction_threshold is not None:
-            kv_params["eviction_threshold"] = eviction_threshold
+    # Use the agent-scoped chat endpoint so the server records this
+    # prompt's chunk-aligned prefix in the per-agent registry. That
+    # registry is what /v1/agents/prefetch reads from to warm APC for
+    # the upcoming agent in the rotation.
+    url = f"{base_url.rstrip('/')}/v1/agents/chat/completions"
     payload: dict = {
         "model": model,
         "messages": [
@@ -198,8 +225,14 @@ def call_once(
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": True,
-        "kv_transfer_params": kv_params,
+        "agent_id": agent_id,
     }
+    if probabilities is not None:
+        payload["agent_probabilities"] = probabilities
+        if eviction_window is not None:
+            payload["eviction_window"] = eviction_window
+        if eviction_threshold is not None:
+            payload["eviction_threshold"] = eviction_threshold
 
     start_ns = time.perf_counter_ns()
     first_token_ns: int | None = None
@@ -310,7 +343,8 @@ def run(
                 error=err,
             )
             summary.results.append(result)
-            tag = "warmup" if round_idx <= warm_up_rounds else "scored"
+            is_scored = round_idx > warm_up_rounds
+            tag = "scored" if is_scored else "warmup"
             hit = "HIT" if result.is_hit(hit_threshold_ms) else "miss"
             if err is None:
                 print(
@@ -325,6 +359,12 @@ def run(
                     f"slot={slot_idx} agent={agent_id} ERROR: {err}",
                     file=sys.stderr,
                 )
+            # Fire-and-forget prefetch for the next agent in the
+            # rotation, scored rounds only. wait=false lets the phantom
+            # warm in the background while we set up the next HTTP call.
+            if is_scored:
+                next_agent = rotation[(slot_idx + 1) % len(rotation)]
+                prefetch_agent(base_url, next_agent, wait=False)
             previous_agent = agent_id
     return summary
 
