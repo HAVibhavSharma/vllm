@@ -226,6 +226,7 @@ class FinishedRequestStats:
 
     finish_reason: "FinishReason"
     request_id: str | None = None
+    job_id: str | None = None
     e2e_latency: float = 0.0
     num_prompt_tokens: int = 0
     num_generation_tokens: int = 0
@@ -237,6 +238,7 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+    prefix_cache_hit_rate: float = 0.0
 
 
 @dataclass
@@ -429,6 +431,7 @@ class IterationStats:
         self,
         finish_reason: "FinishReason",
         request_id: str,
+        job_id: str | None,
         num_prompt_tokens: int,
         max_tokens_param: int | None,
         req_stats: RequestStateStats,
@@ -457,10 +460,14 @@ class IterationStats:
             if req_stats.num_generation_tokens - 1 > 0
             else 0
         )
+        prefix_cache_hit_rate = (
+            num_cached_tokens / num_prompt_tokens if num_prompt_tokens > 0 else 0.0
+        )
 
         finished_req = FinishedRequestStats(
             finish_reason=finish_reason,
             request_id=request_id,
+            job_id=job_id,
             e2e_latency=e2e_latency,
             num_prompt_tokens=num_prompt_tokens,
             num_generation_tokens=req_stats.num_generation_tokens,
@@ -472,6 +479,7 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            prefix_cache_hit_rate=prefix_cache_hit_rate,
         )
         self.finished_requests.append(finished_req)
 

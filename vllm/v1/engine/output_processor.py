@@ -148,6 +148,7 @@ class RequestState:
         top_p: float | None = None,
         n: int | None = None,
         temperature: float | None = None,
+        job_id: str | None = None,
         stream_input: bool = False,
     ):
         self.request_id = request_id
@@ -169,6 +170,7 @@ class RequestState:
         self.top_p = top_p
         self.n = n
         self.temperature = temperature
+        self.job_id = job_id
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -232,6 +234,11 @@ class RequestState:
             top_p = sampling_params.top_p
             n = sampling_params.n
             temperature = sampling_params.temperature
+            job_id = None
+            if sampling_params.extra_args is not None:
+                extra_job_id = sampling_params.extra_args.get("job_id")
+                if extra_job_id is not None:
+                    job_id = str(extra_job_id)
         else:
             logprobs_processor = None
             detokenizer = None
@@ -239,6 +246,7 @@ class RequestState:
             top_p = None
             n = None
             temperature = None
+            job_id = None
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -259,6 +267,7 @@ class RequestState:
             top_p=top_p,
             n=n,
             temperature=temperature,
+            job_id=job_id,
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
@@ -800,6 +809,7 @@ class OutputProcessor:
         iteration_stats.update_from_finished_request(
             finish_reason=finish_reason,
             request_id=req_state.external_req_id,
+            job_id=req_state.job_id,
             num_prompt_tokens=req_state.prompt_len,
             max_tokens_param=req_state.max_tokens_param,
             req_stats=req_state.stats,

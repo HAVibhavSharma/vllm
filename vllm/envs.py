@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_REQUEST_STATS_DIR: str | None = None
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -716,6 +717,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
     ),
+    # If set, finished request stats are exported as CSV and JSONL files
+    # under this directory.
+    "VLLM_REQUEST_STATS_DIR": lambda: os.getenv("VLLM_REQUEST_STATS_DIR"),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging

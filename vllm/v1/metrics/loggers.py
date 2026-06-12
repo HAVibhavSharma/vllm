@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
+import csv
+import json
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from datetime import datetime
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -84,6 +89,9 @@ def load_stat_logger_plugin_factories() -> list[StatLoggerFactory]:
             )
 
         factories.append(plugin_class)
+
+    if os.getenv("VLLM_REQUEST_STATS_DIR") is not None:
+        factories.append(FileStatLogger)
 
     return factories
 
@@ -1236,6 +1244,99 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
     def log_engine_initialized(self):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+
+
+_CSV_COLUMNS = [
+    "request_id",
+    "job_id",
+    "finish_reason",
+    "e2e_latency",
+    "num_prompt_tokens",
+    "num_generation_tokens",
+    "num_cached_tokens",
+    "prefix_cache_hit_rate",
+    "queued_time",
+    "prefill_time",
+    "inference_time",
+    "decode_time",
+    "max_tokens_param",
+]
+
+
+class FileStatLogger(StatLoggerBase):
+    """Writes finished per-request stats to CSV and JSONL files."""
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0):
+        del vllm_config
+        output_dir = os.getenv("VLLM_REQUEST_STATS_DIR")
+        if output_dir is None:
+            raise ValueError(
+                "VLLM_REQUEST_STATS_DIR must be set to enable FileStatLogger"
+            )
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = f"finished_requests_engine{engine_index}_{ts}"
+        csv_path = os.path.join(output_dir, f"{base}.csv")
+        jsonl_path = os.path.join(output_dir, f"{base}.jsonl")
+
+        self._csv_file = open(csv_path, "w", newline="", buffering=-1)
+        self._jsonl_file = open(jsonl_path, "w", buffering=-1)
+        self._csv_writer = csv.DictWriter(
+            self._csv_file,
+            fieldnames=_CSV_COLUMNS,
+        )
+        self._csv_writer.writeheader()
+
+        atexit.register(self._close)
+
+        logger.info(
+            "FileStatLogger: writing request stats to %s and %s",
+            csv_path,
+            jsonl_path,
+        )
+
+    def _close(self):
+        for f in (self._csv_file, self._jsonl_file):
+            if not f.closed:
+                f.flush()
+                f.close()
+
+    def record(
+        self,
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
+        mm_cache_stats: MultiModalCacheStats | None = None,
+        engine_idx: int = 0,
+    ):
+        del scheduler_stats, mm_cache_stats, engine_idx
+        if iteration_stats is None:
+            return
+
+        for req in iteration_stats.finished_requests:
+            row = {
+                "request_id": req.request_id,
+                "job_id": req.job_id,
+                "finish_reason": str(req.finish_reason)
+                if req.finish_reason is not None
+                else None,
+                "e2e_latency": req.e2e_latency,
+                "num_prompt_tokens": req.num_prompt_tokens,
+                "num_generation_tokens": req.num_generation_tokens,
+                "num_cached_tokens": req.num_cached_tokens,
+                "prefix_cache_hit_rate": req.prefix_cache_hit_rate,
+                "queued_time": req.queued_time,
+                "prefill_time": req.prefill_time,
+                "inference_time": req.inference_time,
+                "decode_time": req.decode_time,
+                "max_tokens_param": req.max_tokens_param,
+            }
+            self._csv_writer.writerow(row)
+            self._jsonl_file.write(json.dumps(row) + "\n")
+
+    def log_engine_initialized(self):
+        pass
 
 
 def build_buckets(mantissa_lst: list[int], max_value: int) -> list[int]:
