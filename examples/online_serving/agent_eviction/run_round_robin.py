@@ -375,20 +375,19 @@ def run(
                     file=sys.stderr,
                 )
             # Fire-and-forget prefetch for the next agent in the
-            # rotation, scored rounds only. wait=false lets the phantom
-            # warm in the background while we set up the next HTTP call.
-            # In treatment mode we also hand the phantom the same
-            # forecast the next agent's real chat would carry, so the
-            # eviction policy sees a consistent view between the
-            # warm-up phantom and the real call that follows.
-            if is_scored:
+            # rotation, scored rounds only. Treatment mode only: in
+            # baseline we want pure LRU with no cache warming, so the
+            # comparison isolates the agent-aware eviction policy from
+            # the confound of prefetch warming. wait=false lets the
+            # phantom warm in the background while we set up the next
+            # HTTP call. We hand the phantom the same forecast the
+            # next agent's real chat will carry so the eviction policy
+            # sees a consistent view between phantom and real call.
+            if is_scored and mode == "treatment":
                 next_agent = rotation[(slot_idx + 1) % len(rotation)]
-                if mode == "treatment":
-                    next_probs: dict[str, float] | None = build_probabilities(
-                        next_agent, agent_id, rotation
-                    )
-                else:
-                    next_probs = None
+                next_probs = build_probabilities(
+                    next_agent, agent_id, rotation
+                )
                 prefetch_agent(
                     base_url,
                     next_agent,
