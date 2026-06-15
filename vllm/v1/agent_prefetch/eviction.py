@@ -31,7 +31,6 @@ Thread-safety: every public method takes an ``RLock``.
 from __future__ import annotations
 
 import threading
-import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -47,28 +46,6 @@ DEFAULT_EVICTION_THRESHOLD = 0.5
 """Default probability threshold below which an agent's blocks are
 liable for early eviction."""
 
-DEFAULT_PROBABILITY_TTL_SECONDS = 60.0
-"""Default TTL on a live request's probability vote. After this many
-seconds the vote is treated as stale -- it stops contributing to
-``aggregated_probability`` and is opportunistically removed from
-``_active`` on the next query. Pass ``None`` to opt out of expiry."""
-
-DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS = 3.0
-"""Maximum TTL applied to *prefetch* votes specifically.
-
-A prefetch vote only needs to survive the gap between
-"prefetch finishes loading blocks" and "real chat call for the same
-agent arrives" -- typically sub-second in tight workloads. Using the
-60s default would let dozens of stale prefetch votes pile up in
-``_active``: each one contributes cross-agent probabilities (e.g.
-agent_b's prefetch votes 1.0 for agent_c) that the ``max`` aggregator
-would then propagate, pushing most agents above the eviction threshold
-and effectively disabling the early-eviction policy.
-
-Set well above typical inter-turn latency but well below the regular
-vote TTL. ``register_request`` caps the effective prefetch TTL at this
-value (a caller passing a shorter ``ttl_seconds`` is still honoured)."""
-
 
 @dataclass(frozen=True)
 class ActiveRequestInfo:
@@ -83,25 +60,6 @@ class ActiveRequestInfo:
     agent_probabilities: dict[str, float] = field(default_factory=dict)
     window: int = DEFAULT_EVICTION_WINDOW
     threshold: float = DEFAULT_EVICTION_THRESHOLD
-    # Monotonic-ns wall when the vote was registered. Used together
-    # with ``ttl_ns`` to age out stale votes.
-    registered_at_ns: int = field(default_factory=time.monotonic_ns)
-    # Vote lifetime in nanoseconds. ``None`` means "never expires" --
-    # the historical behavior before TTL was added. Positive values
-    # are checked against ``time.monotonic_ns() - registered_at_ns``.
-    ttl_ns: int | None = None
-    # True when the registering request is a phantom prefetch. Prefetch
-    # votes are kept in ``_active`` past their request's lifetime so the
-    # implicit self-vote (1.0 for the prefetch's own agent_id) keeps
-    # protecting the just-loaded blocks until the real chat call for
-    # that agent arrives. Cleared either by that real call (which sweeps
-    # any stale prefetch votes for its agent) or by the TTL.
-    is_prefetch: bool = False
-
-    def is_expired(self, now_ns: int) -> bool:
-        if self.ttl_ns is None:
-            return False
-        return (now_ns - self.registered_at_ns) >= self.ttl_ns
 
 
 class AgentEvictionPolicy:
@@ -141,8 +99,6 @@ class AgentEvictionPolicy:
         agent_probabilities: Mapping[str, float] | None = None,
         window: int = DEFAULT_EVICTION_WINDOW,
         threshold: float = DEFAULT_EVICTION_THRESHOLD,
-        ttl_seconds: float | None = DEFAULT_PROBABILITY_TTL_SECONDS,
-        is_prefetch: bool = False,
     ) -> None:
         """Register a live agent request with the policy.
 
@@ -150,98 +106,37 @@ class AgentEvictionPolicy:
         previous info (useful when probabilities are refined mid-flight,
         though the current API doesn't do this).
 
-        ``ttl_seconds`` controls how long the request's vote counts
-        toward the aggregator. ``None`` or non-positive values disable
-        expiry. Past the TTL the entry is treated as stale: it is
-        ignored by ``aggregated_probability`` /
-        ``low_probability_agents`` / ``effective_threshold`` and the
-        next access opportunistically drops it from ``_active``.
-        Block-ownership tags survive expiry -- only the *vote* goes
-        away.
+        The vote lives in ``_active`` only for the duration of the
+        request -- ``unregister_request`` removes it. Multiple requests
+        that overlap in time contribute their votes simultaneously,
+        and the aggregator takes the ``max`` per agent. Sequential
+        requests do **not** leak state into one another.
         """
         if not agent_id:
             return
         probs = dict(agent_probabilities) if agent_probabilities else {}
-        # Prefetch votes are capped to a much shorter TTL so stale
-        # prefetches don't pile up in ``_active`` and disable the
-        # eviction policy. See ``DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS``.
-        if is_prefetch:
-            if ttl_seconds is None or ttl_seconds <= 0:
-                ttl_seconds = DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS
-            else:
-                ttl_seconds = min(
-                    ttl_seconds, DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS)
-        ttl_ns: int | None
-        if ttl_seconds is None or ttl_seconds <= 0:
-            ttl_ns = None
-        else:
-            ttl_ns = int(ttl_seconds * 1_000_000_000)
         info = ActiveRequestInfo(
             request_id=request_id,
             agent_id=agent_id,
             agent_probabilities=probs,
             window=max(1, int(window)) if window is not None else DEFAULT_EVICTION_WINDOW,
             threshold=float(threshold) if threshold is not None else DEFAULT_EVICTION_THRESHOLD,
-            registered_at_ns=time.monotonic_ns(),
-            ttl_ns=ttl_ns,
-            is_prefetch=is_prefetch,
         )
         with self._lock:
-            # A real chat call arriving for an agent supersedes any
-            # outstanding prefetch protection for the same agent: the
-            # real call's own vote takes over, so retire the prefetch
-            # votes now to keep ``_active`` small and to avoid double
-            # counting in aggregation.
-            #
-            # CRITICAL: do NOT touch ``_request_to_agent`` for the swept
-            # prefetches. The prefetch's prefill may still be in flight,
-            # in which case ``tag_block`` calls keyed off the prefetch's
-            # request_id are about to arrive. Killing the mapping here
-            # made those tags fall through as "NO AGENT MAPPED", leaving
-            # the prefetched blocks anonymous (and therefore evictable
-            # under pure LRU). The mapping is dropped naturally when
-            # the prefetch eventually calls ``unregister_request``.
-            if not is_prefetch:
-                stale_prefetches = [
-                    rid for rid, i in self._active.items()
-                    if i.agent_id == agent_id and i.is_prefetch
-                ]
-                for rid in stale_prefetches:
-                    self._active.pop(rid, None)
             self._active[request_id] = info
             self._request_to_agent[request_id] = agent_id
             self._agent_blocks.setdefault(agent_id, OrderedDict())
         logger.debug(
             "agent_eviction: register request=%s agent=%s probs=%s "
-            "window=%d threshold=%.3f ttl_ns=%s",
-            request_id, agent_id, probs, info.window, info.threshold, ttl_ns,
+            "window=%d threshold=%.3f",
+            request_id, agent_id, probs, info.window, info.threshold,
         )
 
     def unregister_request(self, request_id: str) -> None:
         """Drop the live-request entry. Block ownership is left intact
         so any cached blocks the request produced can still be targeted
-        for low-probability eviction after the request finishes.
-
-        Special case: prefetch votes are kept in ``_active`` past the
-        prefetch request's lifetime. The implicit self-vote (1.0 for
-        the prefetch's own ``agent_id``) is what keeps the just-loaded
-        blocks safe from eviction until the real chat call for that
-        agent arrives. The vote is eventually cleared by either:
-          * the real chat call's ``register_request`` (which sweeps any
-            outstanding prefetch votes for the same agent), or
-          * the TTL on ``ActiveRequestInfo`` (``ttl_ns``), which makes
-            ``_sweep_stale_locked`` drop the entry on the next query.
-        """
+        for low-probability eviction after the request finishes."""
         with self._lock:
-            info = self._active.get(request_id)
-            if info is not None and info.is_prefetch:
-                # Keep the vote alive past the prefetch's lifetime so
-                # the just-loaded blocks stay protected (TTL or a real
-                # chat call will retire it). Drop the request->agent
-                # mapping though -- the prefetch's prefill is done, so
-                # no more ``tag_block`` calls are expected for this id.
-                self._request_to_agent.pop(request_id, None)
-                return
             self._active.pop(request_id, None)
             self._request_to_agent.pop(request_id, None)
         logger.debug("agent_eviction: unregister request=%s", request_id)
@@ -333,27 +228,6 @@ class AgentEvictionPolicy:
 
     # -- queries ---------------------------------------------------------
 
-    def _sweep_stale_locked(self, now_ns: int | None = None) -> None:
-        """Drop expired vote entries from ``_active``. Caller holds the
-        lock. ``now_ns`` defaults to the current monotonic ns; we
-        accept it as an arg so all read paths in a single query share a
-        single timestamp."""
-        if now_ns is None:
-            now_ns = time.monotonic_ns()
-        stale = [
-            req_id
-            for req_id, info in self._active.items()
-            if info.is_expired(now_ns)
-        ]
-        for req_id in stale:
-            self._active.pop(req_id, None)
-            self._request_to_agent.pop(req_id, None)
-        if stale:
-            logger.debug(
-                "agent_eviction: swept %d stale vote(s): %s",
-                len(stale), stale,
-            )
-
     def aggregated_probability(self, agent_id: str) -> float:
         """Return the max probability assigned to ``agent_id`` across
         every live request.
@@ -368,12 +242,8 @@ class AgentEvictionPolicy:
         ``agent_id``: an agent that's currently running cannot
         sensibly be classified as "low probability." Explicit votes
         still win if higher (capped at 1.0 anyway).
-
-        Stale votes (older than each request's ``ttl_seconds``) are
-        skipped and opportunistically dropped from ``_active``.
         """
         with self._lock:
-            self._sweep_stale_locked()
             if not self._active:
                 return 0.0
             best = 0.0
@@ -391,11 +261,8 @@ class AgentEvictionPolicy:
         threshold, we take the **min** -- the most lenient one. This
         means a block is liable for early eviction only when *every*
         live request is willing to evict at that probability.
-
-        Stale votes are skipped (and swept) before the min is taken.
         """
         with self._lock:
-            self._sweep_stale_locked()
             if not self._active:
                 return DEFAULT_EVICTION_THRESHOLD
             return min(info.threshold for info in self._active.values())
@@ -403,8 +270,7 @@ class AgentEvictionPolicy:
     def _low_probability_agents_locked(self) -> set[str]:
         """Return the set of agent ids whose aggregated probability is
         strictly below the effective threshold. Caller must hold
-        ``self._lock``. Sweeps stale votes first."""
-        self._sweep_stale_locked()
+        ``self._lock``."""
         if not self._active:
             return set()
         threshold = min(info.threshold for info in self._active.values())

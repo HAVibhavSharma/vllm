@@ -173,7 +173,6 @@ async def _fan_out_prefetches(
             agent_id=agent_id,
             token_ids=desc.token_ids,
             prefix_hash=desc.prefix_hash,
-            cache_salt=desc.cache_salt,
             agent_probabilities=agent_probabilities,
             eviction_window=eviction_window,
             eviction_threshold=eviction_threshold,
@@ -218,10 +217,6 @@ def _record_in_registry(
 
 
 def _resolve_chat_cache_salt(req: AgentChatCompletionRequest) -> str:
-    return req.agent_cache_salt or f"agent::{req.agent_id}"
-
-
-def _resolve_prefetch_cache_salt(req: AgentPrefetchRequest) -> str:
     return req.agent_cache_salt or f"agent::{req.agent_id}"
 
 

@@ -54,7 +54,6 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.agent_prefetch.eviction import (
     DEFAULT_EVICTION_THRESHOLD,
     DEFAULT_EVICTION_WINDOW,
-    DEFAULT_PROBABILITY_TTL_SECONDS,
     get_eviction_policy,
 )
 from vllm.v1.engine import (
@@ -1985,17 +1984,6 @@ class Scheduler(SchedulerInterface):
             file=sys.stderr,
             flush=True,
         )
-        ttl_seconds = request.probability_ttl_seconds
-        if ttl_seconds is None or ttl_seconds == 0:
-            ttl_seconds = DEFAULT_PROBABILITY_TTL_SECONDS
-        # Phantom prefetch requests carry ``prefetch_only=True`` in
-        # ``kv_transfer_params``. Flag them so the eviction policy
-        # keeps the vote alive past the prefetch's lifetime -- the
-        # implicit self-vote (1.0 for agent_id) is what holds the
-        # just-loaded blocks safe from eviction until the real chat
-        # call for the same agent arrives.
-        kv_params = request.kv_transfer_params or {}
-        is_prefetch = bool(kv_params.get("prefetch_only"))
         get_eviction_policy().register_request(
             request_id=request.request_id,
             agent_id=agent_id,
@@ -2004,8 +1992,6 @@ class Scheduler(SchedulerInterface):
             threshold=request.eviction_threshold
             if request.eviction_threshold is not None
             else DEFAULT_EVICTION_THRESHOLD,
-            ttl_seconds=ttl_seconds,
-            is_prefetch=is_prefetch,
         )
 
     def finish_requests(

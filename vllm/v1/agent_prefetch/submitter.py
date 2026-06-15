@@ -5,7 +5,10 @@
 Fires fire-and-forget prefetch requests into the engine. Each phantom
 request:
 
-* Carries ``kv_transfer_params={"prefetch_only": True, "cache_salt": ...}``.
+* Carries ``kv_transfer_params={"prefetch_only": True, ...}``. The
+  phantom does **not** carry a ``cache_salt`` -- the prefetch and the
+  matching chat call must hash to the same prefix-cache key so the
+  chat's lookup can actually hit the blocks the phantom loaded.
 * Uses ``max_tokens=1`` and ``temperature=0`` -- the smallest legal
   generation request. The scheduler's prefetch_only hook in
   ``_update_from_kv_xfer_finished`` finalizes the request and emits a
@@ -72,7 +75,6 @@ class PhantomPrefetchSubmitter:
         agent_id: str,
         token_ids: Sequence[int],
         prefix_hash: bytes,
-        cache_salt: str,
         agent_probabilities: Mapping[str, float] | None = None,
         eviction_window: int | None = None,
         eviction_threshold: float | None = None,
@@ -123,7 +125,6 @@ class PhantomPrefetchSubmitter:
         )
         kv_params: dict[str, Any] = {
             "prefetch_only": True,
-            "cache_salt": cache_salt,
             "agent_id": agent_id,
             "agent_probabilities": votes,
         }
