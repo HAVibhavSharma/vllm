@@ -53,6 +53,22 @@ seconds the vote is treated as stale -- it stops contributing to
 ``aggregated_probability`` and is opportunistically removed from
 ``_active`` on the next query. Pass ``None`` to opt out of expiry."""
 
+DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS = 3.0
+"""Maximum TTL applied to *prefetch* votes specifically.
+
+A prefetch vote only needs to survive the gap between
+"prefetch finishes loading blocks" and "real chat call for the same
+agent arrives" -- typically sub-second in tight workloads. Using the
+60s default would let dozens of stale prefetch votes pile up in
+``_active``: each one contributes cross-agent probabilities (e.g.
+agent_b's prefetch votes 1.0 for agent_c) that the ``max`` aggregator
+would then propagate, pushing most agents above the eviction threshold
+and effectively disabling the early-eviction policy.
+
+Set well above typical inter-turn latency but well below the regular
+vote TTL. ``register_request`` caps the effective prefetch TTL at this
+value (a caller passing a shorter ``ttl_seconds`` is still honoured)."""
+
 
 @dataclass(frozen=True)
 class ActiveRequestInfo:
@@ -74,6 +90,13 @@ class ActiveRequestInfo:
     # the historical behavior before TTL was added. Positive values
     # are checked against ``time.monotonic_ns() - registered_at_ns``.
     ttl_ns: int | None = None
+    # True when the registering request is a phantom prefetch. Prefetch
+    # votes are kept in ``_active`` past their request's lifetime so the
+    # implicit self-vote (1.0 for the prefetch's own agent_id) keeps
+    # protecting the just-loaded blocks until the real chat call for
+    # that agent arrives. Cleared either by that real call (which sweeps
+    # any stale prefetch votes for its agent) or by the TTL.
+    is_prefetch: bool = False
 
     def is_expired(self, now_ns: int) -> bool:
         if self.ttl_ns is None:
@@ -119,6 +142,7 @@ class AgentEvictionPolicy:
         window: int = DEFAULT_EVICTION_WINDOW,
         threshold: float = DEFAULT_EVICTION_THRESHOLD,
         ttl_seconds: float | None = DEFAULT_PROBABILITY_TTL_SECONDS,
+        is_prefetch: bool = False,
     ) -> None:
         """Register a live agent request with the policy.
 
@@ -138,6 +162,15 @@ class AgentEvictionPolicy:
         if not agent_id:
             return
         probs = dict(agent_probabilities) if agent_probabilities else {}
+        # Prefetch votes are capped to a much shorter TTL so stale
+        # prefetches don't pile up in ``_active`` and disable the
+        # eviction policy. See ``DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS``.
+        if is_prefetch:
+            if ttl_seconds is None or ttl_seconds <= 0:
+                ttl_seconds = DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS
+            else:
+                ttl_seconds = min(
+                    ttl_seconds, DEFAULT_PREFETCH_PROTECTION_TTL_SECONDS)
         ttl_ns: int | None
         if ttl_seconds is None or ttl_seconds <= 0:
             ttl_ns = None
@@ -151,8 +184,22 @@ class AgentEvictionPolicy:
             threshold=float(threshold) if threshold is not None else DEFAULT_EVICTION_THRESHOLD,
             registered_at_ns=time.monotonic_ns(),
             ttl_ns=ttl_ns,
+            is_prefetch=is_prefetch,
         )
         with self._lock:
+            # A real chat call arriving for an agent supersedes any
+            # outstanding prefetch protection for the same agent: the
+            # real call's own vote takes over, so sweep the prefetch
+            # votes now to keep ``_active`` small and to avoid double
+            # counting in aggregation.
+            if not is_prefetch:
+                stale_prefetches = [
+                    rid for rid, i in self._active.items()
+                    if i.agent_id == agent_id and i.is_prefetch
+                ]
+                for rid in stale_prefetches:
+                    self._active.pop(rid, None)
+                    self._request_to_agent.pop(rid, None)
             self._active[request_id] = info
             self._request_to_agent[request_id] = agent_id
             self._agent_blocks.setdefault(agent_id, OrderedDict())
@@ -165,8 +212,23 @@ class AgentEvictionPolicy:
     def unregister_request(self, request_id: str) -> None:
         """Drop the live-request entry. Block ownership is left intact
         so any cached blocks the request produced can still be targeted
-        for low-probability eviction after the request finishes."""
+        for low-probability eviction after the request finishes.
+
+        Special case: prefetch votes are kept in ``_active`` past the
+        prefetch request's lifetime. The implicit self-vote (1.0 for
+        the prefetch's own ``agent_id``) is what keeps the just-loaded
+        blocks safe from eviction until the real chat call for that
+        agent arrives. The vote is eventually cleared by either:
+          * the real chat call's ``register_request`` (which sweeps any
+            outstanding prefetch votes for the same agent), or
+          * the TTL on ``ActiveRequestInfo`` (``ttl_ns``), which makes
+            ``_sweep_stale_locked`` drop the entry on the next query.
+        """
         with self._lock:
+            info = self._active.get(request_id)
+            if info is not None and info.is_prefetch:
+                # Keep the vote alive past the prefetch's lifetime.
+                return
             self._active.pop(request_id, None)
             self._request_to_agent.pop(request_id, None)
         logger.debug("agent_eviction: unregister request=%s", request_id)
