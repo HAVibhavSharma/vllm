@@ -137,45 +137,63 @@ def prefetch_agent(
 # ---------------------------------------------------------------------------
 
 
+# Minimum probability assigned to any agent in the rotation. Picked to
+# sit above the policy's default eviction threshold (0.5) with a safety
+# margin, so every rotation member is protected from preemptive eviction
+# even when the fresh-ratio trigger fires on a half-full cache. Override
+# this if you also override --eviction-threshold above 0.6.
+ROTATION_FLOOR_PROB = 0.6
+
+
 def build_probabilities(
     current_agent: str,
     previous_agent: str | None,
     rotation: list[str],
 ) -> dict[str, float]:
-    """Distance-aware forecast for round-robin firing order.
+    """Distance-ranked forecast for round-robin firing order.
 
-    For a strict round-robin of N agents, each agent's distance from the
-    current one is well-defined: dist=1 is the next to fire, dist=N-1
-    is the one that just fired. We give every agent a probability that
-    linearly decreases with cycle distance:
+    In a strict round-robin of N agents, *every* agent is guaranteed to
+    fire again within N-1 calls. None of them is genuinely "low
+    probability." So the forecast's job here is not to mark anyone as
+    evictable -- it's to rank the rotation members for the case where
+    the policy is forced to evict (cache truly full). The just-fired
+    agent is the safest to drop because it has the longest until
+    re-firing; the next-to-fire is most precious.
 
-        prob(dist) = (N - dist) / (N - 1)
+    We map cycle distance ``dist in [1, N-1]`` linearly to probability
+    ``[1.0, ROTATION_FLOOR_PROB]``:
 
-    So:
-        dist=1 (next)   -> 1.0   (must protect — fires imminently)
-        dist=N-1 (prev) -> 0.0   (won't fire again until full cycle)
-        dist in between -> linear ramp
+        prob(dist=1)   = 1.0                 # next to fire
+        prob(dist=N-1) = ROTATION_FLOOR_PROB # just fired
 
-    The naive "previous=0, next=1, rest=0.5" forecast we used before
-    caused thrashing: when each agent fired it evicted the *just-fired*
-    one — even with cache room to spare — and by the time the cycle
-    came back around N-1 turns later, that agent's blocks were gone.
-    The distance-aware ramp instead reflects the true cycle structure:
-    only the agents *farthest* from re-firing become evictable, so the
-    cache holds the upcoming ones.
+    Why a floor above the eviction threshold matters: the previous
+    version of this function used ``(N - dist) / (N - 1)``, which gave
+    the just-fired agent ``1/(N-1)`` -- well below the default 0.5
+    threshold. When the fresh-ratio trigger fires on a half-full cache,
+    the policy then evicts the just-fired agent's blocks, even though
+    that agent will fire again in N-1 calls. With LMCache backing the
+    eviction, you see the request fall through to external storage at
+    ~3x the GPU-hit latency -- exactly the misses observed in scenario
+    A. Anchoring the floor at 0.6 keeps every rotation member above the
+    default threshold so the policy leaves them alone unless eviction
+    is genuinely forced.
 
-    With the default threshold of 0.5, agents whose probability is
-    strictly below 0.5 become evictable — that means the most-recently
-    fired half of the cycle becomes the eviction pool.
+    The ranking is still useful: when the cache truly cannot hold all N
+    agents and the policy must choose, the distance gradient tells it
+    to evict the just-fired one first (correct for round-robin --
+    LRU alone gets this backwards because it would evict the
+    next-to-fire agent, whose blocks haven't been touched in N-1
+    calls).
 
-    The current agent doesn't need to be in the dict — the policy
+    The current agent doesn't need to be in the dict -- the policy
     implicitly self-votes 1.0 for its own ``agent_id``.
     """
-    del previous_agent  # no longer needed; distance encodes it
+    del previous_agent  # distance encodes it
     n = len(rotation)
     if n < 2:
         return {}
     idx = rotation.index(current_agent)
+    span = 1.0 - ROTATION_FLOOR_PROB
     probs: dict[str, float] = {}
     for i, agent in enumerate(rotation):
         if agent == current_agent:
@@ -183,7 +201,13 @@ def build_probabilities(
         # Cycle distance in firing order: dist=1 is next, dist=N-1 is
         # the one that just fired. Always in [1, N-1].
         dist = (i - idx) % n
-        probs[agent] = (n - dist) / (n - 1)
+        if n == 2:
+            # Only one other agent; it's both next and previous. No
+            # ranking to do -- pin it at 1.0.
+            probs[agent] = 1.0
+        else:
+            # Linear ramp from 1.0 (dist=1) to FLOOR (dist=N-1).
+            probs[agent] = 1.0 - span * (dist - 1) / (n - 2)
     return probs
 
 
