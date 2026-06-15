@@ -442,7 +442,7 @@ def print_summary(summary: RunSummary) -> None:
     print("Per-agent breakdown:")
     print(
         f"  {'agent':<10} {'n':>4} {'hit_rate':>9} "
-        f"{'mean_ttft':>10} {'p95_ttft':>10}"
+        f"{'mean_ttft':>10} {'median_ttft':>12} {'p95_ttft':>10}"
     )
     by_agent: dict[str, list[CallResult]] = {}
     for r in scored:
@@ -456,6 +456,7 @@ def print_summary(summary: RunSummary) -> None:
         print(
             f"  {agent_id:<10} {len(rows):>4d} {rate:>8.1f}% "
             f"{statistics.mean(agent_ttfts):>9.1f}ms "
+            f"{statistics.median(agent_ttfts):>11.1f}ms "
             f"{_percentile(agent_ttfts, 0.95):>9.1f}ms"
         )
 
