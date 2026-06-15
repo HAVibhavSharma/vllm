@@ -290,6 +290,8 @@ class CompletionRequest(OpenAIBaseModel):
                 )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        if self.model_extra:
+            extra_args.update(self.model_extra)
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

@@ -29,6 +29,10 @@ def test_finished_request_stats_include_request_logger_fields():
         finish_reason=FinishReason.STOP,
         request_id="chatcmpl-test",
         job_id="job-1",
+        agent_id="planner",
+        langgraph_node="node-1",
+        input_text="hello prompt",
+        output_text="hello output",
         num_prompt_tokens=20,
         max_tokens_param=128,
         req_stats=req_stats,
@@ -38,6 +42,10 @@ def test_finished_request_stats_include_request_logger_fields():
     finished_request = iteration_stats.finished_requests[0]
     assert finished_request.request_id == "chatcmpl-test"
     assert finished_request.job_id == "job-1"
+    assert finished_request.agent_id == "planner"
+    assert finished_request.langgraph_node == "node-1"
+    assert finished_request.input_text == "hello prompt"
+    assert finished_request.output_text == "hello output"
     assert finished_request.num_cached_tokens == 5
     assert finished_request.prefix_cache_hit_rate == 0.25
     assert finished_request.queued_time == 0.1
@@ -56,6 +64,10 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             finish_reason=FinishReason.STOP,
             request_id="chatcmpl-123",
             job_id="1",
+            agent_id="executor",
+            langgraph_node="node-2",
+            input_text="user prompt",
+            output_text="model output",
             e2e_latency=3.28,
             num_prompt_tokens=489,
             num_generation_tokens=95,
@@ -83,6 +95,10 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
         {
             "request_id": "chatcmpl-123",
             "job_id": "1",
+            "agent_id": "executor",
+            "langgraph_node": "node-2",
+            "input_text": "user prompt",
+            "output_text": "model output",
             "finish_reason": "stop",
             "e2e_latency": "3.28",
             "num_prompt_tokens": "489",
@@ -103,6 +119,10 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
         {
             "request_id": "chatcmpl-123",
             "job_id": "1",
+            "agent_id": "executor",
+            "langgraph_node": "node-2",
+            "input_text": "user prompt",
+            "output_text": "model output",
             "finish_reason": "stop",
             "e2e_latency": 3.28,
             "num_prompt_tokens": 489,
@@ -116,3 +136,43 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             "max_tokens_param": 10000,
         }
     ]
+
+
+def test_file_stat_logger_escapes_multiline_text(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("VLLM_REQUEST_STATS_DIR", str(tmp_path))
+
+    logger = FileStatLogger(object(), engine_index=4)
+    iteration_stats = IterationStats()
+    iteration_stats.finished_requests.append(
+        FinishedRequestStats(
+            finish_reason=FinishReason.STOP,
+            request_id="chatcmpl-escape",
+            job_id="2",
+            agent_id="agent",
+            langgraph_node="node",
+            input_text='user said "hello"\nnext line, with comma',
+            output_text='model replied "ok"\nfinal line',
+            e2e_latency=1.0,
+            num_prompt_tokens=10,
+            num_generation_tokens=2,
+            num_cached_tokens=1,
+            prefix_cache_hit_rate=0.1,
+            queued_time=0.1,
+            prefill_time=0.2,
+            inference_time=0.5,
+            decode_time=0.3,
+            max_tokens_param=20,
+        )
+    )
+
+    logger.record(None, iteration_stats)
+    logger._close()
+
+    csv_files = sorted(tmp_path.glob("finished_requests_engine4_*.csv"))
+    assert len(csv_files) == 1
+
+    with csv_files[0].open(newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert rows[0]["input_text"] == 'user said "hello"\nnext line, with comma'
+    assert rows[0]["output_text"] == 'model replied "ok"\nfinal line'

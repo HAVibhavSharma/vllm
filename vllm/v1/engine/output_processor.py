@@ -149,6 +149,8 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         job_id: str | None = None,
+        agent_id: str | None = None,
+        langgraph_node: str | None = None,
         stream_input: bool = False,
     ):
         self.request_id = request_id
@@ -171,6 +173,8 @@ class RequestState:
         self.n = n
         self.temperature = temperature
         self.job_id = job_id
+        self.agent_id = agent_id
+        self.langgraph_node = langgraph_node
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -235,10 +239,20 @@ class RequestState:
             n = sampling_params.n
             temperature = sampling_params.temperature
             job_id = None
+            agent_id = None
+            langgraph_node = None
             if sampling_params.extra_args is not None:
                 extra_job_id = sampling_params.extra_args.get("job_id")
                 if extra_job_id is not None:
                     job_id = str(extra_job_id)
+                extra_agent_id = sampling_params.extra_args.get("agent_id")
+                if extra_agent_id is not None:
+                    agent_id = str(extra_agent_id)
+                extra_langgraph_node = sampling_params.extra_args.get(
+                    "langgraph_node"
+                )
+                if extra_langgraph_node is not None:
+                    langgraph_node = str(extra_langgraph_node)
         else:
             logprobs_processor = None
             detokenizer = None
@@ -247,6 +261,8 @@ class RequestState:
             n = None
             temperature = None
             job_id = None
+            agent_id = None
+            langgraph_node = None
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -268,6 +284,8 @@ class RequestState:
             n=n,
             temperature=temperature,
             job_id=job_id,
+            agent_id=agent_id,
+            langgraph_node=langgraph_node,
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
@@ -810,6 +828,14 @@ class OutputProcessor:
             finish_reason=finish_reason,
             request_id=req_state.external_req_id,
             job_id=req_state.job_id,
+            agent_id=req_state.agent_id,
+            langgraph_node=req_state.langgraph_node,
+            input_text=req_state.prompt,
+            output_text=(
+                req_state.detokenizer.output_text
+                if req_state.detokenizer is not None
+                else None
+            ),
             num_prompt_tokens=req_state.prompt_len,
             max_tokens_param=req_state.max_tokens_param,
             req_stats=req_state.stats,

@@ -1249,6 +1249,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 _CSV_COLUMNS = [
     "request_id",
     "job_id",
+    "agent_id",
+    "langgraph_node",
+    "input_text",
+    "output_text",
     "finish_reason",
     "e2e_latency",
     "num_prompt_tokens",
@@ -1286,6 +1290,11 @@ class FileStatLogger(StatLoggerBase):
         self._csv_writer = csv.DictWriter(
             self._csv_file,
             fieldnames=_CSV_COLUMNS,
+            quoting=csv.QUOTE_MINIMAL,
+            quotechar='"',
+            escapechar="\\",
+            doublequote=True,
+            lineterminator="\n",
         )
         self._csv_writer.writeheader()
 
@@ -1318,6 +1327,10 @@ class FileStatLogger(StatLoggerBase):
             row = {
                 "request_id": req.request_id,
                 "job_id": req.job_id,
+                "agent_id": req.agent_id,
+                "langgraph_node": req.langgraph_node,
+                "input_text": req.input_text,
+                "output_text": req.output_text,
                 "finish_reason": str(req.finish_reason)
                 if req.finish_reason is not None
                 else None,

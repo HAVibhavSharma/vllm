@@ -227,6 +227,10 @@ class FinishedRequestStats:
     finish_reason: "FinishReason"
     request_id: str | None = None
     job_id: str | None = None
+    agent_id: str | None = None
+    langgraph_node: str | None = None
+    input_text: str | None = None
+    output_text: str | None = None
     e2e_latency: float = 0.0
     num_prompt_tokens: int = 0
     num_generation_tokens: int = 0
@@ -432,6 +436,10 @@ class IterationStats:
         finish_reason: "FinishReason",
         request_id: str,
         job_id: str | None,
+        agent_id: str | None,
+        langgraph_node: str | None,
+        input_text: str | None,
+        output_text: str | None,
         num_prompt_tokens: int,
         max_tokens_param: int | None,
         req_stats: RequestStateStats,
@@ -468,6 +476,10 @@ class IterationStats:
             finish_reason=finish_reason,
             request_id=request_id,
             job_id=job_id,
+            agent_id=agent_id,
+            langgraph_node=langgraph_node,
+            input_text=input_text,
+            output_text=output_text,
             e2e_latency=e2e_latency,
             num_prompt_tokens=num_prompt_tokens,
             num_generation_tokens=req_stats.num_generation_tokens,
