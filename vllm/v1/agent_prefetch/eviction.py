@@ -189,9 +189,18 @@ class AgentEvictionPolicy:
         with self._lock:
             # A real chat call arriving for an agent supersedes any
             # outstanding prefetch protection for the same agent: the
-            # real call's own vote takes over, so sweep the prefetch
+            # real call's own vote takes over, so retire the prefetch
             # votes now to keep ``_active`` small and to avoid double
             # counting in aggregation.
+            #
+            # CRITICAL: do NOT touch ``_request_to_agent`` for the swept
+            # prefetches. The prefetch's prefill may still be in flight,
+            # in which case ``tag_block`` calls keyed off the prefetch's
+            # request_id are about to arrive. Killing the mapping here
+            # made those tags fall through as "NO AGENT MAPPED", leaving
+            # the prefetched blocks anonymous (and therefore evictable
+            # under pure LRU). The mapping is dropped naturally when
+            # the prefetch eventually calls ``unregister_request``.
             if not is_prefetch:
                 stale_prefetches = [
                     rid for rid, i in self._active.items()
@@ -199,7 +208,6 @@ class AgentEvictionPolicy:
                 ]
                 for rid in stale_prefetches:
                     self._active.pop(rid, None)
-                    self._request_to_agent.pop(rid, None)
             self._active[request_id] = info
             self._request_to_agent[request_id] = agent_id
             self._agent_blocks.setdefault(agent_id, OrderedDict())
@@ -227,7 +235,12 @@ class AgentEvictionPolicy:
         with self._lock:
             info = self._active.get(request_id)
             if info is not None and info.is_prefetch:
-                # Keep the vote alive past the prefetch's lifetime.
+                # Keep the vote alive past the prefetch's lifetime so
+                # the just-loaded blocks stay protected (TTL or a real
+                # chat call will retire it). Drop the request->agent
+                # mapping though -- the prefetch's prefill is done, so
+                # no more ``tag_block`` calls are expected for this id.
+                self._request_to_agent.pop(request_id, None)
                 return
             self._active.pop(request_id, None)
             self._request_to_agent.pop(request_id, None)
