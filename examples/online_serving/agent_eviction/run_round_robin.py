@@ -376,13 +376,20 @@ def run(
             is_scored = round_idx > warm_up_rounds
             tag = "scored" if is_scored else "warmup"
             src = result.cache_source()
+            # Tokens the server had to fill in (either by compute
+            # prefill or LMCache reconstruct) -- the "missing fragment"
+            # of this call's prefix. Zero for a full GPU/LMC hit on
+            # an unchanged system prompt; non-zero whenever the
+            # prefix-match shortcut couldn't cover the whole prompt.
+            miss_tokens = max(0, prompt_tokens - cached_tokens)
             if err is None:
                 print(
                     f"[{tag:>6}] call={call_idx:03d} round={round_idx} "
                     f"slot={slot_idx} agent={agent_id} "
                     f"ttft={ttft_ms:7.1f}ms total={total_ms:7.1f}ms "
                     f"out={out_tokens:3d} src={src} "
-                    f"cache={cached_tokens}/{prompt_tokens} | {preview}"
+                    f"cache={cached_tokens}/{prompt_tokens} "
+                    f"miss={miss_tokens:5d} | {preview}"
                 )
             else:
                 print(
@@ -433,13 +440,18 @@ def print_summary(summary: RunSummary) -> None:
     src_summary = " ".join(
         f"{k}={v}" for k, v in sorted(src_counts.items())
     )
+    total_prompt = sum(r.prompt_tokens for r in scored)
+    total_cached = sum(r.cached_tokens for r in scored)
+    total_miss = max(0, total_prompt - total_cached)
+    mean_miss = total_miss / len(scored) if scored else 0.0
     print(
         f"Overall: calls={len(scored)} "
         f"gpu_hit_rate={overall_rate:5.1f}% "
         f"({len(gpu_hits)}/{len(scored)}) "
         f"mean_ttft={statistics.mean(ttfts):.1f}ms "
         f"median_ttft={statistics.median(ttfts):.1f}ms "
-        f"p95_ttft={_percentile(ttfts, 0.95):.1f}ms"
+        f"p95_ttft={_percentile(ttfts, 0.95):.1f}ms "
+        f"mean_miss={mean_miss:.1f} tok/call"
     )
     print(f"Cache sources: {src_summary}")
     print(
@@ -457,7 +469,7 @@ def print_summary(summary: RunSummary) -> None:
     print(
         f"  {'agent':<10} {'n':>4} {'gpu_hit_rate':>13} "
         f"{'mean_ttft':>10} {'median_ttft':>12} {'p95_ttft':>10} "
-        f"{'sources':<24}"
+        f"{'mean_miss':>10} {'sources':<24}"
     )
     by_agent: dict[str, list[CallResult]] = {}
     for r in scored:
@@ -469,6 +481,9 @@ def print_summary(summary: RunSummary) -> None:
         )
         rate = 100.0 * agent_gpu / len(rows)
         agent_ttfts = [r.ttft_ms for r in rows]
+        agent_misses = [
+            max(0, r.prompt_tokens - r.cached_tokens) for r in rows
+        ]
         agent_srcs: dict[str, int] = {}
         for r in rows:
             key = r.cache_source().strip()
@@ -481,6 +496,7 @@ def print_summary(summary: RunSummary) -> None:
             f"{statistics.mean(agent_ttfts):>9.1f}ms "
             f"{statistics.median(agent_ttfts):>11.1f}ms "
             f"{_percentile(agent_ttfts, 0.95):>9.1f}ms "
+            f"{statistics.mean(agent_misses):>9.1f}t "
             f"{srcs_str:<24}"
         )
 

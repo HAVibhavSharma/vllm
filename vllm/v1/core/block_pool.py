@@ -421,16 +421,38 @@ class BlockPool:
         # the policy entirely (fall through to pure LRU). Otherwise we
         # only consult it when we'd actually have to evict cached
         # blocks to satisfy this request. ``get_num_free_blocks()``
-        # lumps fresh (never-used) and cached-but-free blocks together,
-        # so we estimate the fresh portion by subtracting the number
-        # of currently-tagged blocks: ``fresh ≈ total_free - tagged``.
+        # lumps fresh (never-used) and cached-but-free blocks together.
+        #
+        # The naive estimate ``fresh ≈ total_free - tagged`` undercounts
+        # whenever a request's prefix has just been matched: those
+        # blocks are still tagged (the policy still owns them) but are
+        # no longer in the free queue (their ``ref_cnt`` went from 0
+        # to 1). So ``total_free`` drops while ``tagged`` stays put,
+        # and the estimate clamps to zero — firing the trigger even
+        # when there are plenty of fresh blocks at the queue head and
+        # we're only allocating a 3-block suffix. The spurious trigger
+        # then evicts the start of the lowest-prob agent's prompt,
+        # which destroys its prefix match on the next call.
+        #
+        # The fix: subtract the number of currently-referenced blocks
+        # (ref_cnt > 0, i.e. ``num_gpu_blocks - total_free - null``)
+        # from ``tagged`` before computing the queue-side cached
+        # portion. What's left is the cached-but-free tagged blocks,
+        # which IS what we want to compare to ``total_free``.
         # The trigger fires when ``fresh < num_blocks * ratio`` -- a
         # ratio above 1.0 makes the policy proactive (protect popular
         # agents earlier), below 1.0 makes it more conservative.
         if self.enable_caching and _AGENT_EVICTION_FRESH_RATIO > 0:
             total_free = self.get_num_free_blocks()
             tagged = get_eviction_policy().stats()["tagged_blocks"]
-            fresh_free_estimate = max(0, total_free - tagged)
+            # The null block is always marked as used (see
+            # ``reset_prefix_cache``), so subtract 1 from the
+            # in-use count.
+            referenced_blocks = max(
+                0, self.num_gpu_blocks - total_free - 1
+            )
+            cached_free_tagged = max(0, tagged - referenced_blocks)
+            fresh_free_estimate = max(0, total_free - cached_free_tagged)
             if fresh_free_estimate < num_blocks * _AGENT_EVICTION_FRESH_RATIO:
                 prioritized = self._claim_low_probability_blocks(num_blocks)
 
