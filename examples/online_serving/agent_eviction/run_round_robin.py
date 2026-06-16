@@ -39,18 +39,6 @@ from prompts import build_rotation, build_system_prompt, pick_user_query
 DEFAULT_HIT_TTFT_THRESHOLD_MS = 200.0
 
 
-def _post_json(url: str, payload: dict, timeout: float = 600.0) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 def _get_json(url: str, timeout: float = 30.0) -> dict:
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -79,57 +67,6 @@ def _post_stream(url: str, payload: dict, timeout: float = 600.0):
                 yield json.loads(data)
             except json.JSONDecodeError:
                 continue
-
-
-# ---------------------------------------------------------------------------
-# Prefetch helper.
-# ---------------------------------------------------------------------------
-
-
-def prefetch_agent(
-    base_url: str,
-    agent_id: str,
-    *,
-    wait: bool = False,
-    prefetch_top_k: int | None = None,
-    probabilities: dict[str, float] | None = None,
-    eviction_window: int | None = None,
-    eviction_threshold: float | None = None,
-) -> dict | None:
-    """POST /v1/agents/prefetch for ``agent_id``. Errors are swallowed.
-
-    When ``probabilities`` is supplied, the server forwards it into
-    every phantom's ``kv_transfer_params`` so the eviction policy
-    registers the phantom and tags its loaded blocks. Omitting
-    ``probabilities`` falls back to a server-side ``{agent_id: 1.0}``
-    self-vote -- enough for registration but no cross-agent signal.
-
-    Returns the response body on success, ``None`` on failure. Prefetch
-    is best-effort -- the benchmark must continue even if warming fails.
-    """
-    url = f"{base_url.rstrip('/')}/v1/agents/prefetch"
-    payload: dict = {"agent_id": agent_id, "wait": wait}
-    if prefetch_top_k is not None:
-        payload["prefetch_top_k"] = prefetch_top_k
-    if probabilities is not None:
-        payload["agent_probabilities"] = probabilities
-        if eviction_window is not None:
-            payload["eviction_window"] = eviction_window
-        if eviction_threshold is not None:
-            payload["eviction_threshold"] = eviction_threshold
-    try:
-        return _post_json(url, payload, timeout=60.0)
-    except urllib.error.HTTPError as e:
-        print(
-            f"  (prefetch agent={agent_id} failed: HTTP {e.code} {e.reason})",
-            file=sys.stderr,
-        )
-    except urllib.error.URLError as e:
-        print(
-            f"  (prefetch agent={agent_id} failed: {e.reason})",
-            file=sys.stderr,
-        )
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +204,9 @@ def call_once(
     streaming chunk (requested via ``stream_options.include_usage``);
     both are ``0`` if the server didn't include usage info.
     """
-    # Use the agent-scoped chat endpoint so the server records this
-    # prompt's chunk-aligned prefix in the per-agent registry. That
-    # registry is what /v1/agents/prefetch reads from to warm APC for
-    # the upcoming agent in the rotation.
+    # Use the agent-scoped chat endpoint so the request carries an
+    # agent_id and (in treatment mode) the agent_probabilities forecast
+    # that drives the server's eviction policy.
     url = f"{base_url.rstrip('/')}/v1/agents/chat/completions"
     payload: dict = {
         "model": model,
@@ -439,14 +375,13 @@ def run(
             summary.results.append(result)
             is_scored = round_idx > warm_up_rounds
             tag = "scored" if is_scored else "warmup"
-            hit = "HIT" if result.is_hit(hit_threshold_ms) else "miss"
             src = result.cache_source()
             if err is None:
                 print(
                     f"[{tag:>6}] call={call_idx:03d} round={round_idx} "
                     f"slot={slot_idx} agent={agent_id} "
                     f"ttft={ttft_ms:7.1f}ms total={total_ms:7.1f}ms "
-                    f"out={out_tokens:3d} {hit:4s} src={src} "
+                    f"out={out_tokens:3d} src={src} "
                     f"cache={cached_tokens}/{prompt_tokens} | {preview}"
                 )
             else:
@@ -454,28 +389,6 @@ def run(
                     f"[{tag:>6}] call={call_idx:03d} round={round_idx} "
                     f"slot={slot_idx} agent={agent_id} ERROR: {err}",
                     file=sys.stderr,
-                )
-            # Fire-and-forget prefetch for the next agent in the
-            # rotation, scored rounds only. Treatment mode only: in
-            # baseline we want pure LRU with no cache warming, so the
-            # comparison isolates the agent-aware eviction policy from
-            # the confound of prefetch warming. wait=false lets the
-            # phantom warm in the background while we set up the next
-            # HTTP call. We hand the phantom the same forecast the
-            # next agent's real chat will carry so the eviction policy
-            # sees a consistent view between phantom and real call.
-            if is_scored and mode == "treatment":
-                next_agent = rotation[(slot_idx + 1) % len(rotation)]
-                next_probs = build_probabilities(
-                    next_agent, agent_id, rotation
-                )
-                prefetch_agent(
-                    base_url,
-                    next_agent,
-                    wait=False,
-                    probabilities=next_probs,
-                    eviction_window=eviction_window,
-                    eviction_threshold=eviction_threshold,
                 )
             previous_agent = agent_id
     return summary
@@ -511,8 +424,8 @@ def print_summary(summary: RunSummary) -> None:
         return
 
     ttfts = [r.ttft_ms for r in scored]
-    hits = [r for r in scored if r.is_hit(summary.hit_threshold_ms)]
-    overall_rate = 100.0 * len(hits) / len(scored)
+    gpu_hits = [r for r in scored if r.cache_source().strip() == "GPU"]
+    overall_rate = 100.0 * len(gpu_hits) / len(scored)
     src_counts: dict[str, int] = {}
     for r in scored:
         key = r.cache_source().strip()
@@ -521,7 +434,9 @@ def print_summary(summary: RunSummary) -> None:
         f"{k}={v}" for k, v in sorted(src_counts.items())
     )
     print(
-        f"Overall: calls={len(scored)} hit_rate={overall_rate:5.1f}% "
+        f"Overall: calls={len(scored)} "
+        f"gpu_hit_rate={overall_rate:5.1f}% "
+        f"({len(gpu_hits)}/{len(scored)}) "
         f"mean_ttft={statistics.mean(ttfts):.1f}ms "
         f"median_ttft={statistics.median(ttfts):.1f}ms "
         f"p95_ttft={_percentile(ttfts, 0.95):.1f}ms"
@@ -533,10 +448,14 @@ def print_summary(summary: RunSummary) -> None:
         "PART = partial prefix hit, "
         "MISS = full compute prefill)"
     )
+    print(
+        "  hit_rate counts GPU-only -- LMC reconstructs are still "
+        "cache hits at the byte level but are not counted here."
+    )
     print()
     print("Per-agent breakdown:")
     print(
-        f"  {'agent':<10} {'n':>4} {'hit_rate':>9} "
+        f"  {'agent':<10} {'n':>4} {'gpu_hit_rate':>13} "
         f"{'mean_ttft':>10} {'median_ttft':>12} {'p95_ttft':>10} "
         f"{'sources':<24}"
     )
@@ -545,9 +464,10 @@ def print_summary(summary: RunSummary) -> None:
         by_agent.setdefault(r.agent_id, []).append(r)
     for agent_id in sorted(by_agent):
         rows = by_agent[agent_id]
-        rate = 100.0 * sum(
-            1 for r in rows if r.is_hit(summary.hit_threshold_ms)
-        ) / len(rows)
+        agent_gpu = sum(
+            1 for r in rows if r.cache_source().strip() == "GPU"
+        )
+        rate = 100.0 * agent_gpu / len(rows)
         agent_ttfts = [r.ttft_ms for r in rows]
         agent_srcs: dict[str, int] = {}
         for r in rows:
@@ -557,7 +477,7 @@ def print_summary(summary: RunSummary) -> None:
             f"{k}:{v}" for k, v in sorted(agent_srcs.items())
         )
         print(
-            f"  {agent_id:<10} {len(rows):>4d} {rate:>8.1f}% "
+            f"  {agent_id:<10} {len(rows):>4d} {rate:>12.1f}% "
             f"{statistics.mean(agent_ttfts):>9.1f}ms "
             f"{statistics.median(agent_ttfts):>11.1f}ms "
             f"{_percentile(agent_ttfts, 0.95):>9.1f}ms "
