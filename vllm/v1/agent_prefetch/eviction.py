@@ -89,6 +89,14 @@ class AgentEvictionPolicy:
         # Use OrderedDict-as-set so we can keep LRU-ish order of when a
         # block was tagged; popping from the head gives the oldest first.
         self._agent_blocks: dict[str, OrderedDict[int, None]] = {}
+        # Per-request tag bookkeeping for diagnostic logging. Keyed by
+        # request_id; cleared on unregister after the SUMMARY line is
+        # emitted. Tracks fresh tags, re-tags (block changed agent),
+        # LRU refreshes (same agent re-touches its block), and the
+        # number of unmapped tag attempts for requests we never saw a
+        # register_request() for.
+        self._tag_stats: dict[str, dict[str, int]] = {}
+        self._unmapped_tag_counts: dict[str, int] = {}
 
     # -- live-request registry -------------------------------------------
 
@@ -136,35 +144,71 @@ class AgentEvictionPolicy:
         """Drop the live-request entry. Block ownership is left intact
         so any cached blocks the request produced can still be targeted
         for low-probability eviction after the request finishes."""
+        import sys
         with self._lock:
+            agent_id = self._request_to_agent.get(request_id)
+            stats = self._tag_stats.pop(request_id, None)
             self._active.pop(request_id, None)
             self._request_to_agent.pop(request_id, None)
+            agent_total = (
+                len(self._agent_blocks.get(agent_id, ()))
+                if agent_id is not None else 0
+            )
+            global_tagged = len(self._block_owner)
+            unmapped = self._unmapped_tag_counts.pop(request_id, 0)
+        if stats is not None:
+            print(
+                f"DBG tag_block SUMMARY req={request_id} agent={agent_id} "
+                f"new={stats['new']} retag={stats['retag']} "
+                f"refresh={stats['refresh']} "
+                f"agent_owns_now={agent_total} "
+                f"global_tagged={global_tagged}",
+                file=sys.stderr, flush=True,
+            )
+        if unmapped:
+            print(
+                f"DBG tag_block SUMMARY req={request_id} agent=<UNMAPPED> "
+                f"unmapped_attempts={unmapped}",
+                file=sys.stderr, flush=True,
+            )
         logger.debug("agent_eviction: unregister request=%s", request_id)
 
     # -- block-ownership tagging -----------------------------------------
 
     def tag_block(self, block_id: int, request_id: str) -> None:
         """Mark ``block_id`` as owned by the agent that owns
-        ``request_id``. No-op if the request isn't agent-tagged."""
+        ``request_id``. No-op if the request isn't agent-tagged.
+
+        Logging: instead of sampling every Nth block (which masks
+        contention) we keep a per-request counter and emit:
+
+        * ``tag_block START`` -- first time we see this request tagging,
+        * ``tag_block RETAG`` -- a block changes owner (signals
+          cross-agent cache contention; always logged, never sampled),
+        * ``tag_block SUMMARY`` -- on ``unregister_request`` with the
+          final per-request totals and the agent's current bucket size.
+        """
+        import sys
         with self._lock:
             agent_id = self._request_to_agent.get(request_id)
             if agent_id is None:
-                # Sample heavily: an un-mapped request emits this for
-                # ~1.5K blocks; one line per ~100 blocks is plenty.
-                if block_id % 100 == 0:
-                    import sys
+                count = self._unmapped_tag_counts.get(request_id, 0) + 1
+                self._unmapped_tag_counts[request_id] = count
+                if count == 1:
                     print(
-                        f"DBG tag_block: block={block_id} req={request_id} "
-                        f"-> NO AGENT MAPPED (known reqs: {list(self._request_to_agent.keys())[:3]})",
+                        f"DBG tag_block UNMAPPED req={request_id} "
+                        f"first_block={block_id} "
+                        f"known_reqs={list(self._request_to_agent.keys())[:3]}",
                         file=sys.stderr, flush=True,
                     )
                 return
-            # Only print every ~100th tag to avoid spam (one prompt = ~1500 blocks)
-            if block_id % 100 == 0:
-                import sys
+            stats = self._tag_stats.get(request_id)
+            if stats is None:
+                stats = {"new": 0, "retag": 0, "refresh": 0}
+                self._tag_stats[request_id] = stats
                 print(
-                    f"DBG tag_block: block={block_id} req={request_id} agent={agent_id} "
-                    f"(total tagged so far: {len(self._block_owner)})",
+                    f"DBG tag_block START req={request_id} agent={agent_id} "
+                    f"first_block={block_id}",
                     file=sys.stderr, flush=True,
                 )
             prev_agent = self._block_owner.get(block_id)
@@ -173,12 +217,26 @@ class AgentEvictionPolicy:
                 bucket = self._agent_blocks.setdefault(agent_id, OrderedDict())
                 if block_id in bucket:
                     bucket.move_to_end(block_id)
+                stats["refresh"] += 1
                 return
             if prev_agent is not None:
-                # Remove from previous owner's bucket.
+                # Remove from previous owner's bucket and log the steal --
+                # this is the signal that cache pressure is real.
                 prev_bucket = self._agent_blocks.get(prev_agent)
+                prev_remaining = 0
                 if prev_bucket is not None:
                     prev_bucket.pop(block_id, None)
+                    prev_remaining = len(prev_bucket)
+                stats["retag"] += 1
+                print(
+                    f"DBG tag_block RETAG block={block_id} "
+                    f"req={request_id} agent={agent_id} "
+                    f"prev_agent={prev_agent} "
+                    f"prev_agent_owns_now={prev_remaining}",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                stats["new"] += 1
             self._block_owner[block_id] = agent_id
             self._agent_blocks.setdefault(agent_id, OrderedDict())[block_id] = None
 
@@ -204,27 +262,49 @@ class AgentEvictionPolicy:
 
     def untag_block(self, block_id: int) -> None:
         """Drop an agent->block association. Called when the prefix
-        cache evicts a block or when ``reset_prefix_cache`` runs."""
+        cache evicts a block or when ``reset_prefix_cache`` runs.
+
+        Logging: every untag is a real eviction event, so we log it.
+        To keep the line useful we include the agent's remaining bucket
+        size and the global tagged-block count after the drop.
+        """
+        import sys
         with self._lock:
             agent_id = self._block_owner.pop(block_id, None)
             if agent_id is None:
+                # Block wasn't tagged -- pure LRU eviction of an
+                # untagged block. Not interesting, stay quiet.
                 return
             bucket = self._agent_blocks.get(agent_id)
+            bucket_remaining = 0
             if bucket is not None:
                 bucket.pop(block_id, None)
-                if not bucket:
-                    # Keep the bucket even if empty -- the agent may
-                    # still be referenced by a live request. Small.
-
-                    pass
+                bucket_remaining = len(bucket)
+                # Keep the bucket even if empty -- the agent may still
+                # be referenced by a live request.
+            global_tagged = len(self._block_owner)
+        print(
+            f"DBG untag_block block={block_id} agent={agent_id} "
+            f"agent_owns_now={bucket_remaining} "
+            f"global_tagged={global_tagged}",
+            file=sys.stderr, flush=True,
+        )
 
     def clear_all_blocks(self) -> None:
         """Drop every block-ownership association. Used by
         ``reset_prefix_cache``."""
+        import sys
         with self._lock:
+            dropped = len(self._block_owner)
+            per_agent = {a: len(b) for a, b in self._agent_blocks.items() if b}
             self._block_owner.clear()
             for bucket in self._agent_blocks.values():
                 bucket.clear()
+        print(
+            f"DBG clear_all_blocks dropped={dropped} "
+            f"per_agent_before={per_agent}",
+            file=sys.stderr, flush=True,
+        )
 
     # -- queries ---------------------------------------------------------
 
@@ -267,32 +347,54 @@ class AgentEvictionPolicy:
                 return DEFAULT_EVICTION_THRESHOLD
             return min(info.threshold for info in self._active.values())
 
-    def _low_probability_agents_locked(self) -> set[str]:
-        """Return the set of agent ids whose aggregated probability is
-        strictly below the effective threshold. Caller must hold
-        ``self._lock``."""
+    def _agents_by_probability_locked(self) -> list[tuple[str, float]]:
+        """Return candidate agents sorted by ascending aggregated
+        probability. Caller must hold ``self._lock``.
+
+        Currently-active agents are excluded entirely: a request
+        implicitly self-votes 1.0 for its own ``agent_id``, and we
+        never evict the agent that's actively generating tokens. Every
+        other agent (block-owning or merely referenced by some live
+        request's forecast) is ranked by the highest probability any
+        live request assigns it, lowest first.
+        """
         if not self._active:
-            return set()
-        threshold = min(info.threshold for info in self._active.values())
-        # Union of every agent we have block ownership for and every
-        # agent any live request talks about.
+            return []
+        active_agents: set[str] = {
+            info.agent_id for info in self._active.values()
+        }
         candidates: set[str] = set(self._agent_blocks.keys())
         for info in self._active.values():
             candidates.update(info.agent_probabilities.keys())
-            candidates.add(info.agent_id)
-        low: set[str] = set()
+        candidates -= active_agents
+        ranked: list[tuple[str, float]] = []
         for agent_id in candidates:
             best = 0.0
             for info in self._active.values():
                 p = info.agent_probabilities.get(agent_id, 0.0)
-                if info.agent_id == agent_id and p < 1.0:
-                    # A request implicitly votes 1.0 for its own
-                    # agent_id -- the agent is actively running and
-                    # must never be classified as low-probability.
-                    p = 1.0
                 if p > best:
                     best = p
-            if best < threshold:
+            ranked.append((agent_id, best))
+        ranked.sort(key=lambda x: x[1])
+        return ranked
+
+    def _low_probability_agents_locked(self) -> set[str]:
+        """Stats-only view: agents whose aggregated probability is
+        strictly below the effective threshold. The eviction decision
+        no longer uses a threshold gate (see ``evictable_blocks``); this
+        is retained so existing stats endpoints keep returning a
+        meaningful summary."""
+        if not self._active:
+            return set()
+        threshold = min(info.threshold for info in self._active.values())
+        active_agents: set[str] = {
+            info.agent_id for info in self._active.values()
+        }
+        low: set[str] = set()
+        for agent_id, prob in self._agents_by_probability_locked():
+            if agent_id in active_agents:
+                continue
+            if prob < threshold:
                 low.add(agent_id)
         return low
 
@@ -302,8 +404,15 @@ class AgentEvictionPolicy:
             return self._low_probability_agents_locked()
 
     def evictable_blocks(self, num_needed: int) -> list[int]:
-        """Return up to ``num_needed`` block ids whose owning agent is
-        below the eviction threshold, in LRU-tag order (oldest first).
+        """Return up to ``num_needed`` block ids in lowest-probability
+        order: drain the agent with the smallest aggregated probability
+        first, walk up the ranking, and keep taking until the request is
+        satisfied or every non-active agent has been drained.
+
+        There is no threshold gate -- if the request needs blocks, the
+        policy hands over whatever it has, starting from the agents
+        least likely to fire next. Currently-active agents are never
+        touched (they self-vote 1.0).
 
         The pool then has to verify each block is actually a valid
         eviction target (``ref_cnt == 0`` and in the free queue) --
@@ -327,35 +436,43 @@ class AgentEvictionPolicy:
                         file=sys.stderr, flush=True,
                     )
                 return []
-            low = self._low_probability_agents_locked()
-            if not low:
+            ranked = self._agents_by_probability_locked()
+            if not ranked:
                 if do_print:
                     print(
                         f"DBG evictable_blocks(num_needed={num_needed}) "
-                        f"-> [] : no low-prob agents "
-                        f"(active={len(self._active)}, tagged_agents={list(self._agent_blocks.keys())})",
+                        f"-> [] : no candidate agents "
+                        f"(active={len(self._active)}, "
+                        f"tagged={list(self._agent_blocks.keys())})",
                         file=sys.stderr, flush=True,
                     )
                 return []
             picks: list[int] = []
-            for agent_id in low:
+            drained: list[tuple[str, float, int]] = []
+            for agent_id, prob in ranked:
                 bucket = self._agent_blocks.get(agent_id)
                 if not bucket:
                     continue
+                taken = 0
                 for block_id in bucket.keys():
                     picks.append(block_id)
+                    taken += 1
                     if len(picks) >= num_needed:
+                        drained.append((agent_id, prob, taken))
                         if do_print:
                             print(
                                 f"DBG evictable_blocks(num_needed={num_needed}) "
-                                f"-> {len(picks)} blocks from low-prob agents {low}",
+                                f"-> {len(picks)} blocks "
+                                f"(drained_lowest_first={drained})",
                                 file=sys.stderr, flush=True,
                             )
                         return picks
+                drained.append((agent_id, prob, taken))
             if do_print:
                 print(
                     f"DBG evictable_blocks(num_needed={num_needed}) "
-                    f"-> {len(picks)} blocks (low={low}, short of need)",
+                    f"-> {len(picks)} blocks "
+                    f"(drained_lowest_first={drained}, short of need)",
                     file=sys.stderr, flush=True,
                 )
             return picks
