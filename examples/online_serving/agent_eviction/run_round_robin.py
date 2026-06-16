@@ -201,12 +201,49 @@ class CallResult:
     total_ms: float
     output_tokens: int
     preview: str
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
     error: str | None = None
 
     def is_hit(self, hit_ttft_ms: float) -> bool:
         if self.error is not None:
             return False
         return self.ttft_ms < hit_ttft_ms
+
+    def cache_source(self, gpu_ttft_ms: float = 300.0) -> str:
+        """Best-guess source of the prefix-cache hit for this call.
+
+        The OpenAI usage payload only tells us the **sum** of
+        GPU-APC + external (LMCache) cached tokens -- the split isn't
+        surfaced per-request (it lives in vLLM's internal metrics,
+        not the chat response). So we infer:
+
+        * ``MISS``  -- nothing cached, prompt was fully recomputed.
+        * ``GPU``   -- cached_tokens > 0 and TTFT below ``gpu_ttft_ms``
+                       (cache slots resident on the device, no reload).
+        * ``LMC``   -- cached_tokens > 0 and TTFT above ``gpu_ttft_ms``
+                       (had to reconstruct blocks from the external
+                       KV store -- still way faster than a full
+                       prefill but visibly slower than a GPU hit).
+        * ``PART``  -- ``cached_tokens`` is non-zero but covers less
+                       than half of the prompt: a partial prefix hit
+                       that still required a sizeable compute prefill.
+
+        Naming kept short so the per-call line stays readable.
+        """
+        if self.error is not None:
+            return "ERR "
+        if self.prompt_tokens <= 0:
+            # No usage payload at all -- fall back to the TTFT signal
+            # so the column is never blank.
+            return "GPU " if self.ttft_ms < gpu_ttft_ms else "?   "
+        if self.cached_tokens == 0:
+            return "MISS"
+        if self.cached_tokens < self.prompt_tokens // 2:
+            return "PART"
+        if self.ttft_ms < gpu_ttft_ms:
+            return "GPU "
+        return "LMC "
 
 
 def call_once(
@@ -220,11 +257,15 @@ def call_once(
     probabilities: dict[str, float] | None,
     eviction_window: int | None,
     eviction_threshold: float | None,
-) -> tuple[float, float, int, str, str | None]:
+) -> tuple[float, float, int, str, int, int, str | None]:
     """Issue one chat call and time TTFT + total wall time.
 
-    Returns ``(ttft_ms, total_ms, output_tokens, preview, error)``.
-    ``error`` is ``None`` on success.
+    Returns ``(ttft_ms, total_ms, output_tokens, preview,
+    prompt_tokens, cached_tokens, error)``. ``error`` is ``None`` on
+    success. ``prompt_tokens`` / ``cached_tokens`` come from the
+    OpenAI ``usage.prompt_tokens_details`` block emitted in the final
+    streaming chunk (requested via ``stream_options.include_usage``);
+    both are ``0`` if the server didn't include usage info.
     """
     # Use the agent-scoped chat endpoint so the server records this
     # prompt's chunk-aligned prefix in the per-agent registry. That
@@ -240,6 +281,9 @@ def call_once(
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": True,
+        # Ask the server for a trailing usage chunk so we can tell
+        # whether the prefix was served from cache (and how much of it).
+        "stream_options": {"include_usage": True},
         "agent_id": agent_id,
     }
     if probabilities is not None:
@@ -253,8 +297,17 @@ def call_once(
     first_token_ns: int | None = None
     pieces: list[str] = []
     output_tokens = 0
+    prompt_tokens = 0
+    cached_tokens = 0
     try:
         for chunk in _post_stream(url, payload):
+            # Usage arrives in its own trailing chunk with empty
+            # ``choices`` -- pick it up before bailing on no-content.
+            usage = chunk.get("usage")
+            if usage:
+                prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                details = usage.get("prompt_tokens_details") or {}
+                cached_tokens = int(details.get("cached_tokens") or 0)
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -268,20 +321,36 @@ def call_once(
             output_tokens += 1
     except urllib.error.HTTPError as e:
         msg = f"HTTPError {e.code}: {e.reason}"
-        return float("nan"), float("nan"), 0, "", msg
+        return float("nan"), float("nan"), 0, "", 0, 0, msg
     except urllib.error.URLError as e:
-        return float("nan"), float("nan"), 0, "", f"URLError: {e.reason}"
+        return float("nan"), float("nan"), 0, "", 0, 0, f"URLError: {e.reason}"
     end_ns = time.perf_counter_ns()
 
     if first_token_ns is None:
-        return float("nan"), (end_ns - start_ns) / 1e6, 0, "", "no tokens"
+        return (
+            float("nan"),
+            (end_ns - start_ns) / 1e6,
+            0,
+            "",
+            prompt_tokens,
+            cached_tokens,
+            "no tokens",
+        )
 
     ttft_ms = (first_token_ns - start_ns) / 1e6
     total_ms = (end_ns - start_ns) / 1e6
     preview = "".join(pieces).strip().replace("\n", " ")
     if len(preview) > 80:
         preview = preview[:77] + "..."
-    return ttft_ms, total_ms, output_tokens, preview, None
+    return (
+        ttft_ms,
+        total_ms,
+        output_tokens,
+        preview,
+        prompt_tokens,
+        cached_tokens,
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +405,15 @@ def run(
                 probs = build_probabilities(agent_id, previous_agent, rotation)
             else:
                 probs = None
-            ttft_ms, total_ms, out_tokens, preview, err = call_once(
+            (
+                ttft_ms,
+                total_ms,
+                out_tokens,
+                preview,
+                prompt_tokens,
+                cached_tokens,
+                err,
+            ) = call_once(
                 base_url=base_url,
                 model=model,
                 agent_id=agent_id,
@@ -355,18 +432,22 @@ def run(
                 total_ms=total_ms,
                 output_tokens=out_tokens,
                 preview=preview,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
                 error=err,
             )
             summary.results.append(result)
             is_scored = round_idx > warm_up_rounds
             tag = "scored" if is_scored else "warmup"
             hit = "HIT" if result.is_hit(hit_threshold_ms) else "miss"
+            src = result.cache_source()
             if err is None:
                 print(
                     f"[{tag:>6}] call={call_idx:03d} round={round_idx} "
                     f"slot={slot_idx} agent={agent_id} "
                     f"ttft={ttft_ms:7.1f}ms total={total_ms:7.1f}ms "
-                    f"out={out_tokens:3d} {hit:4s} | {preview}"
+                    f"out={out_tokens:3d} {hit:4s} src={src} "
+                    f"cache={cached_tokens}/{prompt_tokens} | {preview}"
                 )
             else:
                 print(
@@ -432,17 +513,32 @@ def print_summary(summary: RunSummary) -> None:
     ttfts = [r.ttft_ms for r in scored]
     hits = [r for r in scored if r.is_hit(summary.hit_threshold_ms)]
     overall_rate = 100.0 * len(hits) / len(scored)
+    src_counts: dict[str, int] = {}
+    for r in scored:
+        key = r.cache_source().strip()
+        src_counts[key] = src_counts.get(key, 0) + 1
+    src_summary = " ".join(
+        f"{k}={v}" for k, v in sorted(src_counts.items())
+    )
     print(
         f"Overall: calls={len(scored)} hit_rate={overall_rate:5.1f}% "
         f"mean_ttft={statistics.mean(ttfts):.1f}ms "
         f"median_ttft={statistics.median(ttfts):.1f}ms "
         f"p95_ttft={_percentile(ttfts, 0.95):.1f}ms"
     )
+    print(f"Cache sources: {src_summary}")
+    print(
+        "  (GPU = on-device prefix cache hit, "
+        "LMC = external LMCache reconstruct, "
+        "PART = partial prefix hit, "
+        "MISS = full compute prefill)"
+    )
     print()
     print("Per-agent breakdown:")
     print(
         f"  {'agent':<10} {'n':>4} {'hit_rate':>9} "
-        f"{'mean_ttft':>10} {'median_ttft':>12} {'p95_ttft':>10}"
+        f"{'mean_ttft':>10} {'median_ttft':>12} {'p95_ttft':>10} "
+        f"{'sources':<24}"
     )
     by_agent: dict[str, list[CallResult]] = {}
     for r in scored:
@@ -453,11 +549,19 @@ def print_summary(summary: RunSummary) -> None:
             1 for r in rows if r.is_hit(summary.hit_threshold_ms)
         ) / len(rows)
         agent_ttfts = [r.ttft_ms for r in rows]
+        agent_srcs: dict[str, int] = {}
+        for r in rows:
+            key = r.cache_source().strip()
+            agent_srcs[key] = agent_srcs.get(key, 0) + 1
+        srcs_str = ",".join(
+            f"{k}:{v}" for k, v in sorted(agent_srcs.items())
+        )
         print(
             f"  {agent_id:<10} {len(rows):>4d} {rate:>8.1f}% "
             f"{statistics.mean(agent_ttfts):>9.1f}ms "
             f"{statistics.median(agent_ttfts):>11.1f}ms "
-            f"{_percentile(agent_ttfts, 0.95):>9.1f}ms"
+            f"{_percentile(agent_ttfts, 0.95):>9.1f}ms "
+            f"{srcs_str:<24}"
         )
 
 
