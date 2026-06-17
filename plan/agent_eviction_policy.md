@@ -13,19 +13,20 @@ By default it throws out whatever was used least recently (LRU). That is a
 fine guess in general, but it ignores something we actually know in an
 **agent** setting: which agent is likely to run next.
 
-If we know that Agent A is almost certainly going to fire in the next few
-turns and Agent B almost certainly is not, then evicting B's cached blocks
-first is smarter than blindly picking the oldest block — even if B's blocks
-happen to be newer.
+If we know that Agent A is about to fire and Agent F is not going to fire
+again for several turns, then evicting F's cached blocks is smarter than
+blindly picking the oldest block — even if F's blocks happen to be newer.
 
 ## The idea in one paragraph
 
-Every agent request can attach a small dictionary of guesses:
+Every agent request attaches a small dictionary of guesses:
 "here is the probability that each agent will run in the next N turns."
-We collect these guesses from every live request, decide which agents look
-unlikely, and tell the GPU cache to prefer **their** cached blocks when it
-needs to free room. Agents that look likely are protected; agents that look
-unlikely lose their cache space first.
+We collect these guesses from every live request, **rank every non-active
+agent by aggregated probability ascending**, and when the GPU cache needs
+space we drain blocks from the lowest-probability agent first, then the
+next lowest, then the next — until the request is satisfied. There is no
+threshold gate: if the system needs blocks, it takes them from whoever
+looks least valuable, walking up the ranking as needed.
 
 ## What gets passed in
 
@@ -36,11 +37,21 @@ When a request hits `/v1/agents/chat/completions` it can include:
 | `agent_id` | Which agent owns this request | required |
 | `agent_probabilities` | A map: agent → probability it fires in the next N turns | `{}` |
 | `eviction_window` | The N above (how many turns to look ahead) | 3 |
-| `eviction_threshold` | Below this probability, an agent is considered "unlikely" | 0.5 |
+| `eviction_threshold` | Stats-only summary cutoff; **does not** gate eviction anymore | 0.5 |
 | `probability_ttl_seconds` | How long this guess stays valid | 60 |
 
 If an agent is not in the dictionary, it is treated as probability 0 —
-i.e. "very unlikely," so its blocks become first in line for eviction.
+i.e. "very unlikely," so its blocks sit at the head of the eviction queue.
+
+**Note on `eviction_threshold`.** Earlier versions of this policy used the
+threshold as a hard gate: blocks could only be evicted if their owning
+agent's aggregated probability fell **strictly below** the threshold. In
+round-robin workloads with N ≥ 5 agents this caused the eviction pool to
+collapse to "the just-fired agent only," leaving the policy unable to
+satisfy reasonable allocation requests and falling back to LRU at the
+worst possible moment. The threshold is now retained purely so the
+`GET /v1/agents/eviction_stats` endpoint can label agents as "low" for
+human inspection — it has no effect on which blocks are evicted.
 
 ## What the policy tracks
 
@@ -60,86 +71,165 @@ likely an agent is. The policy resolves the disagreement like this:
 
 - **Probability per agent** — take the **highest** guess across all live
   requests. If even one request thinks an agent is likely, we believe it
-  and protect that agent's blocks.
-- **Threshold** — take the **lowest** threshold across all live requests.
-  An agent is only treated as "unlikely" when *every* live request would
-  agree it is.
+  and push it toward the protected end of the ranking.
 - **Self-protection** — a request always implicitly votes 1.0 for its own
-  agent. An agent that is literally running right now can never be marked
-  unlikely.
+  agent. The currently-active agent(s) are excluded from the eviction
+  ranking entirely; their blocks are never offered up.
+- **Stale vote cleanup** — each vote has an expiry timer (default 60
+  seconds). Stale votes are dropped before any decision is made.
 
-Each vote also has an expiry timer (default 60 seconds). Stale votes are
-quietly dropped before any decision is made.
+## How eviction picks blocks
+
+When the block pool asks the policy for `num_needed` blocks:
+
+1. **Build the ranked candidate list.** Take every agent that either owns
+   tagged blocks or is mentioned by a live request's forecast. Exclude all
+   currently-active agents. For each remaining agent compute its aggregated
+   probability (max across votes). Sort ascending — lowest probability
+   first.
+2. **Drain from the bottom up.** Walk the ranked list. For each agent, hand
+   over its tagged blocks in LRU-tag order (oldest tag first) until
+   `num_needed` is reached.
+3. **Walk further if you have to.** If the lowest-probability agent doesn't
+   have enough blocks, move on to the next-lowest, and so on. The walk only
+   stops when either `num_needed` is satisfied or every non-active agent has
+   been drained.
+
+This is the change from the old design: there is no "below 0.5 ⇒ evict,
+above 0.5 ⇒ refuse." Eviction always returns whatever it can, in
+**lowest-probability-first** order.
+
+## When the policy is consulted
+
+The block pool does not call into the policy on every allocation. It calls
+it only when free space is genuinely tight, controlled by
+`VLLM_AGENT_EVICTION_FRESH_RATIO` (default `0.6`, set to `0` to disable the
+policy entirely and use pure LRU).
+
+The trigger fires when
+
+```
+fresh_free_estimate < num_blocks * ratio
+```
+
+where `fresh_free_estimate` is the number of untagged, never-used blocks in
+the free queue. Estimating this correctly is subtle:
+
+- `get_num_free_blocks()` returns total queue size — fresh and
+  cached-but-free blocks lumped together.
+- `policy.stats()["tagged_blocks"]` counts every tagged block, including
+  ones currently referenced by a running request (which have ref_cnt > 0
+  and have therefore **left** the free queue).
+
+The naive estimate `fresh ≈ total_free − tagged` undercounts whenever a
+request's prefix has just been matched: its blocks are still tagged but no
+longer in the queue, so `total_free` drops while `tagged` stays put, the
+estimate clamps to zero, and the trigger fires for trivial allocations.
+That spurious trigger evicts the **start** of the lowest-probability
+agent's prompt — which destroys its prefix match on the next call.
+
+The fix used in `block_pool.py:get_new_blocks`:
+
+```python
+referenced_blocks = max(0, num_gpu_blocks - total_free - 1)  # − null block
+cached_free_tagged = max(0, tagged - referenced_blocks)
+fresh_free_estimate = max(0, total_free - cached_free_tagged)
+```
+
+This subtracts currently-referenced blocks from `tagged` before computing
+the queue-side cached portion, so prefix-matched blocks don't double-count.
 
 ## End-to-end lifecycle
 
 1. **Request arrives** at the agent chat endpoint with its probabilities.
 2. **Scheduler admits it** and calls `register_request` — the vote is now
-   counted.
-3. **As the request runs**, the block pool fills GPU cache blocks. Each new
-   cached block is **tagged** with the owning agent's id.
-4. **When the cache fills up**, the block pool asks the policy:
-   *"Give me some blocks I can throw out that belong to unlikely agents."*
-   The policy returns oldest-first block ids from any agent below the
-   threshold.
+   counted, and the agent is implicitly protected (self-vote 1.0).
+3. **As the request runs**, the block pool fills GPU cache blocks. Each
+   newly-cached block is **tagged** with the owning agent's id.
+4. **When the cache is tight**, the block pool checks the fresh-free
+   estimate. If it falls below the ratio threshold, it asks the policy:
+   *"Give me some blocks I can throw out."* The policy returns the
+   lowest-probability agent's oldest tagged blocks first, walking up the
+   ranking as needed.
 5. **The block pool double-checks** each candidate is actually free
    (nothing is currently using it) and then reuses it. If a candidate has
-   been re-grabbed in the meantime, it skips it and falls back to normal
-   LRU for that slot.
-6. **When a block leaves the cache**, the tag is cleared.
+   been re-grabbed in the meantime it is skipped, and the pool falls back
+   to LRU for that slot.
+6. **When a block leaves the cache**, the tag is cleared via
+   `untag_block`, which logs the event so cache loss is traceable.
 7. **When the request finishes**, its vote is removed — but the block tags
-   stay, so the cached work it produced can still be cleared out later if
-   its agent stops looking likely.
+   stay, so the cached work it produced remains a candidate for later
+   eviction once the agent's probability falls.
 
 ## Flow diagram
 
 ```mermaid
 flowchart TD
     A[Client sends agent chat request with agent_probabilities] --> B[Scheduler admits the request]
-    B --> C[register_request stores the vote]
+    B --> C[register_request stores the vote and self-protects the agent]
 
     C --> D[Engine runs the request and fills cache blocks]
     D --> E[tag_block marks each cached block with its agent id]
 
-    F[Cache is full, block pool needs space] --> G[Ask policy for evictable blocks]
-    G --> H[Drop expired votes]
-    H --> I[Find agents whose combined probability is below the threshold]
-    I --> J{Any unlikely agents?}
-    J -- No --> K[Use normal LRU eviction]
-    J -- Yes --> L[Return their oldest tagged blocks first]
+    F[Block pool needs space] --> G{fresh_free_estimate < num_blocks * ratio?}
+    G -- No --> H[Pure LRU pop from queue head]
+    G -- Yes --> I[Ask policy for ranked eviction candidates]
+    I --> J[Drop expired votes, exclude active agents]
+    J --> K[Sort remaining agents by aggregated probability ascending]
+    K --> L[Drain lowest-prob agent's oldest tags first, walk up the ranking until num_needed met]
     L --> M{Block actually free right now?}
     M -- No --> N[Skip it, fall back to LRU for that slot]
     M -- Yes --> O[Reuse the block for new work]
 
-    P[Cached block leaves the cache] --> Q[untag_block clears the agent tag]
+    P[Cached block leaves the cache] --> Q[untag_block clears the agent tag and logs the eviction]
     R[Request finishes] --> S[unregister_request removes the vote, tags stay]
     T[reset_prefix_cache called] --> U[clear_all_blocks wipes every tag]
 ```
 
 ## A short worked example
 
-Imagine three agents — `search`, `summarize`, `code` — and two live requests:
+Imagine seven agents `a` through `g` rotating in strict round-robin order,
+and the request currently running is `agent_e`. Its forecast (built from
+cycle distance) looks like:
 
-- Request 1 (running `search`) predicts: `{search: 1.0, summarize: 0.8, code: 0.1}`
-- Request 2 (running `summarize`) predicts: `{search: 0.2, summarize: 1.0, code: 0.0}`
+| Agent | Distance from e | Probability |
+|-------|-----------------|-------------|
+| f | 1 (next) | 1.00 |
+| g | 2 | 0.83 |
+| a | 3 | 0.67 |
+| b | 4 | 0.50 |
+| c | 5 | 0.33 |
+| d | 6 (just fired) | 0.17 |
 
-Combined view (max across requests):
+`agent_e` itself is excluded (self-vote 1.0, currently active).
 
-- `search` → 1.0 (protected)
-- `summarize` → 1.0 (protected)
-- `code` → 0.1 (unlikely, below 0.5)
+Suppose the block pool asks for **2994** evictable blocks (a fresh suffix
+needs space). The policy:
 
-When the GPU cache needs to free space, blocks tagged with `code` go first.
-Blocks tagged with `search` or `summarize` are left alone. If `code`
-eventually has no tagged blocks left, the system falls back to normal LRU.
+1. Sorts the non-active agents ascending: `d (0.17), c (0.33), b (0.50),
+   a (0.67), g (0.83), f (1.00)`.
+2. Drains all 1500 of `d`'s oldest tagged blocks. Still need 1494.
+3. Drains 1494 of `c`'s oldest tagged blocks. Done.
+
+The pool gets a 2994-block candidate list mostly composed of `d` (oldest
+agent in the cycle) plus a slice of `c`. `b`, `a`, `g`, `f` are untouched
+this call — they're closer to firing and the policy prefers to keep them.
+
+Under the **old** threshold-gated design this same call would have
+returned 0 blocks (only `d` was strictly below 0.5, and `d` alone couldn't
+cover 2994), forcing the system to fall back to LRU at exactly the wrong
+moment. The new ranked-drain design lets the policy degrade gracefully:
+it always gives you something, and what it gives you is always the
+lowest-value blocks first.
 
 ## Where this is wired in the codebase
 
 - **Scheduler** — `vllm/v1/core/sched/scheduler.py`
   Registers the vote when a request starts, removes it when it finishes.
 - **Block pool** — `vllm/v1/core/block_pool.py`
-  Tags blocks when they enter the cache, asks the policy for victims when it
-  needs space, untags on eviction, wipes everything on cache reset.
+  Tags blocks when they enter the cache, evaluates the fresh-free trigger,
+  asks the policy for victims when space is tight, untags on eviction,
+  wipes everything on cache reset.
 - **API layer** — `vllm/entrypoints/openai/agent_chat/api_router.py`
   Accepts `agent_probabilities` on incoming requests and exposes a debug
   endpoint at `GET /v1/agents/eviction_stats`.
@@ -155,8 +245,21 @@ This returns:
 - `active_requests` — how many live agent requests are voting right now
 - `tagged_blocks` — how many cached GPU blocks have an agent tag
 - `tracked_agents` — how many distinct agents the policy is following
-- `low_probability_agents` — which agents are currently considered unlikely
-- `effective_threshold` — the threshold in force right now
+- `low_probability_agents` — agents whose aggregated probability is below
+  the (stats-only) threshold. **Informational only** — eviction now uses
+  the full ranking, not this set.
+- `effective_threshold` — the threshold in force for the stats summary
+
+The server also emits per-event debug lines on stderr:
+
+- `DBG tag_block START / RETAG / SUMMARY` — block ownership changes per
+  request, including the count of fresh tags, re-tags (block stolen from
+  another agent — a contention signal), and LRU refreshes.
+- `DBG untag_block` — every cache eviction, with the owning agent and the
+  remaining bucket size.
+- `DBG evictable_blocks` — sampled every 50th call, showing the
+  `drained_lowest_first=[(agent, prob, taken), ...]` walk order so you can
+  confirm the ranking matches your forecast.
 
 ## Why this matters
 
@@ -164,5 +267,5 @@ In a normal LLM workload, LRU is a reasonable default. In an **agent**
 workload, the system actually has hints about the future — which agent is
 going to fire next — and ignoring those hints means evicting cache that you
 were about to reuse. This policy turns those hints into a concrete eviction
-preference, so the GPU prefix cache holds onto the work that is most likely
-to pay off.
+preference, ranks every cached agent by how soon it is expected to fire,
+and bleeds the least-valuable blocks first when space is needed.
