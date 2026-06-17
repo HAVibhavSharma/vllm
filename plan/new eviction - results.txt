@@ -1,0 +1,107 @@
+new eviction 
+
+
+rotation: 7 agents (agent_a ... agent_g)
+[warmup] call=001 round=1 slot=0 agent=agent_a ttft=11433.6ms total=11800.7ms out= 17 src=MISS cache=0/23958 miss=23958 | Maintain prior conventions, observe the established style, avoid speculation,...
+[warmup] call=002 round=1 slot=1 agent=agent_b ttft=11331.0ms total=11831.7ms out= 17 src=MISS cache=0/23957 miss=23957 | Verdict: The design is generally sound but has notable operational risks.  1.
+[warmup] call=003 round=1 slot=2 agent=agent_c ttft=11350.4ms total=11859.4ms out= 17 src=MISS cache=0/23958 miss=23958 | Certainly! To break down the task into three steps with clear owners, deliver...
+[warmup] call=004 round=1 slot=3 agent=agent_d ttft=11409.2ms total=11715.1ms out= 11 src=MISS cache=0/23955 miss=23955 | Improved stability and performance in the latest update.
+[warmup] call=005 round=1 slot=4 agent=agent_e ttft=11426.2ms total=11933.4ms out= 17 src=MISS cache=0/23965 miss=23965 | Maintain prior conventions, observe the established style, avoid speculation,...
+[warmup] call=006 round=1 slot=5 agent=agent_f ttft=11471.0ms total=11979.9ms out= 17 src=MISS cache=0/23964 miss=23964 | Maintain prior conventions, observe the established style, avoid speculation,...
+[warmup] call=007 round=1 slot=6 agent=agent_g ttft=11482.8ms total=11988.0ms out= 17 src=MISS cache=0/23963 miss=23963 | Maintain prior conventions, observe the established style, avoid speculation,...
+[scored] call=008 round=2 slot=0 agent=agent_a ttft=  207.4ms total=  605.7ms out= 17 src=GPU  cache=23936/23957 miss=   21 | Sure, here are two follow-up questions a reviewer might ask:  1. **
+[scored] call=009 round=2 slot=1 agent=agent_b ttft=  214.3ms total=  609.7ms out= 17 src=GPU  cache=23936/23959 miss=   23 | Verdict: Investigate and optimize the most critical path in the system.  1
+[scored] call=010 round=2 slot=2 agent=agent_c ttft=  208.8ms total=  604.2ms out= 17 src=GPU  cache=23936/23956 miss=   20 | **Step 1: Define Project Scope and Objectives**  - **Owner:**
+[scored] call=011 round=2 slot=3 agent=agent_d ttft=  201.0ms total=  595.3ms out= 17 src=GPU  cache=23936/23958 miss=   22 | The update now allows you to easily share your location with friends and fami...
+[scored] call=012 round=2 slot=4 agent=agent_e ttft=  388.6ms total=  788.0ms out= 17 src=LMC  cache=23936/23963 miss=   27 | - **Unpatched Vulnerabilities**: Systems with unpatched vulnerabilities are at
+[scored] call=013 round=2 slot=5 agent=agent_f ttft=  389.7ms total=  786.9ms out= 17 src=LMC  cache=23936/23962 miss=   26 | - **Data Integrity Issues**: Incorrect or inconsistent data can lead to inacc...
+[scored] call=014 round=2 slot=6 agent=agent_g ttft=  197.2ms total=  595.0ms out= 17 src=GPU  cache=23936/23961 miss=   25 | - **Injection Vulnerabilities**: If user input is not properly sanitized, it can
+[scored] call=015 round=3 slot=0 agent=agent_a ttft=  197.4ms total=  590.4ms out= 17 src=GPU  cache=23936/23955 miss=   19 | One assumption worth double-checking is that the system designer's choices ar...
+[scored] call=016 round=3 slot=1 agent=agent_b ttft=  195.6ms total=  594.3ms out= 17 src=GPU  cache=23936/23959 miss=   23 | Verdict: The design includes a single point of failure.  1. **Single
+[scored] call=017 round=3 slot=2 agent=agent_c ttft=  193.7ms total=  593.1ms out= 17 src=GPU  cache=23936/23957 miss=   21 | To determine which step has the most schedule risk, we need to evaluate each ...
+[scored] call=018 round=3 slot=3 agent=agent_d ttft=  392.1ms total=  737.6ms out= 15 src=LMC  cache=23936/23953 miss=   17 | "New Feature Enhances User Experience with Streamlined Functionality"
+[scored] call=019 round=3 slot=4 agent=agent_e ttft=  387.7ms total=  785.2ms out= 17 src=LMC  cache=23936/23963 miss=   27 | - Identify the specific alert or issue that needs addressing. - Gather initia...
+[scored] call=020 round=3 slot=5 agent=agent_f ttft=  197.5ms total=  595.7ms out= 17 src=GPU  cache=23936/23962 miss=   26 | - Identify the specific problem or task. - Review the current system document...
+[scored] call=021 round=3 slot=6 agent=agent_g ttft=  199.6ms total=  598.0ms out= 17 src=GPU  cache=23936/23961 miss=   25 | - Identify and document the specific security requirements and objectives for...
+
+============================================================================
+Mode: treatment   rounds: 3   warm-up: 1   hit threshold: 500ms
+============================================================================
+Overall: calls=14 gpu_hit_rate= 71.4% (10/14) mean_ttft=255.0ms median_ttft=204.2ms p95_ttft=390.5ms mean_miss=23.0 tok/call
+Cache sources: GPU=10 LMC=4
+  (GPU = on-device prefix cache hit, LMC = external LMCache reconstruct, PART = partial prefix hit, MISS = full compute prefill)
+  hit_rate counts GPU-only -- LMC reconstructs are still cache hits at the byte level but are not counted here.
+
+Per-agent breakdown:
+  agent         n  gpu_hit_rate  mean_ttft  median_ttft   p95_ttft  mean_miss sources
+  agent_a       2        100.0%     202.4ms       202.4ms     206.9ms      20.0t GPU:2
+  agent_b       2        100.0%     204.9ms       204.9ms     213.4ms      23.0t GPU:2
+  agent_c       2        100.0%     201.2ms       201.2ms     208.0ms      20.5t GPU:2
+  agent_d       2         50.0%     296.5ms       296.5ms     382.5ms      19.5t GPU:1,LMC:1
+  agent_e       2          0.0%     388.2ms       388.2ms     388.6ms      27.0t LMC:2
+  agent_f       2         50.0%     293.6ms       293.6ms     380.1ms      26.0t GPU:1,LMC:1
+  agent_g       2        100.0%     198.4ms       198.4ms     199.5ms      25.0t GPU:2
+
+
+
+
+LRU 
+
+rotation: 7 agents (agent_a ... agent_g)
+[warmup] call=001 round=1 slot=0 agent=agent_a ttft=11420.9ms total=11815.9ms out= 17 src=MISS cache=0/23958 miss=23958 | Maintain prior conventions, observe the established style, avoid speculation,...
+[warmup] call=002 round=1 slot=1 agent=agent_b ttft=11303.7ms total=11804.9ms out= 17 src=MISS cache=0/23957 miss=23957 | Verdict: The design is generally sound but has notable operational risks.  1.
+[warmup] call=003 round=1 slot=2 agent=agent_c ttft=11348.2ms total=11844.2ms out= 17 src=MISS cache=0/23958 miss=23958 | Certainly! To break down the task into three steps with clear owners, deliver...
+[warmup] call=004 round=1 slot=3 agent=agent_d ttft=11377.8ms total=11680.3ms out= 11 src=MISS cache=0/23955 miss=23955 | Improved stability and performance in the latest update.
+[warmup] call=005 round=1 slot=4 agent=agent_e ttft=11384.0ms total=11880.6ms out= 17 src=MISS cache=0/23965 miss=23965 | Maintain prior conventions, observe the established style, avoid speculation,...
+[warmup] call=006 round=1 slot=5 agent=agent_f ttft=11423.6ms total=11925.0ms out= 17 src=MISS cache=0/23964 miss=23964 | Maintain prior conventions, observe the established style, avoid speculation,...
+[warmup] call=007 round=1 slot=6 agent=agent_g ttft=11473.3ms total=11973.9ms out= 17 src=MISS cache=0/23963 miss=23963 | Maintain prior conventions, observe the established style, avoid speculation,...
+[scored] call=008 round=2 slot=0 agent=agent_a ttft=  381.6ms total=  773.1ms out= 17 src=LMC  cache=23936/23957 miss=   21 | Sure, here are two follow-up questions a reviewer might ask:  1. **
+[scored] call=009 round=2 slot=1 agent=agent_b ttft=  370.6ms total=  768.8ms out= 17 src=LMC  cache=23936/23959 miss=   23 | Verdict: Investigate and optimize the most critical path in the system.  1
+[scored] call=010 round=2 slot=2 agent=agent_c ttft=  365.1ms total=  758.1ms out= 17 src=LMC  cache=23936/23956 miss=   20 | **Step 1: Define Project Scope and Objectives**  - **Owner:**
+[scored] call=011 round=2 slot=3 agent=agent_d ttft=  380.3ms total=  774.2ms out= 17 src=LMC  cache=23936/23958 miss=   22 | The update now allows you to easily share your location with friends and fami...
+[scored] call=012 round=2 slot=4 agent=agent_e ttft=  366.7ms total=  764.4ms out= 17 src=LMC  cache=23936/23963 miss=   27 | - **Unpatched Vulnerabilities**: Systems with unpatched vulnerabilities are at
+[scored] call=013 round=2 slot=5 agent=agent_f ttft=  378.7ms total=  775.0ms out= 17 src=LMC  cache=23936/23962 miss=   26 | - **Data Integrity Issues**: Incorrect or inconsistent data can lead to inacc...
+[scored] call=014 round=2 slot=6 agent=agent_g ttft=  386.5ms total=  781.6ms out= 17 src=LMC  cache=23936/23961 miss=   25 | - **Injection Vulnerabilities**: If user input is not properly sanitized, it can
+[scored] call=015 round=3 slot=0 agent=agent_a ttft=  378.5ms total=  773.2ms out= 17 src=LMC  cache=23936/23955 miss=   19 | One assumption worth double-checking is that the system designer's choices ar...
+[scored] call=016 round=3 slot=1 agent=agent_b ttft=  410.9ms total=  804.2ms out= 17 src=LMC  cache=23936/23959 miss=   23 | Verdict: The design includes a single point of failure.  1. **Single
+[scored] call=017 round=3 slot=2 agent=agent_c ttft=  379.1ms total=  774.4ms out= 17 src=LMC  cache=23936/23957 miss=   21 | To determine which step has the most schedule risk, we need to evaluate each ...
+[scored] call=018 round=3 slot=3 agent=agent_d ttft=  381.1ms total=  718.5ms out= 15 src=LMC  cache=23936/23953 miss=   17 | "New Feature Enhances User Experience with Streamlined Functionality"
+[scored] call=019 round=3 slot=4 agent=agent_e ttft=  371.7ms total=  765.6ms out= 17 src=LMC  cache=23936/23963 miss=   27 | - Identify the specific alert or issue that needs addressing. - Gather initia...
+[scored] call=020 round=3 slot=5 agent=agent_f ttft=  366.9ms total=  762.0ms out= 17 src=LMC  cache=23936/23962 miss=   26 | - Identify the specific problem or task. - Review the current system document...
+[scored] call=021 round=3 slot=6 agent=agent_g ttft=  375.4ms total=  767.2ms out= 17 src=LMC  cache=23936/23961 miss=   25 | - Identify and document the specific security requirements and objectives for...
+
+============================================================================
+Mode: baseline   rounds: 3   warm-up: 1   hit threshold: 500ms
+============================================================================
+Overall: calls=14 gpu_hit_rate=  0.0% (0/14) mean_ttft=378.1ms median_ttft=378.6ms p95_ttft=395.0ms mean_miss=23.0 tok/call
+Cache sources: LMC=14
+  (GPU = on-device prefix cache hit, LMC = external LMCache reconstruct, PART = partial prefix hit, MISS = full compute prefill)
+  hit_rate counts GPU-only -- LMC reconstructs are still cache hits at the byte level but are not counted here.
+
+Per-agent breakdown:
+  agent         n  gpu_hit_rate  mean_ttft  median_ttft   p95_ttft  mean_miss sources
+  agent_a       2          0.0%     380.1ms       380.1ms     381.5ms      20.0t LMC:2
+  agent_b       2          0.0%     390.7ms       390.7ms     408.9ms      23.0t LMC:2
+  agent_c       2          0.0%     372.1ms       372.1ms     378.4ms      20.5t LMC:2
+  agent_d       2          0.0%     380.7ms       380.7ms     381.1ms      19.5t LMC:2
+  agent_e       2          0.0%     369.2ms       369.2ms     371.5ms      27.0t LMC:2
+  agent_f       2          0.0%     372.8ms       372.8ms     378.1ms      26.0t LMC:2
+  agent_g       2          0.0%     381.0ms       381.0ms     386.0ms      25.0t LMC:2
+
+
+
+  ───────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                   Knob                    │                                               Effect on L0                                               │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ --gpu-memory-utilization (e.g. 0.7 → 0.4) │ Shrinks requested_memory, so KV pool shrinks roughly linearly after the weights/activation floor is paid │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ --num-gpu-blocks-override N               │ Bypasses the profiler and pins the pool to exactly N blocks — cleanest knob for a controlled experiment  │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ --kv-cache-memory-bytes                   │ Same idea but in bytes                                                                                   │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ --max-num-seqs / --max-num-batched-tokens │ Pressure the scheduler without changing the pool                                                         │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ --enable-prefix-caching off/on            │ Doesn't change size, but changes hit rate and therefore eviction pressure on the same pool               │
+  └───────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  This is how to change the L0 memory 
