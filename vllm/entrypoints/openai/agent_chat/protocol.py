@@ -43,14 +43,20 @@ class AgentChatCompletionRequest(ChatCompletionRequest):
     record_in_registry: bool = Field(default=True)
 
     def to_chat_completion_request(self) -> ChatCompletionRequest:
-        """Strip agent fields and return a plain ChatCompletionRequest
-        the existing serving_chat handler can consume."""
+        """Strip agent-routing fields and return a plain
+        ChatCompletionRequest the existing serving_chat handler can
+        consume.
+
+        ``agent_id`` is intentionally **kept** so it lands in
+        ``model_extra`` on the inner request and gets promoted into
+        ``SamplingParams.extra_args`` — that's how the per-request CSV
+        in ``FileStatLogger`` ends up with the agent attribution.
+        """
         # by_alias=True preserves wire-format keys (e.g. `schema` on
         # JsonSchemaResponseFormat) so the round-trip through
         # model_validate doesn't silently drop aliased fields.
         data = self.model_dump(by_alias=True, exclude_none=True)
         for key in (
-            "agent_id",
             "agent_cache_salt",
             "record_in_registry",
         ):

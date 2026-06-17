@@ -98,6 +98,11 @@ fields. Streams SSE the same way the upstream endpoint does.
 Recording failures are caught and logged; they never break the
 response.
 
+`agent_id` is also forwarded into `SamplingParams.extra_args` for the
+inner request, so it shows up in the per-request CSV/JSONL emitted by
+`FileStatLogger` when `VLLM_REQUEST_STATS_DIR` is set — see
+[section 6](#6-per-request-stats-logging-vllm_request_stats_dir).
+
 ### Response
 
 Identical to `/v1/chat/completions`:
@@ -457,7 +462,119 @@ curl -s http://localhost:8000/v1/agents/registry_stats | python3 -m json.tool
 
 ---
 
-## 6. Common gotchas
+## 6. Per-request stats logging (`VLLM_REQUEST_STATS_DIR`)
+
+Independent of the agent endpoints, vLLM can dump one row per finished
+request to disk. This is the primary way to attribute prefix-cache
+hits, TTFT, and queue/decode timings back to a specific agent for
+benchmarking.
+
+### Enabling
+
+Start the server with the env var set to a writable directory:
+
+```bash
+VLLM_REQUEST_STATS_DIR=/tmp/vllm_stats \
+  vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ ...
+```
+
+On startup, `FileStatLogger` opens two files per engine in that
+directory:
+
+```
+finished_requests_engine0_<YYYYMMDD_HHMMSS>.csv
+finished_requests_engine0_<YYYYMMDD_HHMMSS>.jsonl
+```
+
+Each finished request appends one row to both files. The files stay
+open for the life of the process and are flushed + closed via
+`atexit`.
+
+### CSV / JSONL columns
+
+| Column | Meaning |
+|---|---|
+| `request_id` | vLLM internal request id (matches engine logs). |
+| `job_id` | Caller-supplied `job_id` (see below). |
+| `agent_id` | Caller-supplied `agent_id`. |
+| `langgraph_node` | Caller-supplied `langgraph_node` (LangGraph integration tag). |
+| `input_text` | Detokenized prompt (full prompt as the engine saw it). |
+| `output_text` | Detokenized generated text. |
+| `finish_reason` | `stop` / `length` / `abort` / etc. |
+| `e2e_latency` | Arrival → final token, seconds. |
+| `num_prompt_tokens` | Prompt length in tokens. |
+| `num_generation_tokens` | Generated token count. |
+| `num_cached_tokens` | Tokens served from APC. |
+| `prefix_cache_hit_rate` | `num_cached_tokens / num_prompt_tokens` (0 if prompt empty). |
+| `queued_time` | Time in scheduler queue before first prefill, seconds. |
+| `prefill_time` | Prefill stage duration, seconds. |
+| `inference_time` | First-token arrival → finish, seconds. |
+| `decode_time` | Pure decode stage duration, seconds. |
+| `max_tokens_param` | The `max_tokens` the caller asked for. |
+
+`input_text` / `output_text` can be large — the CSV writer uses
+`QUOTE_MINIMAL` with `\` as the escape char to keep multi-line
+prompts parsable. JSONL is the safer format if you're scripting
+analysis.
+
+### How `agent_id` / `job_id` / `langgraph_node` get into the row
+
+These three fields are accepted as **arbitrary extras** by every
+OpenAI-style request model (`ChatCompletionRequest`,
+`CompletionRequest`, `ResponsesRequest`). On `to_sampling_params()`
+the request's `model_extra` is merged into
+`SamplingParams.extra_args`, and the output processor pulls these
+three keys back out into `RequestState` for the logger to read.
+
+That means **all three tagging conventions work**:
+
+```python
+# 1. Plain OpenAI endpoint with extra_body — works on any endpoint
+client.chat.completions.create(
+    model="...",
+    messages=[...],
+    extra_body={"agent_id": "agent1", "job_id": "run-42",
+                "langgraph_node": "planner"},
+)
+```
+
+```python
+# 2. Agent endpoint — agent_id is also forwarded into extra_args,
+#    so the CSV row gets attributed automatically.
+requests.post(f"{BASE}/v1/agents/chat/completions", json={
+    "model": "...",
+    "agent_id": "agent1",       # used for registry + ends up in CSV
+    "messages": [...],
+})
+```
+
+The agent endpoint strips `agent_cache_salt` and `record_in_registry`
+before delegation (they're not meaningful to sampling), but
+`agent_id` is kept so it survives into the per-request row.
+
+### Typical benchmarking loop
+
+```bash
+# 1. Start vLLM with the stats dir set.
+VLLM_REQUEST_STATS_DIR=/tmp/vllm_stats vllm serve ... &
+
+# 2. Cold APC, keep registry + LMCache:
+curl -X POST http://localhost:8000/v1/agents/reset_prefix_cache
+
+# 3. Drive traffic (with or without prefetch).
+python my_benchmark.py
+
+# 4. Inspect the per-request rows.
+csvlook /tmp/vllm_stats/finished_requests_engine0_*.csv | head
+```
+
+For prefix-cache hit-rate plots, the helper
+`plot_prefix_cache_hit_rate.py` (top of repo) consumes these CSVs
+directly.
+
+---
+
+## 7. Common gotchas
 
 1. **`model` mismatch → 404.** The `model` field in the chat body must
    exactly match the model id vLLM is serving. The prefetch endpoint
