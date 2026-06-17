@@ -38,8 +38,8 @@ TTFT gap on every request after the first full rotation.
 ## How it talks to vLLM
 
 The runner hits the standard `POST /v1/chat/completions` endpoint and
-passes the agent-eviction inputs (`agent_id`, `agent_probabilities`,
-`eviction_window`, `eviction_threshold`) inside `kv_transfer_params`.
+passes the agent-eviction inputs (`agent_id`, `agent_probabilities`)
+inside `kv_transfer_params`.
 The scheduler's `_register_agent_eviction` reads those fields off
 `Request.kv_transfer_params` and registers a vote with the policy — the
 exact same code path the dedicated `/v1/agents/chat/completions` wrapper

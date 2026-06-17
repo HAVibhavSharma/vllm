@@ -35,23 +35,18 @@ When a request hits `/v1/agents/chat/completions` it can include:
 | Field | What it means | Default |
 | --- | --- | --- |
 | `agent_id` | Which agent owns this request | required |
-| `agent_probabilities` | A map: agent → probability it fires in the next N turns | `{}` |
-| `eviction_window` | The N above (how many turns to look ahead) | 3 |
-| `eviction_threshold` | Stats-only summary cutoff; **does not** gate eviction anymore | 0.5 |
-| `probability_ttl_seconds` | How long this guess stays valid | 60 |
+| `agent_probabilities` | A map: agent → probability it fires soon | `{}` |
 
 If an agent is not in the dictionary, it is treated as probability 0 —
 i.e. "very unlikely," so its blocks sit at the head of the eviction queue.
 
-**Note on `eviction_threshold`.** Earlier versions of this policy used the
-threshold as a hard gate: blocks could only be evicted if their owning
-agent's aggregated probability fell **strictly below** the threshold. In
-round-robin workloads with N ≥ 5 agents this caused the eviction pool to
-collapse to "the just-fired agent only," leaving the policy unable to
-satisfy reasonable allocation requests and falling back to LRU at the
-worst possible moment. The threshold is now retained purely so the
-`GET /v1/agents/eviction_stats` endpoint can label agents as "low" for
-human inspection — it has no effect on which blocks are evicted.
+**Historical note.** Earlier drafts of this API also exposed an
+`eviction_window`, `eviction_threshold`, and `probability_ttl_seconds`.
+Window and TTL were never wired through to behaviour, and the threshold
+gate was found to collapse pathologically in round-robin workloads with
+N ≥ 5 agents (the eviction pool would shrink to "the just-fired agent
+only" and force LRU fallback at the worst possible moment). All three
+have been removed — the only knob that matters is the forecast itself.
 
 ## What the policy tracks
 
@@ -75,8 +70,9 @@ likely an agent is. The policy resolves the disagreement like this:
 - **Self-protection** — a request always implicitly votes 1.0 for its own
   agent. The currently-active agent(s) are excluded from the eviction
   ranking entirely; their blocks are never offered up.
-- **Stale vote cleanup** — each vote has an expiry timer (default 60
-  seconds). Stale votes are dropped before any decision is made.
+- **Vote lifetime** — a vote lives exactly as long as the request that
+  cast it. When the scheduler marks the request finished, its row in the
+  aggregator is dropped. Block-ownership tags survive.
 
 ## How eviction picks blocks
 
@@ -245,10 +241,6 @@ This returns:
 - `active_requests` — how many live agent requests are voting right now
 - `tagged_blocks` — how many cached GPU blocks have an agent tag
 - `tracked_agents` — how many distinct agents the policy is following
-- `low_probability_agents` — agents whose aggregated probability is below
-  the (stats-only) threshold. **Informational only** — eviction now uses
-  the full ranking, not this set.
-- `effective_threshold` — the threshold in force for the stats summary
 
 The server also emits per-event debug lines on stderr:
 

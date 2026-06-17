@@ -76,9 +76,6 @@ class PhantomPrefetchSubmitter:
         token_ids: Sequence[int],
         prefix_hash: bytes,
         agent_probabilities: Mapping[str, float] | None = None,
-        eviction_window: int | None = None,
-        eviction_threshold: float | None = None,
-        probability_ttl_seconds: float | None = None,
     ) -> asyncio.Task | None:
         """Submit one phantom prefetch.
 
@@ -128,12 +125,6 @@ class PhantomPrefetchSubmitter:
             "agent_id": agent_id,
             "agent_probabilities": votes,
         }
-        if eviction_window is not None:
-            kv_params["eviction_window"] = int(eviction_window)
-        if eviction_threshold is not None:
-            kv_params["eviction_threshold"] = float(eviction_threshold)
-        if probability_ttl_seconds is not None:
-            kv_params["probability_ttl_seconds"] = float(probability_ttl_seconds)
 
         params = SamplingParams(
             max_tokens=1,

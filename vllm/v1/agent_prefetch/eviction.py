@@ -9,16 +9,15 @@ their owning agent is unlikely to be the next one to fire.
 Mental model::
 
     Each live ``/v1/agents/chat/completions`` request can carry an
-    ``agent_probabilities`` dict: ``agent_id -> P(agent fires in the
-    next N turns)``. The policy maintains a global view of these
-    per-agent probabilities aggregated across every live request.
+    ``agent_probabilities`` dict: ``agent_id -> P(agent fires soon)``.
+    The policy maintains a global view of these per-agent probabilities
+    aggregated (max) across every live request.
 
-    A block in state S3 (free-cached -- see ``plan/block_lifecycle.md``)
-    that is owned by an agent whose aggregated probability is below
-    ``eviction_threshold`` becomes liable for *early* eviction: the
-    block pool prefers it over arbitrary LRU victims when satisfying a
-    ``get_new_blocks`` request. This frees up cached GPU memory for
-    prefixes that are actually likely to be reused soon.
+    When the GPU block pool runs short, it asks the policy for eviction
+    candidates. The policy ranks every non-active agent by aggregated
+    probability ascending and drains blocks from the lowest-probability
+    agent first, walking up the ranking until the pool's request is
+    satisfied.
 
 The policy is a process-wide singleton because the scheduler /
 block-pool live in a single process; the API endpoint feeds info in via
@@ -39,13 +38,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_EVICTION_WINDOW = 3
-"""Default `next-N-turns` window used when the request doesn't override it."""
-
-DEFAULT_EVICTION_THRESHOLD = 0.5
-"""Default probability threshold below which an agent's blocks are
-liable for early eviction."""
-
 
 @dataclass(frozen=True)
 class ActiveRequestInfo:
@@ -53,13 +45,11 @@ class ActiveRequestInfo:
 
     request_id: str
     agent_id: str
-    # Agent id -> P(agent fires in the next ``window`` turns).
-    # An agent missing from this map is treated as probability 0 by the
-    # aggregator (i.e. eligible for eviction unless some other live
-    # request lifts it above the threshold).
+    # Agent id -> P(agent fires soon). An agent missing from this map
+    # is treated as probability 0 by the aggregator (i.e. its blocks
+    # sit at the head of the eviction ranking unless some other live
+    # request lifts them higher).
     agent_probabilities: dict[str, float] = field(default_factory=dict)
-    window: int = DEFAULT_EVICTION_WINDOW
-    threshold: float = DEFAULT_EVICTION_THRESHOLD
 
 
 class AgentEvictionPolicy:
@@ -67,9 +57,9 @@ class AgentEvictionPolicy:
 
     Holds three correlated indices:
 
-    * ``_active``: live-request info (agent id, probabilities, window,
-      threshold). Populated when the scheduler admits a request,
-      removed when the request finishes.
+    * ``_active``: live-request info (agent id, probabilities).
+      Populated when the scheduler admits a request, removed when the
+      request finishes.
     * ``_block_owner``: which agent owns a given cached block. Set when
       a block becomes cached (`cache_full_blocks`); cleared when the
       block leaves the prefix cache (`_maybe_evict_cached_block` or
@@ -105,8 +95,6 @@ class AgentEvictionPolicy:
         request_id: str,
         agent_id: str,
         agent_probabilities: Mapping[str, float] | None = None,
-        window: int = DEFAULT_EVICTION_WINDOW,
-        threshold: float = DEFAULT_EVICTION_THRESHOLD,
     ) -> None:
         """Register a live agent request with the policy.
 
@@ -127,17 +115,14 @@ class AgentEvictionPolicy:
             request_id=request_id,
             agent_id=agent_id,
             agent_probabilities=probs,
-            window=max(1, int(window)) if window is not None else DEFAULT_EVICTION_WINDOW,
-            threshold=float(threshold) if threshold is not None else DEFAULT_EVICTION_THRESHOLD,
         )
         with self._lock:
             self._active[request_id] = info
             self._request_to_agent[request_id] = agent_id
             self._agent_blocks.setdefault(agent_id, OrderedDict())
         logger.debug(
-            "agent_eviction: register request=%s agent=%s probs=%s "
-            "window=%d threshold=%.3f",
-            request_id, agent_id, probs, info.window, info.threshold,
+            "agent_eviction: register request=%s agent=%s probs=%s",
+            request_id, agent_id, probs,
         )
 
     def unregister_request(self, request_id: str) -> None:
@@ -315,8 +300,7 @@ class AgentEvictionPolicy:
         Max (rather than mean/sum) is the most generous aggregator: if
         any live request thinks an agent is likely, we protect its
         blocks. Returns 0.0 when no live request mentions the agent --
-        which makes its blocks immediately eligible for eviction once a
-        threshold check is applied.
+        which sits it at the head of the eviction ranking.
 
         Each live request also implicitly votes ``1.0`` for **its own**
         ``agent_id``: an agent that's currently running cannot
@@ -334,18 +318,6 @@ class AgentEvictionPolicy:
                 if p > best:
                     best = p
             return best
-
-    def effective_threshold(self) -> float:
-        """Compute the threshold to apply for the current eviction
-        decision. When multiple live requests disagree on the
-        threshold, we take the **min** -- the most lenient one. This
-        means a block is liable for early eviction only when *every*
-        live request is willing to evict at that probability.
-        """
-        with self._lock:
-            if not self._active:
-                return DEFAULT_EVICTION_THRESHOLD
-            return min(info.threshold for info in self._active.values())
 
     def _agents_by_probability_locked(self) -> list[tuple[str, float]]:
         """Return candidate agents sorted by ascending aggregated
@@ -377,31 +349,6 @@ class AgentEvictionPolicy:
             ranked.append((agent_id, best))
         ranked.sort(key=lambda x: x[1])
         return ranked
-
-    def _low_probability_agents_locked(self) -> set[str]:
-        """Stats-only view: agents whose aggregated probability is
-        strictly below the effective threshold. The eviction decision
-        no longer uses a threshold gate (see ``evictable_blocks``); this
-        is retained so existing stats endpoints keep returning a
-        meaningful summary."""
-        if not self._active:
-            return set()
-        threshold = min(info.threshold for info in self._active.values())
-        active_agents: set[str] = {
-            info.agent_id for info in self._active.values()
-        }
-        low: set[str] = set()
-        for agent_id, prob in self._agents_by_probability_locked():
-            if agent_id in active_agents:
-                continue
-            if prob < threshold:
-                low.add(agent_id)
-        return low
-
-    def low_probability_agents(self) -> set[str]:
-        """Public wrapper around ``_low_probability_agents_locked``."""
-        with self._lock:
-            return self._low_probability_agents_locked()
 
     def evictable_blocks(self, num_needed: int) -> list[int]:
         """Return up to ``num_needed`` block ids in lowest-probability

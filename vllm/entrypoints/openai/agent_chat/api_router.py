@@ -138,9 +138,6 @@ async def _fan_out_prefetches(
     k: int | None,
     wait: bool,
     agent_probabilities: dict[str, float] | None = None,
-    eviction_window: int | None = None,
-    eviction_threshold: float | None = None,
-    probability_ttl_seconds: float | None = None,
 ) -> tuple[int, int]:
     """Submit phantom prefetches for ``agent_id``.
 
@@ -149,11 +146,11 @@ async def _fan_out_prefetches(
     int, only the ``k`` most-recently-used prefixes are warmed; ``k``
     <= 0 is a no-op.
 
-    ``agent_probabilities`` and the surrounding eviction params are
-    forwarded verbatim into each phantom's ``kv_transfer_params`` so
-    the eviction policy registers the phantom and tags its blocks.
-    See :class:`PhantomPrefetchSubmitter.submit` for the self-vote
-    fallback behavior when no probabilities are supplied.
+    ``agent_probabilities`` is forwarded verbatim into each phantom's
+    ``kv_transfer_params`` so the eviction policy registers the phantom
+    and tags its blocks. See :class:`PhantomPrefetchSubmitter.submit`
+    for the self-vote fallback behavior when no probabilities are
+    supplied.
 
     Returns ``(submitted, completed)`` -- ``submitted`` is the number
     of phantoms actually handed to the engine after dedup; ``completed``
@@ -174,9 +171,6 @@ async def _fan_out_prefetches(
             token_ids=desc.token_ids,
             prefix_hash=desc.prefix_hash,
             agent_probabilities=agent_probabilities,
-            eviction_window=eviction_window,
-            eviction_threshold=eviction_threshold,
-            probability_ttl_seconds=probability_ttl_seconds,
         )
         if task is not None:
             tasks.append(task)
@@ -391,9 +385,6 @@ async def prefetch_agent_cache(
         k=top_k,
         wait=request.wait,
         agent_probabilities=request.agent_probabilities,
-        eviction_window=request.eviction_window,
-        eviction_threshold=request.eviction_threshold,
-        probability_ttl_seconds=request.probability_ttl_seconds,
     )
 
     elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
@@ -542,13 +533,7 @@ async def get_agent_eviction_stats(raw_request: Request):
     through ``/v1/agents/chat/completions`` are actually reaching the
     engine with their ``agent_probabilities`` payload intact."""
     policy = get_eviction_policy()
-    return JSONResponse(
-        content={
-            **policy.stats(),
-            "low_probability_agents": sorted(policy.low_probability_agents()),
-            "effective_threshold": policy.effective_threshold(),
-        }
-    )
+    return JSONResponse(content=policy.stats())
 
 
 @router.get("/v1/agents/registry_stats")

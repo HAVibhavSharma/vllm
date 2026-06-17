@@ -98,12 +98,9 @@ def build_probabilities(
     one — even with cache room to spare — and by the time the cycle
     came back around N-1 turns later, that agent's blocks were gone.
     The distance-aware ramp instead reflects the true cycle structure:
-    only the agents *farthest* from re-firing become evictable, so the
-    cache holds the upcoming ones.
-
-    With the default threshold of 0.5, agents whose probability is
-    strictly below 0.5 become evictable — that means the most-recently
-    fired half of the cycle becomes the eviction pool.
+    the agents *farthest* from re-firing sit at the head of the
+    eviction ranking, so when the pool needs space it drains them
+    first and the upcoming agents stay warm.
 
     The current agent doesn't need to be in the dict — the policy
     implicitly self-votes 1.0 for its own ``agent_id``.
@@ -192,8 +189,6 @@ def call_once(
     max_tokens: int,
     *,
     probabilities: dict[str, float] | None,
-    eviction_window: int | None,
-    eviction_threshold: float | None,
 ) -> tuple[float, float, int, str, int, int, str | None]:
     """Issue one chat call and time TTFT + total wall time.
 
@@ -224,10 +219,6 @@ def call_once(
     }
     if probabilities is not None:
         payload["agent_probabilities"] = probabilities
-        if eviction_window is not None:
-            payload["eviction_window"] = eviction_window
-        if eviction_threshold is not None:
-            payload["eviction_threshold"] = eviction_threshold
 
     start_ns = time.perf_counter_ns()
     first_token_ns: int | None = None
@@ -318,8 +309,6 @@ def run(
     max_tokens: int,
     warm_up_rounds: int,
     hit_threshold_ms: float,
-    eviction_window: int | None,
-    eviction_threshold: float | None,
     filler_lines: int,
 ) -> RunSummary:
     summary = RunSummary(
@@ -357,8 +346,6 @@ def run(
                 user_query=user_query,
                 max_tokens=max_tokens,
                 probabilities=probs,
-                eviction_window=eviction_window,
-                eviction_threshold=eviction_threshold,
             )
             result = CallResult(
                 call_idx=call_idx,
@@ -553,10 +540,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--filler-lines", type=int, default=220,
                    help="Lines of filler in each agent's system prompt; "
                         "controls prompt length (default: 220 ~ ~4K tokens)")
-    p.add_argument("--eviction-window", type=int, default=None,
-                   help="Optional eviction_window (treatment mode only)")
-    p.add_argument("--eviction-threshold", type=float, default=None,
-                   help="Optional eviction_threshold (treatment mode only)")
     p.add_argument("--skip-eviction-stats", action="store_true",
                    help="Don't fetch /v1/agents/eviction_stats at the end")
     return p.parse_args(argv)
@@ -594,8 +577,6 @@ def main(argv: list[str] | None = None) -> int:
         max_tokens=args.max_output_tokens,
         warm_up_rounds=args.warm_up_rounds,
         hit_threshold_ms=args.hit_threshold_ms,
-        eviction_window=args.eviction_window,
-        eviction_threshold=args.eviction_threshold,
         filler_lines=args.filler_lines,
     )
     print_summary(summary)

@@ -21,8 +21,6 @@ follow-up commits; see ``plan/agent_prefetch_plan.md``.
 """
 
 from vllm.v1.agent_prefetch.eviction import (
-    DEFAULT_EVICTION_THRESHOLD,
-    DEFAULT_EVICTION_WINDOW,
     ActiveRequestInfo,
     AgentEvictionPolicy,
     get_eviction_policy,
@@ -47,8 +45,6 @@ __all__ = [
     "AgentEvictionPolicy",
     "AgentPrefixRegistry",
     "DEFAULT_CHUNK_SIZE",
-    "DEFAULT_EVICTION_THRESHOLD",
-    "DEFAULT_EVICTION_WINDOW",
     "PhantomPrefetchSubmitter",
     "PrefixDescriptor",
     "build_prefetch_request_id",

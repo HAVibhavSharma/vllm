@@ -296,39 +296,6 @@ class Request:
             out[agent] = max(0.0, min(1.0, p))
         return out or None
 
-    @property
-    def eviction_window(self) -> int | None:
-        if self.kv_transfer_params is None:
-            return None
-        value = self.kv_transfer_params.get("eviction_window")
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    @property
-    def eviction_threshold(self) -> float | None:
-        if self.kv_transfer_params is None:
-            return None
-        value = self.kv_transfer_params.get("eviction_threshold")
-        try:
-            return float(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    @property
-    def probability_ttl_seconds(self) -> float | None:
-        """TTL on this request's probability vote, in seconds.
-        ``None`` (or absent) means use the server default; non-positive
-        means "no expiry"."""
-        if self.kv_transfer_params is None:
-            return None
-        value = self.kv_transfer_params.get("probability_ttl_seconds")
-        try:
-            return float(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
 

@@ -81,6 +81,7 @@ fields. Streams SSE the same way the upstream endpoint does.
 | `agent_id` | string (1–128 chars) | **yes** | — | Scopes the prefix registry. Distinct agents do not share prefixes. |
 | `agent_cache_salt` | string (≤256) or null | no | `"agent::<agent_id>"` | Override for the LMCache `cache_salt`. Two agents with the same explicit salt will share LMCache entries. |
 | `record_in_registry` | bool | no | `true` | When `false`, the server skips tokenizing-for-registry and does **not** record. Use for one-shot calls you do not expect to repeat. |
+| `agent_probabilities` | `dict[str, float]` or null | no | `null` | Caller's forecast: for each agent, the probability it fires soon. Feeds the cross-request eviction policy — when the GPU block pool runs short, blocks are drained starting from the agent with the lowest aggregated probability. Omit to abstain. See [`agent_eviction_policy.md`](agent_eviction_policy.md) for the ranking logic. |
 
 ### Behaviour
 
@@ -205,8 +206,8 @@ prefixes through the engine as zero-output phantom requests.
 |---|---|---|---|---|
 | `agent_id` | string (1–128) | **yes** | — | Selects which agent's prefixes to warm. |
 | `prefetch_top_k` | int ≥ 0 or null | no | `null` (= all) | Cap on how many of the agent's most-recently-used prefixes to warm. `null` warms **every** prefix the registry has for this agent. `0` is a no-op. |
-| `agent_cache_salt` | string (≤256) or null | no | `"agent::<agent_id>"` | Should match whatever salt was used at chat time, or LMCache will miss. |
 | `wait` | bool | no | `true` | `true` → block until every phantom finishes (APC is warm on return). `false` → fire-and-forget; server returns as soon as phantoms are queued. |
+| `agent_probabilities` | `dict[str, float]` or null | no | `null` (= self-vote of `{agent_id: 1.0}`) | Forecast that every phantom this call submits will carry. Lets the eviction policy keep the phantom's blocks tagged with `agent_id` and contribute to the cross-request aggregator while the phantom is in flight. Omit to fall back to the minimal self-vote. See [`agent_eviction_policy.md`](agent_eviction_policy.md). |
 
 ### Behaviour
 
@@ -354,14 +355,19 @@ of agent traffic, leave it on.
 
 ### Cache salt
 
-`agent_cache_salt` is exposed for advanced sharing:
+`agent_cache_salt` is exposed for advanced sharing on the **chat**
+endpoint only:
 - Default (`"agent::<agent_id>"`) means each agent's prefixes are
   isolated in LMCache.
 - Set the **same** explicit salt across multiple agents to make them
   share LMCache entries (e.g. several agents that genuinely share a
   static system preamble).
-- Whatever salt you used at chat time **must** be the same one you
-  pass at prefetch time, or LMCache misses on the warm.
+
+The **prefetch** endpoint does not accept a salt — phantoms intentionally
+omit `cache_salt` so the phantom's hash and the chat's lookup hash
+agree on the same prefix-cache key. If you customised the chat salt,
+the matching phantom still hits because LMCache derives the lookup key
+from the hash that was registered at warm time.
 
 ---
 
@@ -411,10 +417,11 @@ curl -s http://localhost:8000/v1/agents/registry_stats | python3 -m json.tool
    error — you need to issue one chat per `(agent_id, prefix)` to seed
    the registry.
 
-3. **Salt drift.** If you pass `agent_cache_salt` only at prefetch
-   time and not at chat time (or vice versa), the LMCache key won't
-   match and the warm will miss. Either pass it in both places, or in
-   neither.
+3. **Salt is chat-only.** `agent_cache_salt` is accepted only on the
+   chat endpoint. The prefetch endpoint has no salt parameter:
+   phantoms must omit `cache_salt` to keep the prefix-hash aligned
+   with the chat's lookup. Customise the chat salt freely; you don't
+   pass anything at prefetch time.
 
 4. **`record_in_registry=false` plus prefetch.** A chat that didn't
    record won't show up in the next prefetch. The registry is

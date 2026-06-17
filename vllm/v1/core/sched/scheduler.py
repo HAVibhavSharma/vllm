@@ -51,11 +51,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.agent_prefetch.eviction import (
-    DEFAULT_EVICTION_THRESHOLD,
-    DEFAULT_EVICTION_WINDOW,
-    get_eviction_policy,
-)
+from vllm.v1.agent_prefetch.eviction import get_eviction_policy
 from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
@@ -1988,10 +1984,6 @@ class Scheduler(SchedulerInterface):
             request_id=request.request_id,
             agent_id=agent_id,
             agent_probabilities=agent_probabilities,
-            window=request.eviction_window or DEFAULT_EVICTION_WINDOW,
-            threshold=request.eviction_threshold
-            if request.eviction_threshold is not None
-            else DEFAULT_EVICTION_THRESHOLD,
         )
 
     def finish_requests(

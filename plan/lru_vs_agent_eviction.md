@@ -64,10 +64,10 @@ The new policy turns each of the five problems into a tractable case.
 | Thrashes on cycles | A predicted hand-off keeps the next agent's blocks pinned. |
 | Punishes the long tail | A quiet-but-likely agent can declare itself, keeping its prefix warm. |
 
-The fallback story is important too: if no forecast is supplied, or all
-forecasts have expired (TTL), the policy degrades back to plain LRU. There
-is no scenario where it does worse than the default — only scenarios where
-it does better.
+The fallback story is important too: if no forecast is supplied, or
+every live request has finished, the policy degrades back to plain LRU.
+There is no scenario where it does worse than the default — only
+scenarios where it does better.
 
 ---
 
@@ -201,7 +201,7 @@ For every run, capture:
    - Treatment pass: start vLLM with the same model and the same workload,
      this time sending the probability payload.
 4. **Snapshot eviction stats** every 5 seconds during the run to chart
-   `tagged_blocks` and `low_probability_agents` over time.
+   `tagged_blocks` and `tracked_agents` over time.
 5. **Plot**: side-by-side bar charts of hit rate and TTFT per scenario,
    plus a time-series chart of `tagged_blocks` to show the policy at work.
 
@@ -211,7 +211,8 @@ For every run, capture:
 
 - **The forecast has to be accurate.** If the probabilities are nonsense,
   the policy can do mild harm (evict blocks that turn out to be needed).
-  The TTL and the fallback to LRU bound this damage, but the demo should
+  The fallback to LRU bounds this damage (votes die with their requests,
+  so a stale forecast can't outlive its caller), but the demo should
   also include a "noisy forecast" scenario to show graceful degradation.
 - **Cache sizing matters.** If the cache is large enough to hold every
   agent's prefix, there's nothing to evict and both policies tie. The demo
