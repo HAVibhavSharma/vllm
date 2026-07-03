@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -63,6 +64,30 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+# Environment variable that enables full-hit-only lookups. When set to a
+# truthy value ("1", "true", "yes", "on"; case-insensitive), a lookup that
+# matches only part of the chunk-aligned prompt prefix is reported to the
+# scheduler as a complete miss instead of a partial hit, so KV is only ever
+# loaded from LMCache when the whole prefix can be served. Read scheduler-side
+# in the vLLM process (this connector), not the LMCache server process.
+FULL_HIT_ONLY_ENV_VAR = "LMCACHE_MP_FULL_HIT_ONLY"
+
+
+def _full_hit_only_enabled() -> bool:
+    """Whether full-hit-only mode is enabled via the environment.
+
+    Returns:
+        True when ``LMCACHE_MP_FULL_HIT_ONLY`` is set to "1", "true", "yes"
+        or "on" (case-insensitive, surrounding whitespace ignored); False
+        when it is unset or holds any other value.
+    """
+    return os.getenv(FULL_HIT_ONLY_ENV_VAR, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 # Helper functions
@@ -517,6 +542,15 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 heartbeat_interval,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            # Full-hit-only mode: report partial prefix hits as misses so KV
+            # is only loaded when the whole chunk-aligned prefix is available.
+            self._full_hit_only = _full_hit_only_enabled()
+            if self._full_hit_only:
+                logger.info(
+                    "%s is enabled: partial prefix hits will be reported as "
+                    "misses and never loaded from LMCache",
+                    FULL_HIT_ONLY_ENV_VAR,
+                )
         elif self.role == KVConnectorRole.WORKER:
             self.worker_adapter = create_worker_adapter(
                 server_url,
@@ -786,6 +820,38 @@ class LMCacheMPConnector(KVConnectorBase_V1):
 
         if ret == 0:
             return 0, False
+
+        # Full-hit-only: report a partial prefix hit as a complete miss so KV
+        # is only ever loaded when the whole chunk-aligned prefix is available.
+        if self._full_hit_only:
+            chunk_tokens = (
+                self.scheduler_adapter.num_blocks_per_chunk() * self.vllm_block_size
+            )
+            aligned_end = (len(request.all_token_ids) // chunk_tokens) * chunk_tokens
+            if ret < aligned_end:
+                logger.info(
+                    "Rejecting partial prefix hit for request %s: %d/%d tokens "
+                    "matched (%s is enabled)",
+                    request.request_id,
+                    ret,
+                    aligned_end,
+                    FULL_HIT_ONLY_ENV_VAR,
+                )
+                # Release the read locks the lookup acquired on the matched
+                # chunks so they do not linger until TTL. The vendored fallback
+                # adapter lacks this method, so guard before calling.
+                free_lookup_locks = getattr(
+                    self.scheduler_adapter, "free_lookup_locks", None
+                )
+                if free_lookup_locks is not None:
+                    free_lookup_locks(
+                        token_ids=list(request.all_token_ids),
+                        start=0,
+                        end=ret,
+                        request_id=request.request_id,
+                        cache_salt=tracker.cache_salt,
+                    )
+                return 0, False
 
         assert (
             ret % (self.scheduler_adapter.num_blocks_per_chunk() * self.vllm_block_size)
