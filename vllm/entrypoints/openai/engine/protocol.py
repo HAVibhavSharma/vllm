@@ -100,6 +100,9 @@ class ModelList(OpenAIBaseModel):
 
 class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
+    # Prompt tokens actually computed locally during prefill
+    # (prompt_tokens - cached_tokens).
+    computed_tokens: int | None = None
 
 
 class UsageInfo(OpenAIBaseModel):

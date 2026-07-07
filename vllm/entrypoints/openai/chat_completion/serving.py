@@ -428,6 +428,7 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        num_computed_tokens = None
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
@@ -527,6 +528,7 @@ class OpenAIServingChat(OpenAIServing):
                 # response (by the try...catch).
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
+                    num_computed_tokens = res.num_computed_tokens
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
@@ -1092,9 +1094,12 @@ class OpenAIServingChat(OpenAIServing):
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
+                if self.enable_prompt_tokens_details and (
+                    num_cached_tokens or num_computed_tokens
+                ):
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
-                        cached_tokens=num_cached_tokens
+                        cached_tokens=num_cached_tokens,
+                        computed_tokens=num_computed_tokens,
                     )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
@@ -1500,9 +1505,12 @@ class OpenAIServingChat(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+        if self.enable_prompt_tokens_details and (
+            final_res.num_cached_tokens or final_res.num_computed_tokens
+        ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=final_res.num_cached_tokens
+                cached_tokens=final_res.num_cached_tokens,
+                computed_tokens=final_res.num_computed_tokens,
             )
 
         request_metadata.final_usage_info = usage
