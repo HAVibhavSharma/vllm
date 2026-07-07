@@ -105,6 +105,10 @@ class RequestOutput:
         num_cached_tokens: The number of tokens with prefix cache hit.
         num_computed_tokens: The number of prompt tokens actually computed
             locally during prefill (num_prompt_tokens - num_cached_tokens).
+        num_local_cached_tokens: The number of prompt tokens served from the
+            local prefix cache (prefix-cache hits).
+        num_external_cached_tokens: The number of prompt tokens fetched via
+            external KV transfer (e.g. the LMCache connector).
         kv_transfer_params: The params for remote K/V transfer.
     """
 
@@ -122,6 +126,8 @@ class RequestOutput:
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
         num_computed_tokens: int | None = None,
+        num_local_cached_tokens: int | None = None,
+        num_external_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
@@ -144,6 +150,8 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.num_computed_tokens = num_computed_tokens
+        self.num_local_cached_tokens = num_local_cached_tokens
+        self.num_external_cached_tokens = num_external_cached_tokens
         self.kv_transfer_params = kv_transfer_params
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
@@ -189,7 +197,9 @@ class RequestOutput:
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
             f"num_cached_tokens={self.num_cached_tokens}, "
-            f"num_computed_tokens={self.num_computed_tokens})"
+            f"num_computed_tokens={self.num_computed_tokens}, "
+            f"num_local_cached_tokens={self.num_local_cached_tokens}, "
+            f"num_external_cached_tokens={self.num_external_cached_tokens})"
         )
 
 

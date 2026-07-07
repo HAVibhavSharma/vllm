@@ -179,6 +179,8 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
         self.num_computed_tokens = 0
+        self.num_local_cached_tokens = 0
+        self.num_external_cached_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -399,6 +401,8 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             num_computed_tokens=self.num_computed_tokens,
+            num_local_cached_tokens=self.num_local_cached_tokens,
+            num_external_cached_tokens=self.num_external_cached_tokens,
             metrics=self.stats,
         )
 
@@ -655,6 +659,12 @@ class OutputProcessor:
                     req_state.num_computed_tokens = (
                         engine_core_output.prefill_stats.num_computed_tokens
                     )
+                    req_state.num_local_cached_tokens = (
+                        engine_core_output.prefill_stats.num_local_cached_tokens
+                    )
+                    req_state.num_external_cached_tokens = (
+                        engine_core_output.prefill_stats.num_external_cached_tokens
+                    )
                 req_state.is_prefilling = False
 
             if pooling_output is None:
@@ -846,6 +856,8 @@ class OutputProcessor:
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
             num_computed_tokens=req_state.num_computed_tokens,
+            num_local_cached_tokens=req_state.num_local_cached_tokens,
+            num_external_cached_tokens=req_state.num_external_cached_tokens,
         )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 

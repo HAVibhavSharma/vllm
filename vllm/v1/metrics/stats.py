@@ -246,6 +246,10 @@ class FinishedRequestStats:
     # num_prompt_tokens - num_cached_tokens. Mirrors
     # PrefillStats.num_computed_tokens.
     num_computed_tokens: int = 0
+    # Prompt tokens served from the local prefix cache (prefix-cache hits).
+    num_local_cached_tokens: int = 0
+    # Prompt tokens fetched via external KV transfer (e.g. LMCache connector).
+    num_external_cached_tokens: int = 0
     prefix_cache_hit_rate: float = 0.0
 
 
@@ -449,6 +453,8 @@ class IterationStats:
         req_stats: RequestStateStats,
         num_cached_tokens: int = 0,
         num_computed_tokens: int = 0,
+        num_local_cached_tokens: int = 0,
+        num_external_cached_tokens: int = 0,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
 
@@ -497,6 +503,8 @@ class IterationStats:
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
             num_computed_tokens=num_computed_tokens,
+            num_local_cached_tokens=num_local_cached_tokens,
+            num_external_cached_tokens=num_external_cached_tokens,
             prefix_cache_hit_rate=prefix_cache_hit_rate,
         )
         self.finished_requests.append(finished_req)

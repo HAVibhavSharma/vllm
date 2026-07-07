@@ -103,6 +103,10 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     # Prompt tokens actually computed locally during prefill
     # (prompt_tokens - cached_tokens).
     computed_tokens: int | None = None
+    # Prompt tokens served from the local prefix cache (prefix-cache hits).
+    local_cached_tokens: int | None = None
+    # Prompt tokens fetched via external KV transfer (e.g. LMCache connector).
+    external_cached_tokens: int | None = None
 
 
 class UsageInfo(OpenAIBaseModel):
