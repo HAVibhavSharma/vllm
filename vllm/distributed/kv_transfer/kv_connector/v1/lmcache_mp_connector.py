@@ -873,19 +873,6 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         )
         return need_to_load, need_to_load > 0
 
-    def get_last_external_hit_tokens(self, request: "Request") -> int | None:
-        """Full LMCache prefix hit for this request (in tokens), including the
-        portion that also overlaps vLLM's local prefix cache. This is `ret`
-        from the last `get_num_new_matched_tokens` lookup, stashed on the
-        tracker as ``num_lmcache_hit_blocks``. Used for stats attribution so
-        prefetched tokens are credited to the external source even when the
-        transfer delta (`need_to_load`) is zero. See the base method.
-        """
-        tracker = self.request_trackers.get(request.request_id)
-        if tracker is None:
-            return None
-        return tracker.num_lmcache_hit_blocks * self.vllm_block_size
-
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
