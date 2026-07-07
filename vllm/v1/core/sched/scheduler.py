@@ -824,10 +824,33 @@ class Scheduler(SchedulerInterface):
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
+                        # Attribution: credit tokens prefetched from the
+                        # external cache to "external" even when they are also
+                        # resident in the local prefix cache. The connector's
+                        # num_external_computed_tokens is only the still-to-
+                        # transfer delta (ret - local), which collapses to 0
+                        # once a prefetch lands in the local cache. The full
+                        # external hit (ret) is reported via
+                        # get_last_external_hit_tokens; the overlap it covers is
+                        # moved out of the local bucket. This preserves the
+                        # total cached count (recomputed is unchanged).
+                        num_external_cached = num_external_computed_tokens
+                        if self.connector is not None:
+                            external_hit = (
+                                self.connector.get_last_external_hit_tokens(request)
+                            )
+                            if external_hit is not None:
+                                num_external_cached = max(
+                                    num_external_cached,
+                                    min(external_hit, request.num_prompt_tokens),
+                                )
+                        num_local_cached = max(
+                            0, num_new_local_computed_tokens - num_external_cached
+                        )
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
+                            num_local_cached_tokens=num_local_cached,
+                            num_external_cached_tokens=num_external_cached,
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0

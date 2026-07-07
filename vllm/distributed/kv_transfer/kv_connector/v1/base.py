@@ -502,6 +502,24 @@ class KVConnectorBase_V1(ABC):
         """
         return []
 
+    def get_last_external_hit_tokens(self, request: "Request") -> int | None:
+        """Return the total number of prompt tokens whose KV is available in
+        the external cache for `request` (the full leading-prefix hit),
+        *including* tokens that also happen to be resident in vLLM's local
+        prefix cache.
+
+        This differs from `get_num_new_matched_tokens`, which returns only the
+        tokens that still need to be transferred (the amount *beyond* the local
+        prefix-cache hit). For stats/attribution we want the full external hit,
+        so that tokens prefetched from the external cache are credited to the
+        external source even after they land in the local prefix cache and the
+        transfer delta collapses to zero.
+
+        The default returns `None`; callers should then fall back to the
+        scheduler's `num_external_computed_tokens`.
+        """
+        return None
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
