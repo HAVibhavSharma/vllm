@@ -1,5 +1,27 @@
 # Agent-Scoped KV Prefix Prefetch — Design & Implementation Plan
 
+> **⚠️ Status: IMPLEMENTED — this document is the original design plan and
+> parts of it have drifted from the as-built code.** The sections below are kept
+> for design rationale. Where the shipped implementation differs, the
+> **As-built deltas** table is authoritative. Read it first.
+>
+> ### As-built deltas (code vs. this plan)
+>
+> | Area | This plan says | Actually shipped |
+> |---|---|---|
+> | HTTP surface | One route `POST /v1/agents/chat/completions` that *both* fires prefetches and services the chat. | Split into **four** routes: `POST /v1/agents/chat/completions` (records the prompt's prefix in the registry only — **does not** fire phantom prefetches), `POST /v1/agents/prefetch` (the explicit cache-warming route), `POST /v1/agents/reset_prefix_cache`, and `GET /v1/agents/registry_stats`. |
+> | Prefetch request body | `agent_id`, `prefetch_top_k`, `agent_cache_salt`, `record_in_registry`. | `AgentPrefetchRequest`: `agent_id`, `prefetch_top_k?`, `agent_cache_salt?`, `wait` (block until loads finish), plus **new** `agent_kind: "react" \| "non-react"` and `text` (seed text rendered to token ids and recorded before fan-out). `non-react` forces fan-out to 1. |
+> | Route module | New single file `vllm/entrypoints/openai/agent_api.py`. | Package `vllm/entrypoints/openai/agent_chat/` (`api_router.py`, `protocol.py`, `__init__.py`). Mounted via `attach_router(app)` from `vllm/entrypoints/openai/generate/api_router.py`. Registry + submitter are lazily attached to `app.state` (not module globals). |
+> | `agent_prefetch` package | `registry.py`, `hashing.py`, `submitter.py`. | Landed as planned: `AgentPrefixRegistry` + `PrefixDescriptor` in `registry.py`, `hashing.py`, `submitter.py`, `__init__.py` under `vllm/v1/agent_prefetch/`. |
+> | Submitter API | `submit(token_ids, cache_salt, agent_id)`, `max_tokens=0`. | `PhantomPrefetchSubmitter.submit(*, agent_id, token_ids, prefix_hash, cache_salt) -> asyncio.Task \| None` (keyword-only). Uses **`max_tokens=1`** (the §6.5 fallback), not `0`. Request id from `build_prefetch_request_id(agent_id, prefix_hash)` → `prefetch::<agent_id>::<hash16>`. |
+> | Scheduler hook (§6.3) | Branch inside the `connector.get_finished()` consumer calling `_finish_request`. | Landed in `_update_from_kv_xfer_finished` via helpers `_is_prefetch_only_request` / `_finalize_prefetch_only_request` (`vllm/v1/core/sched/scheduler.py` ≈2291–2369). |
+> | `kv_cache_manager.py` tweak (§6.2) | Add a `prefetch_only` branch to skip the `num_tokens - 1` cap. | **Not implemented / not needed** — `kv_cache_manager.py:208` is still `max_cache_hit_length = request.num_tokens - 1`. Using `max_tokens=1` made the tweak unnecessary. |
+> | Connector flag (§6.1) | `prefetch_only` on the request tracker. | Shipped: `prefetch_only` handled in `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py`. |
+>
+> Sections **§8 (config flags)**, **§9 (Prometheus metrics)** and the
+> `prefetch_meta` response block in **§5.2** describe intended surfaces that may
+> not match what shipped — verify against code before relying on them.
+
 ## 1. Goal
 
 Add a new vLLM API path that:
@@ -245,6 +267,11 @@ Populate it in `_get_or_create_request_tracker` from
 
 ### 6.2 Skip "minus one" cap for phantom prefetches
 
+> **Not shipped.** This tweak was proposed but not implemented — the phantom
+> path uses `max_tokens=1` instead, so `kv_cache_manager.py:208` still reads
+> `max_cache_hit_length = request.num_tokens - 1` unchanged. The rest of this
+> subsection is retained for context only.
+
 **File:** `vllm/v1/core/kv_cache_manager.py:208`
 
 Today:
@@ -294,7 +321,11 @@ tokens, return).
 
 ### 6.5 Request build path
 
-**File:** `vllm/entrypoints/openai/protocol.py` or wherever
+> **As-built:** the phantom request is built in
+> `vllm/v1/agent_prefetch/submitter.py` (`PhantomPrefetchSubmitter.submit`), not
+> in `openai/protocol.py`. It ships with `max_tokens=1` (see below), not `0`.
+
+**File (planned):** `vllm/entrypoints/openai/protocol.py` or wherever
 `SamplingParams`/`Request` are built from the HTTP body.
 
 The new agent endpoint constructs phantom requests with:
@@ -327,11 +358,22 @@ Skip for v1 unless measurements show eviction churn.
 
 ## 7. New module layout
 
+> **As-built.** The layout below is the *shipped* tree. The plan originally
+> proposed a single `vllm/entrypoints/openai/agent_api.py`; the routes actually
+> live in the `agent_chat/` package described here.
+
 ```
 vllm/
 ├── entrypoints/
 │   └── openai/
-│       └── agent_api.py            # NEW. Route + Pydantic models.
+│       ├── agent_chat/             # NEW package (was planned as agent_api.py)
+│       │   ├── __init__.py
+│       │   ├── api_router.py       # 4 routes + attach_router(app); lazy
+│       │   │                       #   registry/submitter on app.state
+│       │   └── protocol.py         # AgentChatCompletionRequest,
+│       │                           #   AgentPrefetchRequest, AgentKind
+│       └── generate/
+│           └── api_router.py       # calls attach_router(app) to mount routes
 └── distributed/
     └── kv_transfer/
         └── kv_connector/
@@ -340,14 +382,14 @@ vllm/
 
 vllm/v1/
 ├── core/
-│   ├── kv_cache_manager.py         # max_cache_hit_length tweak
+│   ├── kv_cache_manager.py         # (planned tweak NOT applied — see §6.2)
 │   └── sched/
-│       └── scheduler.py            # finish phantom requests early
+│       └── scheduler.py            # _is/_finalize_prefetch_only_request(...)
 └── agent_prefetch/                  # NEW package
     ├── __init__.py
     ├── registry.py                 # AgentPrefixRegistry + PrefixDescriptor
     ├── hashing.py                  # prefix_hash() consistent with LMCache
-    └── submitter.py                # submit_phantom_prefetch(...)
+    └── submitter.py                # PhantomPrefetchSubmitter, max_tokens=1
 ```
 
 ### 7.1 `vllm/v1/agent_prefetch/hashing.py`
@@ -397,7 +439,13 @@ class PhantomPrefetchSubmitter:
 Dedup is important: a single agent often shares the same prefix across many
 near-simultaneous calls; we don't want to submit 20 copies.
 
-### 7.3 `vllm/entrypoints/openai/agent_api.py`
+### 7.3 `vllm/entrypoints/openai/agent_chat/api_router.py`
+
+> **As-built note.** In the shipped code, prefetch fan-out lives behind the
+> separate `POST /v1/agents/prefetch` route (handler around
+> `api_router.py:377`), while `POST /v1/agents/chat/completions`
+> (`api_router.py:281`) only records the prompt prefix in the registry. The
+> illustrative handler below combined both; it no longer reflects one route.
 
 ```python
 @router.post("/v1/agents/chat/completions",
