@@ -135,6 +135,9 @@ def extract_file(path, refresh, coverage):
                          "config": pos.get("config")},
             "request": {"params": params},
             "raw_inputs": run.get("inputs") or {},
+            # rendered exactly like replay outputs (content + tool calls),
+            # for the byte-to-byte match test
+            "original_output": rl.trace_analyser().out_text(run),
         }
         os.makedirs(rl.CASES_DIR, exist_ok=True)
         with open(out_path, "w") as f:

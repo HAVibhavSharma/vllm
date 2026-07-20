@@ -403,6 +403,7 @@ def replay_case(case, n_tries=None):
                                    resp, text, started, ended))
     div = divergence(outputs)
     noise = noise_threshold()
+    original = case.get("original_output")
     result = {
         "case_id": case["case_id"],
         "langsmith_project": project,
@@ -411,6 +412,10 @@ def replay_case(case, n_tries=None):
         "noise_threshold": noise,
         "reproduced": div > noise,
         "distinct_outputs": len(set(outputs)),
+        "outputs": outputs,
+        "original_output": original,
+        "exact_match_tries": (sum(o == original for o in outputs)
+                              if original is not None else None),
         "original_output_divergence":
             case.get("original", {}).get("output_divergence"),
         "run_ids": run_ids,

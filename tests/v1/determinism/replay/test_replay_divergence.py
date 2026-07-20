@@ -29,8 +29,9 @@ def test_cases_extracted():
                     "cases/coverage_summary.json)")
 
 
-def test_replay_is_deterministic_in_isolation(case, replay_env):
-    result = rl.replay_case(case)
+def test_replay_is_deterministic_in_isolation(case, replay_env,
+                                              replay_results):
+    result = replay_results(case)
     assert not result["reproduced"], (
         "Divergence REPRODUCED in isolation for %s: divergence=%.4f > "
         "noise=%.4f over %d sequential tries (%d distinct outputs; "
@@ -41,3 +42,23 @@ def test_replay_is_deterministic_in_isolation(case, replay_env):
             result["distinct_outputs"],
             result["original_output_divergence"] or 0,
             result["langsmith_project"]))
+
+
+def test_replay_matches_trace_output_exactly(case, replay_env,
+                                             replay_results):
+    """Byte-to-byte comparison against the ORIGINAL trace output: every
+    replay try must equal the source run's output exactly (rendered the
+    same way: content + tool calls). Stricter than the divergence test —
+    the endpoint can be self-consistent yet produce a different answer
+    than it did in production."""
+    if case.get("original_output") is None:
+        pytest.skip("case predates original_output capture — re-run "
+                    "extract_cases.py --refresh")
+    result = replay_results(case)
+    n, matched = result["n_tries"], result["exact_match_tries"]
+    assert matched == n, (
+        "Replay output differs from the original trace for %s: only %d/%d "
+        "tries matched byte-to-byte (LangSmith project %r; outputs in "
+        "results/%s.json)." % (case["case_id"], matched, n,
+                               result["langsmith_project"],
+                               case["case_id"]))

@@ -18,6 +18,20 @@ def pytest_generate_tests(metafunc):
 
 
 @pytest.fixture(scope="session")
+def replay_results():
+    """Session-wide cache: each case is replayed (paid LLM calls) exactly
+    once, even though two tests judge its outputs."""
+    cache = {}
+
+    def get(case):
+        if case["case_id"] not in cache:
+            cache[case["case_id"]] = rl.replay_case(case)
+        return cache[case["case_id"]]
+
+    return get
+
+
+@pytest.fixture(scope="session")
 def replay_env():
     """Fail fast with a clear message when replay credentials are absent."""
     missing = []
