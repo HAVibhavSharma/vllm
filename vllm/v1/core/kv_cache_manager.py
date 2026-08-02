@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.node_eviction import maybe_build_controller
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -149,6 +150,18 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        # Node-aware eviction. Off unless VLLM_NODE_EVICTION_POLICY is set;
+        # when off this is None and every call site below is skipped, so the
+        # engine reproduces upstream behaviour exactly. This is the layer
+        # that holds the Request, i.e. where the policy's *inputs* live —
+        # the decisions themselves happen in BlockPool.
+        self.node_eviction = maybe_build_controller(
+            block_pool=self.block_pool,
+            num_kv_cache_groups=self.num_kv_cache_groups,
+        )
+        if self.node_eviction is not None:
+            self.block_pool.attach_node_eviction(self.node_eviction)
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -321,6 +334,14 @@ class KVCacheManager:
             new_computed_block_list = new_computed_blocks.blocks
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
+
+        if self.node_eviction is not None and new_computed_block_list:
+            # A prefix hit is the signal that a speculative (prefetch-created)
+            # index entry was a correct prediction. This is the only layer
+            # holding both the Request and new_computed_blocks: BlockPool.touch
+            # sees only blocks, and allocate_new_computed_blocks sees only a
+            # request_id (02 §5 part 2).
+            self.node_eviction.on_prefix_hit(request, new_computed_block_list)
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
@@ -539,3 +560,37 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
+        if self.node_eviction is not None:
+            # The periodic re-score. Runs on the thread that owns BlockPool,
+            # inside the engine-core loop, so it needs no locking and no
+            # background work; it is wall-clock paced and skips itself in the
+            # common case (01 §6 Rule 4).
+            self.node_eviction.maybe_tick()
+
+    def get_node_value(self, request: Request) -> float | None:
+        """The O(1) per-request consult (02 §2).
+
+        One lookup of a value the tick already computed — never a score
+        computed here, never a Redis read, never a walk of the free queue.
+        Returns None when the policy has no opinion, which callers read as
+        "use the default".
+        """
+        if self.node_eviction is None:
+            return None
+        return self.node_eviction.get_value_for_request(request)
+
+    def shutdown(self) -> None:
+        """Release anything the eviction policy holds.
+
+        The subscriber thread is a daemon, so the process can exit without
+        this — but the decision log is a buffered file handle and would
+        otherwise lose its tail.
+        """
+        if self.node_eviction is not None:
+            self.node_eviction.close()
+
+    def get_node_eviction_stats(self) -> dict[str, float | int | bool] | None:
+        """Policy counters, or None when the policy is off."""
+        if self.node_eviction is None:
+            return None
+        return self.node_eviction.stats()

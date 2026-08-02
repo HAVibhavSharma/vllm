@@ -4,6 +4,8 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.loggers import FileStatLogger
 from vllm.v1.metrics.stats import (
@@ -31,6 +33,7 @@ def test_finished_request_stats_include_request_logger_fields():
         job_id="job-1",
         agent_id="planner",
         langgraph_node="node-1",
+        call_type="tavily:summary",
         input_text="hello prompt",
         output_text="hello output",
         num_prompt_tokens=20,
@@ -44,6 +47,7 @@ def test_finished_request_stats_include_request_logger_fields():
     assert finished_request.job_id == "job-1"
     assert finished_request.agent_id == "planner"
     assert finished_request.langgraph_node == "node-1"
+    assert finished_request.call_type == "tavily:summary"
     assert finished_request.input_text == "hello prompt"
     assert finished_request.output_text == "hello output"
     assert finished_request.num_cached_tokens == 5
@@ -52,6 +56,11 @@ def test_finished_request_stats_include_request_logger_fields():
     assert finished_request.prefill_time == 0.3
     assert finished_request.inference_time == 0.9
     assert finished_request.decode_time == 0.6
+    # Absolute wall-clock timestamps: the Trace Analyser infers tool
+    # execution time from the gap between two requests of a job, and a gap
+    # cannot be derived from durations.
+    assert finished_request.arrival_ts == 100.0
+    assert finished_request.finish_ts == pytest.approx(101.6)
 
 
 def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
@@ -66,6 +75,7 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             job_id="1",
             agent_id="executor",
             langgraph_node="node-2",
+            call_type="plan",
             input_text="user prompt",
             output_text="model output",
             e2e_latency=3.28,
@@ -97,6 +107,7 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             "job_id": "1",
             "agent_id": "executor",
             "langgraph_node": "node-2",
+            "call_type": "plan",
             "input_text": "user prompt",
             "output_text": "model output",
             "finish_reason": "stop",
@@ -104,12 +115,17 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             "num_prompt_tokens": "489",
             "num_generation_tokens": "95",
             "num_cached_tokens": "0",
+            "num_computed_tokens": "0",
+            "num_local_cached_tokens": "0",
+            "num_external_cached_tokens": "0",
             "prefix_cache_hit_rate": "0.0",
             "queued_time": "0.02",
             "prefill_time": "0.6",
             "inference_time": "2.82",
             "decode_time": "2.22",
             "max_tokens_param": "10000",
+            "arrival_ts": "0.0",
+            "finish_ts": "0.0",
         }
     ]
 
@@ -121,6 +137,7 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             "job_id": "1",
             "agent_id": "executor",
             "langgraph_node": "node-2",
+            "call_type": "plan",
             "input_text": "user prompt",
             "output_text": "model output",
             "finish_reason": "stop",
@@ -128,12 +145,17 @@ def test_file_stat_logger_writes_csv_and_jsonl(monkeypatch, tmp_path: Path):
             "num_prompt_tokens": 489,
             "num_generation_tokens": 95,
             "num_cached_tokens": 0,
+            "num_computed_tokens": 0,
+            "num_local_cached_tokens": 0,
+            "num_external_cached_tokens": 0,
             "prefix_cache_hit_rate": 0.0,
             "queued_time": 0.02,
             "prefill_time": 0.6,
             "inference_time": 2.82,
             "decode_time": 2.22,
             "max_tokens_param": 10000,
+            "arrival_ts": 0.0,
+            "finish_ts": 0.0,
         }
     ]
 

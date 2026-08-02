@@ -181,8 +181,24 @@ class FreeKVCacheBlockQueue:
         blocks: A list of KVCacheBlock objects.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+    def __init__(
+        self, blocks: list[KVCacheBlock], track_fresh: bool = False
+    ) -> None:
         self.num_free_blocks = len(blocks)
+
+        # Exact count of queued blocks that carry no block hash ("fresh"
+        # blocks). Only maintained when `track_fresh` is set, which the
+        # node-aware eviction policy turns on; with the policy off every
+        # counter update below is skipped and this class behaves exactly as
+        # it did before. See plan/new-eviction/01-redis-integration.md §6
+        # Rule 1: the splice inserts at the *absolute* head, so it must not
+        # run while unused blocks are still available.
+        self.track_fresh = track_fresh
+        self.num_free_fresh = (
+            sum(1 for block in blocks if block.block_hash is None)
+            if track_fresh
+            else 0
+        )
 
         # Initialize doubly links of consecutive blocks
         for i in range(self.num_free_blocks):
@@ -246,6 +262,8 @@ class FreeKVCacheBlockQueue:
         first_block.prev_free_block = first_block.next_free_block = None
 
         self.num_free_blocks -= 1
+        if self.track_fresh and first_block.block_hash is None:
+            self.num_free_fresh -= 1
         return first_block
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
@@ -279,6 +297,11 @@ class FreeKVCacheBlockQueue:
             # the new first block.
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
+
+        if self.track_fresh:
+            self.num_free_fresh -= sum(
+                1 for block in ret if block.block_hash is None
+            )
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -300,6 +323,8 @@ class FreeKVCacheBlockQueue:
         # Remove the block from the linked list.
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
+        if self.track_fresh and block.block_hash is None:
+            self.num_free_fresh -= 1
 
     def append(self, block: KVCacheBlock) -> None:
         """Put a block back into the free list and increase
@@ -323,6 +348,8 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_tail.prev_free_block = block
 
         self.num_free_blocks += 1
+        if self.track_fresh and block.block_hash is None:
+            self.num_free_fresh += 1
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
@@ -348,6 +375,101 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_tail.prev_free_block = last_block
 
         self.num_free_blocks += len(blocks)
+        if self.track_fresh:
+            self.num_free_fresh += sum(
+                1 for block in blocks if block.block_hash is None
+            )
+
+    def appendleft(self, block: KVCacheBlock) -> None:
+        """Put a block back at the *head* of the free list, i.e. make it the
+        next block to be evicted, and increase num_free_blocks by 1.
+
+        The mirror of `append`. Nothing in vLLM puts a block at the head
+        today; this exists so the node-aware eviction policy can move a
+        low-value block to the front of the eviction order without touching
+        `get_new_blocks`, which stays a plain `popleft_n`.
+
+        Args:
+            block: The block to insert at the head.
+        """
+        if self.fake_free_list_head.next_free_block is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist"
+            )
+        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+
+        # Connect the new block before the current first block.
+        block.next_free_block = first_block
+        first_block.prev_free_block = block
+
+        # Connect the fake head before the new block.
+        block.prev_free_block = self.fake_free_list_head
+        self.fake_free_list_head.next_free_block = block
+
+        self.num_free_blocks += 1
+        if self.track_fresh and block.block_hash is None:
+            self.num_free_fresh += 1
+
+    def appendleft_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Splice a list of blocks in at the *head* of the free list.
+
+        Order is **preserved**, not reversed: after this call `blocks[0]` is
+        the head of the queue and therefore the first block `popleft` will
+        return. Callers that want the worst-scoring block evicted first must
+        pass their candidates in **ascending** score order.
+
+        This is deliberately not the same convention as repeated `appendleft`
+        calls (which reverse), because an inverted eviction order has no
+        symptom other than a hit rate that looks like LRU's.
+
+        Args:
+            blocks: The blocks to insert at the head, in queue order.
+        """
+        if len(blocks) == 0:
+            return
+
+        first_block = self.fake_free_list_head.next_free_block
+        assert first_block is not None, (
+            "next_free_block of fake_free_list_head should always exist"
+        )
+
+        # Add inter-connections between consecutive blocks, walking backwards
+        # so that blocks[0] ends up adjacent to the fake head.
+        next_block = first_block
+        for block in reversed(blocks):
+            block.next_free_block = next_block
+            next_block.prev_free_block = block
+            next_block = block
+
+        # Connect the fake head to the first block of <blocks>.
+        self.fake_free_list_head.next_free_block = next_block
+        next_block.prev_free_block = self.fake_free_list_head
+
+        self.num_free_blocks += len(blocks)
+        if self.track_fresh:
+            self.num_free_fresh += sum(
+                1 for block in blocks if block.block_hash is None
+            )
+
+    def is_queued(self, block: KVCacheBlock) -> bool:
+        """Whether the block is currently linked into the free list.
+
+        Blocks that have been popped or removed have both links cleared,
+        while every queued block has a predecessor (at minimum the fake head).
+        """
+        return block.prev_free_block is not None
+
+    def on_queued_block_hash_reset(self, block: KVCacheBlock) -> None:
+        """Notify the queue that a block it holds just lost its block hash.
+
+        `BlockPool.evict_blocks` can drop the prefix-cache identity of a block
+        that is sitting in the free list, turning a cached block into a fresh
+        one without any queue operation. Without this the `num_free_fresh`
+        count would drift low and the splice gate in Rule 1 would open too
+        early.
+        """
+        if self.track_fresh and self.is_queued(block):
+            self.num_free_fresh += 1
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.

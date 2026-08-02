@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Observability (07). The one number is the score/outcome correlation: if
+it is negative the policy is anti-correlated, i.e. actively worse than LRU,
+and that is a failure with no other symptom."""
+
+import json
+
+from vllm.v1.core.node_eviction.metrics import EvictionObserver
+from vllm.v1.core.node_eviction.types import NodeKey, ScoreBreakdown
+
+RESEARCH = NodeKey("run-42", "research", "tavily:summary")
+SUPERVISOR = NodeKey("run-42", "supervisor", "plan")
+
+
+def breakdown(score: float, speculative: bool = False) -> ScoreBreakdown:
+    return ScoreBreakdown(
+        score=score,
+        prob=0.5,
+        ttnc_ms=1000.0,
+        decay=0.5,
+        e_miss_ms=180.0,
+        blocks=100,
+        speculative=speculative,
+    )
+
+
+def test_regret_is_counted_without_an_offline_join():
+    """On admission the key is already in hand, so a hit against the recent
+    ring buffer is an O(1) lookup (07 §6)."""
+    observer = EvictionObserver(regret_window_ms=10_000.0)
+    observer.record_eviction(1, [RESEARCH], breakdown(0.5), now_ms=1000.0)
+    observer.record_admission(RESEARCH, now_ms=2000.0)
+
+    assert observer.counters.evicted_then_needed_total == 1
+    assert observer.counters.evicted_then_needed_cost_ms == 180.0
+
+
+def test_an_eviction_outside_the_horizon_is_not_regret():
+    observer = EvictionObserver(regret_window_ms=1_000.0)
+    observer.record_eviction(1, [RESEARCH], breakdown(0.5), now_ms=1000.0)
+    observer.record_admission(RESEARCH, now_ms=99_000.0)
+    assert observer.counters.evicted_then_needed_total == 0
+
+
+def test_correlation_is_positive_when_the_policy_is_right():
+    """Blocks that were needed again should have scored *higher* than blocks
+    that were not."""
+    observer = EvictionObserver(regret_window_ms=10_000.0)
+    # A high-scoring block we evicted and immediately needed back.
+    observer.record_eviction(1, [RESEARCH], breakdown(10.0), now_ms=1000.0)
+    observer.record_admission(RESEARCH, now_ms=1500.0)
+    # A low-scoring block nobody wanted.
+    observer.record_eviction(2, [SUPERVISOR], breakdown(0.1), now_ms=1000.0)
+    observer.expire(now_ms=99_000.0)
+
+    assert observer.counters.score_outcome_correlation > 0
+
+
+def test_correlation_goes_negative_when_the_sign_is_inverted():
+    """The failure the whole metric exists for: the policy kept the blocks
+    nobody wanted and dropped the ones it needed."""
+    observer = EvictionObserver(regret_window_ms=10_000.0)
+    observer.record_eviction(1, [RESEARCH], breakdown(0.1), now_ms=1000.0)
+    observer.record_admission(RESEARCH, now_ms=1500.0)
+    observer.record_eviction(2, [SUPERVISOR], breakdown(10.0), now_ms=1000.0)
+    observer.expire(now_ms=99_000.0)
+
+    assert observer.counters.score_outcome_correlation < 0
+
+
+def test_an_eviction_is_classified_exactly_once():
+    """A record counted as 'needed' must not also be counted as 'not needed'
+    when it ages out, or the correlation is computed against a corrupted
+    negative class."""
+    observer = EvictionObserver(regret_window_ms=1_000.0)
+    observer.record_eviction(1, [RESEARCH], breakdown(5.0), now_ms=1000.0)
+    observer.record_admission(RESEARCH, now_ms=1500.0)
+    observer.expire(now_ms=99_000.0)
+
+    assert observer.counters.needed_count == 1
+    assert observer.counters.not_needed_count == 0
+
+
+def test_unscored_evictions_are_tracked_separately():
+    """A broken join is otherwise completely silent (03 §5)."""
+    observer = EvictionObserver()
+    observer.record_eviction(1, [], None, now_ms=1000.0)
+    observer.record_eviction(2, [RESEARCH], breakdown(1.0), now_ms=1000.0,
+                             was_spliced=True)
+    assert observer.counters.unscored_evictions_total == 1
+    assert observer.counters.unscored_eviction_ratio == 0.5
+
+
+def test_speculative_waste_is_reported():
+    """Without this ratio, a policy that protects garbage for a full TTL
+    looks identical to one that works (02 §5)."""
+    observer = EvictionObserver()
+    observer.counters.speculative_created = 4
+    observer.record_eviction(
+        1, [RESEARCH], breakdown(1.0, speculative=True), now_ms=1000.0
+    )
+    assert observer.counters.speculative_evicted_before_confirm == 1
+    assert observer.counters.speculative_waste == 0.25
+
+
+def test_decision_log_carries_the_terms_and_the_snapshot_age(tmp_path):
+    """Logging the components, not just the total, is what makes a bad score
+    diagnosable rather than merely visible. `snapshot_age_ms` separates a
+    wrong forecast from a merely late one (07 §4, §7)."""
+    path = tmp_path / "decisions.jsonl"
+    observer = EvictionObserver(decision_log_path=str(path))
+    observer.record_eviction(
+        84213,
+        [RESEARCH],
+        breakdown(0.0141),
+        now_ms=1753980000123.0,
+        prefix_pos=1487,
+        run_len=1600,
+        rank_in_splice=12,
+        snapshot_age_ms=340.0,
+        num_free_fresh=0,
+    )
+    observer.close()
+
+    line = json.loads(path.read_text().strip())
+    assert line["block_id"] == 84213
+    assert line["keys"] == [["run-42", "research", "tavily:summary"]]
+    assert line["terms"]["blocks"] == 100
+    assert line["snapshot_age_ms"] == 340.0
+    # prefix_pos near run_len is what says tail-first is holding.
+    assert line["prefix_pos"] == 1487
+    assert line["run_len"] == 1600
+
+
+def test_no_decision_log_by_default(tmp_path):
+    """Per-eviction lines are unbounded under pressure, so they cannot be the
+    production mechanism (07 §6)."""
+    observer = EvictionObserver()
+    observer.record_eviction(1, [RESEARCH], breakdown(1.0), now_ms=1.0)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_counters_serialise():
+    observer = EvictionObserver()
+    payload = observer.counters.as_dict()
+    for field in (
+        "evictions_by_score_total",
+        "evicted_then_needed_total",
+        "speculative_waste",
+        "score_outcome_correlation",
+        "policy_enabled",
+    ):
+        assert field in payload

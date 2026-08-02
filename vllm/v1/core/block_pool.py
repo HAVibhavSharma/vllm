@@ -181,6 +181,34 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Node-aware eviction policy, attached by KVCacheManager when it is
+        # switched on. While this is None every hook below is a single
+        # `is not None` check and the pool behaves exactly as upstream.
+        self.node_eviction = None
+
+    def attach_node_eviction(self, controller) -> None:
+        """Turn on the node-aware eviction policy for this pool.
+
+        Enables the exact `num_free_fresh` count on the free queue, which
+        gates the policy's re-splice: a block with no hash costs nothing to
+        consume, while destroying a cached one costs its prefix, so the
+        splice must not run while unused blocks are still queued
+        (plan/new-eviction/01-redis-integration.md §6, Rule 1).
+        """
+        self.node_eviction = controller
+        queue = self.free_block_queue
+        queue.track_fresh = True
+        queue.num_free_fresh = sum(
+            1
+            for block in queue.get_all_free_blocks()
+            if block.block_hash is None
+        )
+
+    @property
+    def num_free_fresh(self) -> int:
+        """Queued blocks carrying no block hash. Exact, not an estimate."""
+        return self.free_block_queue.num_free_fresh
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -272,6 +300,13 @@ class BlockPool:
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+
+        if self.node_eviction is not None:
+            # `new_full_blocks` is in prefix order, so the position of
+            # blocks[i] within this node's prefix is num_cached_blocks + i.
+            self.node_eviction.on_blocks_cached(
+                request, new_full_blocks, num_cached_blocks
+            )
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
@@ -371,12 +406,34 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
-        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
+        popped = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
+
+        if self.node_eviction is not None:
+            # Ground truth for the policy is free one frame later: this block
+            # is gone, and the next request for its key says whether that was
+            # a mistake (plan/new-eviction/07-observability.md §1).
+            #
+            # Deliberately outside the `popped is None` guard below. Every
+            # caller that reaches here is about to hand the block to another
+            # request or has been told it is invalid, so the index must
+            # release it either way; keeping a claim on a block whose
+            # contents are about to be overwritten would score a stale key.
+            self.node_eviction.on_block_evicted(
+                block.block_id, self.free_block_queue.num_free_fresh
+            )
+
+        if popped is None:
             # block not found in cached_block_hash_to_block,
             # eviction is not needed
             return False
 
         block.reset_hash()
+
+        if self.node_eviction is not None:
+            # `evict_blocks` can strip the hash from a block that is still
+            # queued, turning a cached block into a fresh one with no queue
+            # operation to observe.
+            self.free_block_queue.on_queued_block_hash_reset(block)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -464,6 +521,14 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        if self.node_eviction is not None:
+            # Every block hash just went away, so the index owns nothing and
+            # every queued block is now fresh.
+            self.node_eviction.on_reset_prefix_cache()
+            self.free_block_queue.num_free_fresh = (
+                self.free_block_queue.num_free_blocks
+            )
 
         if self.metrics_collector:
             self.metrics_collector.reset()

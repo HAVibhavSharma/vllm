@@ -1251,6 +1251,7 @@ _CSV_COLUMNS = [
     "job_id",
     "agent_id",
     "langgraph_node",
+    "call_type",
     "input_text",
     "output_text",
     "finish_reason",
@@ -1267,6 +1268,8 @@ _CSV_COLUMNS = [
     "inference_time",
     "decode_time",
     "max_tokens_param",
+    "arrival_ts",
+    "finish_ts",
 ]
 
 
@@ -1332,6 +1335,7 @@ class FileStatLogger(StatLoggerBase):
                 "job_id": req.job_id,
                 "agent_id": req.agent_id,
                 "langgraph_node": req.langgraph_node,
+                "call_type": req.call_type,
                 "input_text": req.input_text,
                 "output_text": req.output_text,
                 "finish_reason": str(req.finish_reason)
@@ -1350,6 +1354,11 @@ class FileStatLogger(StatLoggerBase):
                 "inference_time": req.inference_time,
                 "decode_time": req.decode_time,
                 "max_tokens_param": req.max_tokens_param,
+                # Wall clock, epoch seconds. The Trace Analyser infers tool
+                # execution time from next.arrival_ts - prev.finish_ts within
+                # one job; a gap cannot be derived from durations.
+                "arrival_ts": req.arrival_ts,
+                "finish_ts": req.finish_ts,
             }
             self._csv_writer.writerow(row)
             self._jsonl_file.write(json.dumps(row) + "\n")

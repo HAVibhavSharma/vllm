@@ -1,0 +1,8 @@
+# Optional dependencies for the node-aware KV eviction policy
+# (VLLM_NODE_EVICTION_POLICY=1). See plan/new-eviction/.
+#
+# Deliberately NOT in common.txt: the policy is off by default, and vLLM must
+# boot without redis installed. The import is guarded — with redis missing,
+# the policy indexes blocks but ranks nothing and the engine falls back to
+# LRU, logging once.
+redis >= 5.0.0

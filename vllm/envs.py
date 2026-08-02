@@ -45,6 +45,10 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_REQUEST_STATS_DIR: str | None = None
+    VLLM_NODE_EVICTION_POLICY: bool | None = None
+    VLLM_NODE_EVICTION_CONFIG: str | None = None
+    VLLM_NODE_EVICTION_REDIS_URL: str | None = None
+    VLLM_NODE_EVICTION_DECISION_LOG: str | None = None
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -720,6 +724,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, finished request stats are exported as CSV and JSONL files
     # under this directory.
     "VLLM_REQUEST_STATS_DIR": lambda: os.getenv("VLLM_REQUEST_STATS_DIR"),
+    # Node-aware KV eviction policy. Off by default: with this unset the
+    # free-block queue behaves exactly as upstream, which is the A/B baseline
+    # arm. See plan/new-eviction/.
+    "VLLM_NODE_EVICTION_POLICY": lambda: (
+        bool(int(os.environ["VLLM_NODE_EVICTION_POLICY"]))
+        if "VLLM_NODE_EVICTION_POLICY" in os.environ
+        else None
+    ),
+    # Path to a JSON file holding the policy's tunables (scoring constants,
+    # tick period, splice bound). All of them are unvalidated defaults, so
+    # they live in a file the offline replay harness can sweep.
+    "VLLM_NODE_EVICTION_CONFIG": lambda: os.getenv("VLLM_NODE_EVICTION_CONFIG"),
+    # redis://host:port/db for the importance feed. When unset the policy
+    # runs without a forecast, i.e. it indexes blocks but ranks nothing.
+    "VLLM_NODE_EVICTION_REDIS_URL": lambda: os.getenv(
+        "VLLM_NODE_EVICTION_REDIS_URL"
+    ),
+    # If set, write one JSONL line per evicted cached block to this path.
+    # Unbounded under pressure - a debugging tool, not a production one.
+    "VLLM_NODE_EVICTION_DECISION_LOG": lambda: os.getenv(
+        "VLLM_NODE_EVICTION_DECISION_LOG"
+    ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -1905,6 +1931,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        # KV eviction policy: affects block reuse, never a traced graph, so
+        # toggling it must not force a recompile.
+        "VLLM_NODE_EVICTION_POLICY",
+        "VLLM_NODE_EVICTION_CONFIG",
+        "VLLM_NODE_EVICTION_REDIS_URL",
+        "VLLM_NODE_EVICTION_DECISION_LOG",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

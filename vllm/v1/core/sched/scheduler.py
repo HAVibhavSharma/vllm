@@ -2169,6 +2169,7 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        self.kv_cache_manager.shutdown()
 
     ########################################################################
     # KV Connector Related Methods

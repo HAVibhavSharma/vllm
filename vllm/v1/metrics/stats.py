@@ -229,6 +229,7 @@ class FinishedRequestStats:
     job_id: str | None = None
     agent_id: str | None = None
     langgraph_node: str | None = None
+    call_type: str | None = None
     input_text: str | None = None
     output_text: str | None = None
     e2e_latency: float = 0.0
@@ -251,6 +252,18 @@ class FinishedRequestStats:
     # Prompt tokens fetched via external KV transfer (e.g. LMCache connector).
     num_external_cached_tokens: int = 0
     prefix_cache_hit_rate: float = 0.0
+    # Absolute wall-clock timestamps, in epoch seconds. Durations alone
+    # cannot express the gap *between* two requests of a job, which is the
+    # only signal vLLM has for tool execution time
+    # (plan/new-eviction/04-trace-analyser.md §3.2).
+    #
+    # Wall clock only: this class mixes two clocks, and the engine-core
+    # timestamps below (queued_ts, scheduled_ts, first_token_ts,
+    # last_token_ts) are monotonic. Monotonic values are meaningless across
+    # processes and across restarts, so they may only ever be exported as
+    # durations (§3.3).
+    arrival_ts: float = 0.0
+    finish_ts: float = 0.0
 
 
 @dataclass
@@ -446,6 +459,7 @@ class IterationStats:
         job_id: str | None,
         agent_id: str | None,
         langgraph_node: str | None,
+        call_type: str | None,
         input_text: str | None,
         output_text: str | None,
         num_prompt_tokens: int,
@@ -489,6 +503,7 @@ class IterationStats:
             job_id=job_id,
             agent_id=agent_id,
             langgraph_node=langgraph_node,
+            call_type=call_type,
             input_text=input_text,
             output_text=output_text,
             e2e_latency=e2e_latency,
@@ -506,6 +521,8 @@ class IterationStats:
             num_local_cached_tokens=num_local_cached_tokens,
             num_external_cached_tokens=num_external_cached_tokens,
             prefix_cache_hit_rate=prefix_cache_hit_rate,
+            arrival_ts=req_stats.arrival_time,
+            finish_ts=req_stats.arrival_time + e2e_latency,
         )
         self.finished_requests.append(finished_req)
 

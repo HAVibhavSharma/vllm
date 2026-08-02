@@ -151,6 +151,7 @@ class RequestState:
         job_id: str | None = None,
         agent_id: str | None = None,
         langgraph_node: str | None = None,
+        call_type: str | None = None,
         stream_input: bool = False,
     ):
         self.request_id = request_id
@@ -175,6 +176,7 @@ class RequestState:
         self.job_id = job_id
         self.agent_id = agent_id
         self.langgraph_node = langgraph_node
+        self.call_type = call_type
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -244,6 +246,7 @@ class RequestState:
             job_id = None
             agent_id = None
             langgraph_node = None
+            call_type = None
             if sampling_params.extra_args is not None:
                 extra_job_id = sampling_params.extra_args.get("job_id")
                 if extra_job_id is not None:
@@ -256,6 +259,9 @@ class RequestState:
                 )
                 if extra_langgraph_node is not None:
                     langgraph_node = str(extra_langgraph_node)
+                extra_call_type = sampling_params.extra_args.get("call_type")
+                if extra_call_type is not None:
+                    call_type = str(extra_call_type)
         else:
             logprobs_processor = None
             detokenizer = None
@@ -266,6 +272,7 @@ class RequestState:
             job_id = None
             agent_id = None
             langgraph_node = None
+            call_type = None
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -289,6 +296,7 @@ class RequestState:
             job_id=job_id,
             agent_id=agent_id,
             langgraph_node=langgraph_node,
+            call_type=call_type,
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
@@ -845,6 +853,7 @@ class OutputProcessor:
             job_id=req_state.job_id,
             agent_id=req_state.agent_id,
             langgraph_node=req_state.langgraph_node,
+            call_type=req_state.call_type,
             input_text=req_state.prompt,
             output_text=(
                 req_state.detokenizer.output_text
