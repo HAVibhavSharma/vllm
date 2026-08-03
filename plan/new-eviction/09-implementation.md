@@ -6,13 +6,26 @@ Where this doc and 00–08 disagree about *intent*, they win; where they
 disagree about *what the code does*, this one does.
 
 **First run: 2026-08-03**, on `chisel-8` (Python 3.10, pytest 9.1.1).
-`tests/v1/core/node_eviction/`: 104 collected, **92 passed, 12 failed**.
+`tests/v1/core/node_eviction/`: 104 collected, **92 passed, 12 failed**;
+after fixing those, one more surfaced that the first batch had masked.
 `tests/v1/metrics/test_request_stats_logger.py`: **2 passed, 1 failed**.
-No failure was in production code:
+
+**Every failure was in test code. No production code was changed to make
+them pass.** That matters for what the green suite is now evidence of: the
+policy's logic was written correctly the first time, but four separate test
+bugs — three of them arithmetically or structurally impossible assertions —
+survived to this point because nothing had ever executed them.
 
 - 11 x `TypeError: keywords must be strings` — the `fresh_rows` helper in
   `test_controller.py` took `**kwargs`, but every caller keys it by `NodeKey`
   tuples. Test-helper bug; the helper now takes the mapping positionally.
+- 1 x `test_low_scoring_blocks_move_to_the_head`, which the `TypeError` above
+  had been masking: its *precondition* asserted the free queue began
+  `[1, 2, 3, 4, 5, 6]`. `index_prefix` only records ownership in the index —
+  it does not touch the queue — so the queue was still in construction order
+  with the unowned block 0 at the head. The precondition now asserts the
+  property it meant (research ahead of supervisor) rather than an absolute
+  list. The behaviour under test passed once reached.
 - 1 x `test_ablation_changes_the_ranking` — asserted that ablating `decay`
   must change hit rate. On this fixture it cannot: under `oracle` every live
   key has `prob=1.0`, all three keys are the same size so `blocks` is
@@ -33,7 +46,7 @@ No failure was in production code:
   the test has never passed. Now `pytest.approx`. The `call_type`,
   `arrival_ts` and `finish_ts` assertions this changeset added all passed.
 
-Note the second one is a real limitation of the replay fixture, not just a
+Note the ablation one is a real limitation of the replay fixture, not just a
 bad assertion: **no ablation can separate terms on `walkthrough_trace()`**,
 because it varies only one of them. A trace that can answer "which terms are
 load-bearing" (09 §4 step 3) needs keys of differing size or differing

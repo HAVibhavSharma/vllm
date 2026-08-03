@@ -172,7 +172,15 @@ def test_low_scoring_blocks_move_to_the_head():
     # research freed first, so LRU has it nearest the head.
     index_prefix(controller, pool, RESEARCH, [1, 2, 3])
     index_prefix(controller, pool, SUPERVISOR, [4, 5, 6])
-    assert pool.queue_ids()[:6] == [1, 2, 3, 4, 5, 6]
+
+    # Precondition, stated as the ordering rather than as an absolute list:
+    # `index_prefix` only records ownership, it does not touch the queue, so
+    # the queue is still in construction order and block 0 — owned by nobody
+    # — is at the head. What matters is that research sits *ahead of*
+    # supervisor, which is the LRU-anti-correlated setup: age says evict
+    # research, the forecast says evict supervisor.
+    queue = pool.queue_ids()
+    assert queue.index(1) < queue.index(4)
 
     controller.maybe_tick()
 
