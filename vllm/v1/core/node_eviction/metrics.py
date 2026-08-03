@@ -62,9 +62,23 @@ class EvictionCounters:
     evicted_then_needed_total: int = 0
     evicted_then_needed_cost_ms: float = 0.0
 
+    # Keys stamped speculative...
     speculative_created: int = 0
     speculative_confirmed: int = 0
+    # ...and the blocks under them. The waste ratio needs the second: its
+    # numerator counts blocks, and a key owns as many blocks as its prefix
+    # is long.
+    speculative_blocks_created: int = 0
     speculative_evicted_before_confirm: int = 0
+
+    # Prefetch origination (02 §4, step 6).
+    prefetch_wants_created: int = 0
+    prefetch_wants_dropped: int = 0
+    prefetch_wants_drained: int = 0
+    prefetch_wants_satisfied: int = 0
+    prefetch_wants_expired: int = 0
+    prefetch_wants_pending: int = 0
+    prefetch_wants_outstanding: int = 0
 
     snapshot_stale_seconds: float = 0.0
     snapshot_revision: int = 0
@@ -95,10 +109,19 @@ class EvictionCounters:
             "regret_rate": self.regret_rate,
             "speculative_created": self.speculative_created,
             "speculative_confirmed": self.speculative_confirmed,
+            "speculative_blocks_created": self.speculative_blocks_created,
             "speculative_evicted_before_confirm": (
                 self.speculative_evicted_before_confirm
             ),
             "speculative_waste": self.speculative_waste,
+            "prefetch_wants_created": self.prefetch_wants_created,
+            "prefetch_wants_dropped": self.prefetch_wants_dropped,
+            "prefetch_wants_drained": self.prefetch_wants_drained,
+            "prefetch_wants_satisfied": self.prefetch_wants_satisfied,
+            "prefetch_wants_expired": self.prefetch_wants_expired,
+            "prefetch_wants_pending": self.prefetch_wants_pending,
+            "prefetch_wants_outstanding": self.prefetch_wants_outstanding,
+            "prefetch_want_hit_rate": self.prefetch_want_hit_rate,
             "score_outcome_correlation": self.score_outcome_correlation,
             "snapshot_stale_seconds": self.snapshot_stale_seconds,
             "snapshot_revision": self.snapshot_revision,
@@ -123,10 +146,36 @@ class EvictionCounters:
         """`evicted_before_confirm / created` — this ratio *is* prefetch
         waste, and it is the only honest read on whether the forecast is
         worth anything. Without it, a policy that protects garbage for a full
-        TTL looks identical to one that works (02 §5)."""
-        if self.speculative_created == 0:
+        TTL looks identical to one that works (02 §5).
+
+        Both sides are counted in **blocks**. 02 §5 writes the denominator as
+        "created", which reads naturally as the number of predictions, but
+        the numerator can only be per-block: eviction happens one block at a
+        time. Dividing blocks by keys made a single fully wasted 50-block
+        prefix report 5000% waste, so the fraction is taken over blocks and
+        the key counts are reported separately.
+        """
+        if self.speculative_blocks_created == 0:
             return 0.0
-        return self.speculative_evicted_before_confirm / self.speculative_created
+        return (
+            self.speculative_evicted_before_confirm
+            / self.speculative_blocks_created
+        )
+
+    @property
+    def prefetch_want_hit_rate(self) -> float:
+        """How often a want was answered before it aged out.
+
+        Distinct from `speculative_waste`, which asks whether a *landed*
+        prefetch was used. This asks the prior question — whether the
+        instruction reached HBM at all — and separates "the forecast was
+        wrong" from "the phantom never ran" (02 §4).
+        """
+        answered = self.prefetch_wants_satisfied
+        total = answered + self.prefetch_wants_expired
+        if total == 0:
+            return 0.0
+        return answered / total
 
     @property
     def score_outcome_correlation(self) -> float:
@@ -193,15 +242,23 @@ class EvictionObserver:
         snapshot_age_ms: float = 0.0,
         num_free_fresh: int = 0,
         was_spliced: bool = False,
+        speculative: bool | None = None,
     ) -> None:
-        """One evicted *cached* block. Fresh blocks carry no information."""
+        """One evicted *cached* block. Fresh blocks carry no information.
+
+        `speculative` is the caller's authoritative read of provenance, from
+        the ownership index. It falls back to the score breakdown only for
+        callers that have no index in hand (the replay harness, tests).
+        """
         counters = self.counters
         counters.evictions_total += 1
         if breakdown is None or not breakdown.scored:
             counters.unscored_evictions_total += 1
         if was_spliced:
             counters.evictions_by_score_total += 1
-        if breakdown is not None and breakdown.speculative:
+        if speculative is None:
+            speculative = breakdown is not None and breakdown.speculative
+        if speculative:
             counters.speculative_evicted_before_confirm += 1
 
         if keys and breakdown is not None and breakdown.scored:
@@ -221,7 +278,7 @@ class EvictionObserver:
             "keys": [list(k) for k in keys],
             "score": breakdown.score if breakdown is not None else None,
             "terms": breakdown.as_terms() if breakdown is not None else None,
-            "speculative": breakdown.speculative if breakdown is not None else False,
+            "speculative": speculative,
             "floor_applied": (
                 breakdown.floor_applied if breakdown is not None else None
             ),

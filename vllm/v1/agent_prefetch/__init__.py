@@ -18,8 +18,17 @@ Components in this commit:
 
 The phantom-request submitter and the public HTTP route land in
 follow-up commits; see ``plan/agent_prefetch_plan.md``.
+
+* :class:`PrefetchWantDrainer` -- polls the node-eviction policy's
+  want-list in engine core and submits phantoms for it. This is the
+  front-end half of prefetch origination; see
+  ``plan/new-eviction/02-controller-scope.md`` §4.
 """
 
+from vllm.v1.agent_prefetch.drain import (
+    PrefetchWantDrainer,
+    maybe_start_prefetch_drainer,
+)
 from vllm.v1.agent_prefetch.hashing import (
     DEFAULT_CHUNK_SIZE,
     chunk_align,
@@ -38,8 +47,10 @@ __all__ = [
     "AgentPrefixRegistry",
     "DEFAULT_CHUNK_SIZE",
     "PhantomPrefetchSubmitter",
+    "PrefetchWantDrainer",
     "PrefixDescriptor",
     "build_prefetch_request_id",
     "chunk_align",
     "compute_prefix_hash",
+    "maybe_start_prefetch_drainer",
 ]

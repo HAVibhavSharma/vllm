@@ -69,7 +69,7 @@ Redis, a real GPU, or a real workflow.
 | **3.5** Value table + consult | built | `controller.get_value`, `KVCacheManager.get_node_value` |
 | **4** Real Redis subscriber | built, **unexercised** | `redis_source.py` — the transport questions in 03 §7 are config knobs, not assumptions |
 | **5** Real scoring | shape built, constants unvalidated | `scoring.py`, `config.py` |
-| **6** Prefetch/admission instructions | **not built** | needs the §4 decision: want-list vs new message type vs connector API |
+| **6** Prefetch/admission instructions | built, **unexercised** | `wantlist.py` + `controller.drain_prefetch_wants`, drained by `vllm/v1/agent_prefetch/drain.py`. §6 below |
 | **7** Demote-to-L1 | **not built** | data-gated on `p_cold` (02 §9) |
 
 Also built, from 04 §3 (the engine-side gap that blocks the Trace Analyser):
@@ -99,7 +99,17 @@ VLLM_NODE_EVICTION_CONFIG=/path/to/policy.json
 
 # per-eviction decision log — unbounded under pressure, debugging only
 VLLM_NODE_EVICTION_DECISION_LOG=/tmp/evictions.jsonl
+
+# prefetch origination (step 6) — off by default, and separate from the
+# policy switch on purpose: reordering is free, origination adds prefill work
+VLLM_NODE_EVICTION_PREFETCH_DRAIN=1
+VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S=1.0
 ```
+
+One env var gates both halves. Engine core only builds a want-list when it is
+set and the front end only drains when it is set, because an engine
+accumulating wants nobody submits reads as a broken forecast rather than a
+configuration mistake.
 
 `redis` is optional and not in `common.txt`:
 `uv pip install -r requirements/node_eviction.txt`. With it missing the
@@ -197,7 +207,93 @@ no amount of decoding leniency fixes it.
 
 ---
 
-## 5. Known gaps
+## 5. Step 6, as built
+
+**Written: 2026-08-03.** 02 §4 left the origination path open between (a) a
+want-list drained by the front end, (b) a new engine→front-end message type,
+and (c) the manager driving the connector directly. **(a) was taken**, on the
+same reasoning the doc gives: no new transport, no protocol change, and the
+decision stays where the value data is.
+
+| Piece | Where |
+|---|---|
+| Want-list structure | `node_eviction/wantlist.py` — `PrefetchWant`, `PrefetchWantList` |
+| The decision | `controller._rebuild_want_list`, on the tick, **above** the fresh-block early return |
+| Engine-side drain | `controller.drain_prefetch_wants` → `KVCacheManager` → `EngineCore.drain_prefetch_wants` |
+| Transport | `call_utility` — `AsyncMPClient.drain_prefetch_wants_async`, `AsyncLLM.drain_prefetch_wants` |
+| Front-end drain | `vllm/v1/agent_prefetch/drain.py`, started from the server `lifespan` |
+| Switch | `VLLM_NODE_EVICTION_PREFETCH_DRAIN` (both halves), `..._INTERVAL_S` |
+
+Decisions that had to be settled to write it:
+
+### 5.1 A want names a node, not a prefix
+
+Engine core has no tokens — the index holds block ids, and a phantom needs a
+token sequence. So a want carries the `NodeKey` plus an `agent_id`, and the
+front end resolves that against the existing `AgentPrefixRegistry` (02 §8) and
+fans out over **every prefix the registry holds for that agent**, exactly as
+`/v1/agents/prefetch` does. One want is therefore one *node*, not one phantom.
+
+`agent_id` is built engine-side as `{prefetch_agent_namespace}:{node}`, the
+join with the LangGraph fork's `derive_agent_id()`. Resolving it here rather
+than in the drainer keeps the naming convention in one place.
+
+A want for an agent the registry has never seen is dropped, not guessed at.
+
+### 5.2 The phantom now carries identity — without it the floor was inert
+
+The one thing 02 §5 did not account for: `PhantomPrefetchSubmitter` built its
+`SamplingParams` with `extra_args={"kv_transfer_params": ...}` and nothing
+else. `node_key_for_request` therefore returned None for **every** phantom,
+`on_blocks_cached` returned early, and no index entry was ever stamped
+speculative — so the decaying floor, the confirm-on-touch and the waste ratio
+were unreachable in principle, not merely unexercised.
+
+`submit()` now takes an optional `identity` dict which the drainer fills from
+the want. The `/v1/agents/prefetch` endpoint still submits anonymously, since
+`AgentPrefetchRequest` carries no `job_id`; phantoms from that route remain
+invisible to the policy. That is recorded in
+`tests/v1/agent_prefetch/test_drain.py`.
+
+### 5.3 Origination fails closed under data parallelism
+
+Each engine core runs its own KV cache and its own want-list, but a phantom
+submitted from the front end is routed by the load balancer and cannot be
+addressed to the engine that asked for it. Warming engine 0 for a prefix
+engine 1 wanted leaves engine 1 cold *and* costs engine 0 a prefill it had no
+use for — strictly worse than not prefetching. `DPAsyncMPClient` therefore
+returns an empty want-list and logs once. Eviction reordering is unaffected.
+
+### 5.4 The diagram's admission rule needed no new mechanism
+
+> "if it can't be admitted to HBM due to it being full: evict others in order
+> of least value except this"
+
+The splice already moved the least valuable blocks to the head, so
+`get_new_blocks` pops those first; and "except this" is the speculative floor,
+which puts a freshly prefetched prefix above the whole score range. Both
+halves of the rule are the step-3 machinery, consulted implicitly.
+
+### 5.5 Two observability defects fixed alongside
+
+- `speculative_waste` divided **blocks** evicted by **keys** created, so a
+  single fully wasted 50-block prefix reported 5000% waste. The denominator is
+  now `speculative_blocks_created`; the key counts are still reported.
+- `record_eviction` inferred provenance from the score breakdown, which only
+  exists once a tick has scored the key — so a prefix prefetched and evicted
+  inside one 250 ms tick period, the most wasteful case there is, was counted
+  as an *unscored* eviction rather than as waste. The controller now passes the
+  index's own `speculative` flag, and counts a block as waste only when **every**
+  owning key is still speculative.
+
+New counters: `prefetch_wants_{created,dropped,drained,satisfied,expired}`,
+plus `prefetch_want_hit_rate` — which separates "the phantom never ran" from
+"the forecast was wrong", two failures `speculative_waste` alone cannot tell
+apart.
+
+---
+
+## 6. Known gaps
 
 Inside vLLM:
 
@@ -212,8 +308,16 @@ Inside vLLM:
   There are no Prometheus metrics anywhere in this fork (01 §8).
 - **The value table has no consumer.** `get_node_value` is the O(1) read
   path from 02 §2 and nothing in the scheduler calls it yet; that is step 6.
-- **Prefetch origination** (02 §4) is untouched, so the speculative path is
-  only exercised by phantom requests the existing submitter already sends.
+- **Prefetch origination is built but has never run.** No test drives the
+  `call_utility` hop end to end — `drain_prefetch_wants` is unit-tested on
+  both sides of it and the transport itself is assumed. The first real run
+  should check `prefetch_wants_created` moves *and* `prefetch_wants_drained`
+  follows it; the two diverging means the hop is broken.
+- **The constants gating a want are guesses**, like every other constant
+  here. `prefetch_min_prob=0.5` and `prefetch_horizon_ms=60s` were picked to
+  be conservative, not measured. Too loose and speculation buys prefill work
+  that competes with real requests; the counter to watch is
+  `prefetch_want_hit_rate` against `speculative_waste`.
 - **The timing memo** (02 §6, and named in step 5) is not built. The scorer
   reads `HISTORY` from Redis instead, which covers the same need for v1;
   the memo only matters if the engine should keep its own cross-job timing

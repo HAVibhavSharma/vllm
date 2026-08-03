@@ -39,6 +39,7 @@ from vllm.v1.core.node_eviction.types import (
     NodeKey,
     ScoreBreakdown,
 )
+from vllm.v1.core.node_eviction.wantlist import PrefetchWant, PrefetchWantList
 
 __all__ = [
     "BlockOwnershipIndex",
@@ -51,6 +52,8 @@ __all__ = [
     "NodeEvictionConfig",
     "NodeEvictionController",
     "NodeKey",
+    "PrefetchWant",
+    "PrefetchWantList",
     "ScoreBreakdown",
     "SnapshotSource",
     "StaticSnapshotSource",

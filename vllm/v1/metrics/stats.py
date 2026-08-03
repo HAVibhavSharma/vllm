@@ -230,6 +230,10 @@ class FinishedRequestStats:
     agent_id: str | None = None
     langgraph_node: str | None = None
     call_type: str | None = None
+    # True for a phantom prefetch: a KV warm-up, not a workload request.
+    # Consumers that aggregate latency or token counts must exclude these,
+    # or a max_tokens=1 warm-up is averaged in as if it were a real turn.
+    prefetch_only: bool = False
     input_text: str | None = None
     output_text: str | None = None
     e2e_latency: float = 0.0
@@ -469,6 +473,7 @@ class IterationStats:
         num_computed_tokens: int = 0,
         num_local_cached_tokens: int = 0,
         num_external_cached_tokens: int = 0,
+        prefetch_only: bool = False,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
 
@@ -504,6 +509,7 @@ class IterationStats:
             agent_id=agent_id,
             langgraph_node=langgraph_node,
             call_type=call_type,
+            prefetch_only=prefetch_only,
             input_text=input_text,
             output_text=output_text,
             e2e_latency=e2e_latency,

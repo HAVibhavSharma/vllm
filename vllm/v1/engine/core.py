@@ -606,6 +606,21 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def drain_prefetch_wants(self, max_items: int = 4) -> list[dict[str, str | float]]:
+        """Take prefixes the node-eviction policy wants warmed into HBM.
+
+        A `call_utility` target, so it runs on the busy-loop thread — the
+        same one that owns the scheduler and the policy tick — which is why
+        the want-list needs no locking (02 §4 option a).
+
+        Empty list when the policy is off, or when the scheduler is not the
+        V1 `Scheduler` that owns a `KVCacheManager`.
+        """
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return []
+        return kv_cache_manager.drain_prefetch_wants(max_items)
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

@@ -362,6 +362,38 @@ def test_a_phantom_cannot_confirm_another_phantoms_guess():
     assert controller.index.get_entry(RESEARCH).speculative
 
 
+def test_waste_is_counted_even_before_a_tick_has_scored_the_key():
+    """Provenance comes from the index, which knows at insert time. Reading
+    it off the score breakdown instead loses every prefetch evicted inside
+    one tick period (250ms) — the fastest and most wasteful case there is."""
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3], speculative=True)
+    assert controller.get_value(RESEARCH) is None, "no tick has scored it"
+
+    controller.on_block_evicted(1)
+
+    counters = controller.observer.counters
+    assert counters.speculative_evicted_before_confirm == 1
+    assert counters.speculative_blocks_created == 3
+    assert counters.speculative_waste == 1 / 3
+
+
+def test_a_block_a_confirmed_owner_also_holds_is_not_prefetch_waste():
+    """Multi-owner `max` already protects a co-owned block (01 §4), and a
+    confirmed owner means it was genuinely used. Blaming the prefetch for it
+    would inflate the only number that says whether the forecast is worth
+    anything."""
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool)
+    index_prefix(controller, pool, RESEARCH, [1], speculative=True)
+    index_prefix(controller, pool, SUPERVISOR, [1])
+
+    controller.on_block_evicted(1)
+
+    assert controller.observer.counters.speculative_evicted_before_confirm == 0
+
+
 # -- lifecycle -----------------------------------------------------------
 
 

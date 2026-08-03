@@ -146,6 +146,13 @@ export VLLM_NODE_EVICTION_DECISION_LOG=/disk2/vibhav/vllm-logs/debug/evictions.j
 # Optional, all tunables. See §9.
 export VLLM_NODE_EVICTION_CONFIG=/home/vibhav/Build/KVCOMM-VLLM/vllm/node_eviction.json
 
+# Optional, OFF by default. Turns on prefetch origination (step 6): engine
+# core publishes a want-list, the API-server process drains it and submits
+# phantoms. Leave this OFF to measure the eviction ranking on its own —
+# reordering is free, origination buys prefill work. See §10.
+# export VLLM_NODE_EVICTION_PREFETCH_DRAIN=1
+# export VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S=1.0
+
 
 LMCACHE_MP_FULL_HIT_ONLY=0 VLLM_USE_DEEP_GEMM=0 \
 vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ --port 8000 \
@@ -189,9 +196,9 @@ cd ~/Projects/kv-trace-analyser
 uv pip install -e '.[redis]'
 
 kv-trace-analyser run \
-  --stats-dir /var/log/vllm/stats \
+  --stats-dir /disk2/vibhav/vllm-logs/stats \
   --redis-url redis://localhost:6379/0 \
-  --checkpoint /var/lib/kv-trace-analyser/offsets.json
+  --checkpoint /disk2/vibhav/kv-trace-analyser/offsets.json
 ```
 
 `--checkpoint` matters: without it a restart re-reads every file from byte 0.
@@ -327,10 +334,14 @@ python tests/run_evaluate_node_eviction.py --max-queries 6
 
 Notes specific to this integration:
 
-- **`LANGGRAPH_ABLATION_MODE` defaults to `baseline` here**, not `full`. The
-  prefix-prefetch worker is an independent mechanism; running both at once
-  means a hit-rate change cannot be attributed to either. Override explicitly
-  to measure the combination.
+- **Prefetch is disabled by clearing `LANGGRAPH_VLLM_AGENT_ENABLE` and
+  `LANGGRAPH_VLLM_AGENT_BASE_URL`** — *not* by `LANGGRAPH_ABLATION_MODE`,
+  which nothing in langgraph or ODR reads and which only labels the LangSmith
+  experiment. The real switch is `vllm_agent_enabled()`, true when
+  `LANGGRAPH_VLLM_AGENT_ENABLE == "1"` **or** `LANGGRAPH_VLLM_AGENT_BASE_URL`
+  is set, so both must be cleared, and after `load_dotenv`. Set
+  `KV_EVICTION_DISABLE_PREFETCH=0` to leave prefetch on. The harness prints
+  the real state at startup — trust that line, not the mode label.
 - **`VLLM_REQUEST_STATS_DIR` is set by the harness** and defaults under its
   own metrics directory. Point the analyser (§6) at the value it prints.
 - **The graph spec is hand-written** (9 nodes), for the reason in §7.1: ODR
@@ -476,10 +487,29 @@ plain LRU when Redis is down, the forecast is stale, or a key is unscored.
 
 **Does not:**
 
-- **Originate prefetches.** Step 6 is unbuilt, so the speculative path is only
-  exercised by phantom requests the existing submitter already sends.
+- **Originate prefetches — unless `VLLM_NODE_EVICTION_PREFETCH_DRAIN=1`.**
+  Step 6 now exists (09 §5): engine core publishes a want-list, and a
+  background task in the API-server process drains it and submits phantoms
+  through the existing submitter. It is **off by default**, and an eviction
+  experiment usually wants it off (§7.4) so the ranking is measured on its
+  own.
+
+  With it off, the speculative path has exactly one producer:
+  `/v1/agents/prefetch`, whose only caller is langgraph's
+  `BackgroundVLLMAgentWorker` → `warm_agent_prefixes()`, gated on
+  `vllm_agent_enabled()`. **Those phantoms carry no `job_id`, so they are
+  invisible to the policy** — `node_key_for_request` returns None and nothing
+  is stamped speculative. So with prefetch left off, the decaying floor,
+  `speculative_floor_high` / `_low`, `speculative_default_ttl_ms` and
+  `speculative_hard_drop_ttl_multiple` are all inert and
+  `index_speculative_keys` / `speculative_waste` stay 0. The drainer's
+  phantoms *do* carry identity, which is what makes the floor reachable at
+  all — turning the drain on is the only way to exercise it.
 - **Consult the value table per request.** `get_node_value` is implemented and
-  has zero callers, so the O(1) read path from 02 §2 is dead code today.
+  has zero callers, so the O(1) read path from 02 §2 is dead code today. Note
+  step 6 did **not** need it: the want-list reads the forecast directly, and
+  the diagram's "evict others in order of least value except this" is served
+  by the splice plus the speculative floor (09 §5.4).
 - **Demote to L1 instead of destroying.** Step 7 is unbuilt and gated on
   measuring `p_cold` first.
 - **Export Prometheus metrics.** Counters exist behind

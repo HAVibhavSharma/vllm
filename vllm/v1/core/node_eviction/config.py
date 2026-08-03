@@ -73,6 +73,57 @@ class NodeEvictionConfig:
     """Speculative entries are dropped from the index entirely at
     TTL x this, which bounds index growth on the speculative side."""
 
+    # --- Prefetch origination (02 §4, step 6) -----------------------------
+    prefetch_wants_enabled: bool = False
+    """Produce a want-list at all. Separate from `enabled` on purpose:
+    reordering the free queue is free, while originating a prefetch costs a
+    real prefill whenever LMCache misses the prefix. Driven by
+    `VLLM_NODE_EVICTION_PREFETCH_DRAIN`, the same switch the front-end
+    drainer reads, so the two halves cannot be turned on independently."""
+
+    prefetch_min_prob: float = 0.5
+    """Only forecast rows at least this likely become wants. The diagram's
+    "admit/prefetch if the need for the cache is imminent" has two axes; this
+    is the *will it happen* one."""
+
+    prefetch_horizon_ms: float = 60_000.0
+    """...and this is the *when* axis. A node predicted 10 minutes out is
+    real but not imminent, and warming it now just evicts something that is
+    needed sooner."""
+
+    prefetch_max_outstanding: int = 8
+    """Ceiling on wants pending + in flight. This is the actual bound on how
+    much prefill work speculation can create, so it is deliberately small."""
+
+    prefetch_max_per_drain: int = 4
+    """Ceiling on how many wants one front-end poll may take. Each want
+    fans out to *every* prefix the registry holds for its agent, so this is
+    not the phantom count."""
+
+    prefetch_want_ttl_ms: float = 30_000.0
+    """A want nobody drained within this window is dropped as stale intent
+    rather than acted on late."""
+
+    prefetch_resubmit_backoff_ms: float = 60_000.0
+    """How long a drained want blocks a re-offer for the same key. Bounds
+    the retry rate when a phantom is dropped or its prefix never lands."""
+
+    prefetch_summary_period_ms: float = 30_000.0
+    """How often the tick may log one INFO line of prefetch state. Rate
+    limited *and* change-gated, so an idle server stays silent. Set to 0 to
+    turn the line off; the counters remain readable via
+    `KVCacheManager.get_node_eviction_stats()` either way.
+
+    This exists because every per-event prefetch log is either too rare to
+    prove anything (startup) or too frequent for INFO (one per phantom), and
+    the numbers that actually separate "the forecast is wrong" from "the
+    phantom never ran" are ratios over time, not events."""
+
+    prefetch_agent_namespace: str = "langgraph"
+    """`agent_id` is `{namespace}:{node_name}` — the join with the LangGraph
+    fork's `derive_agent_id()`. Resolved engine-side so the front-end drainer
+    needs no knowledge of the naming convention."""
+
     # --- Tick and splice (01 §6 Rule 4) -----------------------------------
     tick_period_ms: float = 250.0
     """Wall-clock cadence of the re-score. Step count is not used because
@@ -165,6 +216,11 @@ class NodeEvictionConfig:
             cfg.redis_url = envs.VLLM_NODE_EVICTION_REDIS_URL
         if envs.VLLM_NODE_EVICTION_DECISION_LOG:
             cfg.decision_log_path = envs.VLLM_NODE_EVICTION_DECISION_LOG
+        # Assigned unconditionally, unlike the tunables above: the front-end
+        # drainer reads this same env var, and a JSON file that could switch
+        # the engine half on by itself would accumulate wants nobody submits
+        # — which reads as a broken forecast, not a config mistake.
+        cfg.prefetch_wants_enabled = bool(envs.VLLM_NODE_EVICTION_PREFETCH_DRAIN)
 
         return cfg
 
@@ -205,6 +261,20 @@ class NodeEvictionConfig:
             )
         if self.speculative_floor_low >= self.speculative_floor_high:
             raise ValueError("speculative floor must decay downwards")
+        if not 0.0 <= self.prefetch_min_prob <= 1.0:
+            raise ValueError("prefetch_min_prob must be a probability in [0, 1]")
+        if self.prefetch_max_outstanding < 0:
+            raise ValueError("prefetch_max_outstanding must be >= 0")
+        if self.prefetch_max_per_drain < 0:
+            raise ValueError("prefetch_max_per_drain must be >= 0")
+        if self.prefetch_wants_enabled and not self.prefetch_agent_namespace:
+            # An empty namespace yields agent_id ":research", which matches
+            # nothing in the registry — every want would fan out to zero
+            # phantoms and the failure would be invisible.
+            raise ValueError(
+                "prefetch_agent_namespace must be non-empty when prefetch "
+                "origination is on"
+            )
 
 
 def load_config_from_file(path: str | os.PathLike) -> NodeEvictionConfig:

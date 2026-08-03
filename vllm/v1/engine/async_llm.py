@@ -896,6 +896,17 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def drain_prefetch_wants(
+        self, max_items: int = 4
+    ) -> list[dict[str, str | float]]:
+        """Prefixes the node-eviction policy wants pulled into HBM.
+
+        The front-end half of 02 §4 option a: engine core decides, this
+        process submits. Polled by `PrefetchWantDrainer`; empty whenever the
+        policy or its prefetch half is off, which is the default.
+        """
+        return await self.engine_core.drain_prefetch_wants_async(max_items)
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

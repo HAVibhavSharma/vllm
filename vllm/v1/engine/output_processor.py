@@ -152,6 +152,7 @@ class RequestState:
         agent_id: str | None = None,
         langgraph_node: str | None = None,
         call_type: str | None = None,
+        prefetch_only: bool = False,
         stream_input: bool = False,
     ):
         self.request_id = request_id
@@ -177,6 +178,7 @@ class RequestState:
         self.agent_id = agent_id
         self.langgraph_node = langgraph_node
         self.call_type = call_type
+        self.prefetch_only = prefetch_only
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -247,6 +249,7 @@ class RequestState:
             agent_id = None
             langgraph_node = None
             call_type = None
+            prefetch_only = False
             if sampling_params.extra_args is not None:
                 extra_job_id = sampling_params.extra_args.get("job_id")
                 if extra_job_id is not None:
@@ -262,6 +265,9 @@ class RequestState:
                 extra_call_type = sampling_params.extra_args.get("call_type")
                 if extra_call_type is not None:
                     call_type = str(extra_call_type)
+                kv_params = sampling_params.extra_args.get("kv_transfer_params")
+                if isinstance(kv_params, dict):
+                    prefetch_only = bool(kv_params.get("prefetch_only", False))
         else:
             logprobs_processor = None
             detokenizer = None
@@ -273,6 +279,7 @@ class RequestState:
             agent_id = None
             langgraph_node = None
             call_type = None
+            prefetch_only = False
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -297,6 +304,7 @@ class RequestState:
             agent_id=agent_id,
             langgraph_node=langgraph_node,
             call_type=call_type,
+            prefetch_only=prefetch_only,
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
@@ -854,6 +862,7 @@ class OutputProcessor:
             agent_id=req_state.agent_id,
             langgraph_node=req_state.langgraph_node,
             call_type=req_state.call_type,
+            prefetch_only=req_state.prefetch_only,
             input_text=req_state.prompt,
             output_text=(
                 req_state.detokenizer.output_text

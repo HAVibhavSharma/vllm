@@ -23,16 +23,16 @@ not blocked on the prefetch finishing.
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
     from vllm.engine.protocol import EngineClient
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 def _short_hex(prefix_hash: bytes, n: int = 16) -> str:
@@ -73,6 +73,7 @@ class PhantomPrefetchSubmitter:
         token_ids: Sequence[int],
         prefix_hash: bytes,
         cache_salt: str,
+        identity: dict[str, str] | None = None,
     ) -> asyncio.Task | None:
         """Submit one phantom prefetch.
 
@@ -81,6 +82,15 @@ class PhantomPrefetchSubmitter:
         Callers can either ignore the task (fire-and-forget) or
         ``await`` it to block until the phantom completes -- at which
         point the prefix is guaranteed to be registered in APC.
+
+        ``identity`` carries ``job_id`` / ``langgraph_node`` / ``call_type``
+        into ``sampling_params.extra_args``. Without it the blocks a phantom
+        caches are **invisible to the node-eviction policy**:
+        ``node_key_for_request`` returns None for a request with no identity,
+        so ``on_blocks_cached`` returns early and the entry is never stamped
+        speculative -- leaving the decaying protection floor (02 §5) inert for
+        exactly the blocks it exists to protect. Callers that know which node
+        they are warming for should always pass it.
 
         Never raises; all failures inside the spawned task are logged
         and absorbed -- prefetch is best-effort and must not break the
@@ -93,25 +103,41 @@ class PhantomPrefetchSubmitter:
             if request_id in inflight_for_agent:
                 return None
             if len(inflight_for_agent) >= self._max_inflight_per_agent:
-                logger.debug(
-                    "agent_prefetch: in-flight cap reached for agent %s "
-                    "(%d) -- dropping prefetch %s",
-                    agent_id,
+                # `warning_once` per agent, not `debug`: silently dropping
+                # prefetches is indistinguishable from a forecast that
+                # predicted nothing, and the cap being hit at all means the
+                # fan-out is outrunning the engine. Once per agent keeps a
+                # saturated agent from flooding the log with the same fact.
+                logger.warning_once(
+                    "agent_prefetch: in-flight cap (%d) reached for agent %s "
+                    "-- dropping prefetches for it. Further drops for this "
+                    "agent are not logged.",
                     self._max_inflight_per_agent,
+                    agent_id,
+                )
+                logger.debug(
+                    "agent_prefetch: dropped prefetch %s (in-flight cap)",
                     request_id,
                 )
                 return None
             inflight_for_agent.add(request_id)
 
+        extra_args: dict[str, Any] = {
+            "kv_transfer_params": {
+                "prefetch_only": True,
+                "cache_salt": cache_salt,
+            },
+        }
+        if identity:
+            # Top-level, beside kv_transfer_params -- the same shape a real
+            # request carries, which is what lets one `node_key_for_request`
+            # serve both.
+            extra_args.update(identity)
+
         params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
-            extra_args={
-                "kv_transfer_params": {
-                    "prefetch_only": True,
-                    "cache_salt": cache_salt,
-                },
-            },
+            extra_args=extra_args,
         )
 
         task = asyncio.create_task(

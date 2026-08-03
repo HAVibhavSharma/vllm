@@ -96,12 +96,52 @@ def test_speculative_waste_is_reported():
     """Without this ratio, a policy that protects garbage for a full TTL
     looks identical to one that works (02 §5)."""
     observer = EvictionObserver()
-    observer.counters.speculative_created = 4
+    observer.counters.speculative_blocks_created = 4
     observer.record_eviction(
         1, [RESEARCH], breakdown(1.0, speculative=True), now_ms=1000.0
     )
     assert observer.counters.speculative_evicted_before_confirm == 1
     assert observer.counters.speculative_waste == 0.25
+
+
+def test_waste_is_a_fraction_of_blocks_not_of_predictions():
+    """Both sides must be counted in blocks. Eviction happens one block at a
+    time, so dividing evicted blocks by *keys* made one fully wasted 50-block
+    prefix report 5000% waste — a ratio that cannot exceed 1 by construction
+    reading as though the forecast were catastrophic."""
+    observer = EvictionObserver()
+    observer.counters.speculative_created = 1
+    observer.counters.speculative_blocks_created = 50
+    for block_id in range(50):
+        observer.record_eviction(
+            block_id, [RESEARCH], breakdown(1.0), now_ms=1000.0, speculative=True
+        )
+    assert observer.counters.speculative_waste == 1.0
+
+
+def test_provenance_can_be_asserted_by_the_caller():
+    """The controller reads `speculative` off the ownership index, which
+    knows before any tick has scored the key. Falling back to the score
+    breakdown alone drops a block prefetched and evicted inside one tick
+    period into the unscored bucket — exactly the case the ratio exists to
+    catch."""
+    observer = EvictionObserver()
+    observer.counters.speculative_blocks_created = 1
+    # No breakdown at all: the key has never been scored.
+    observer.record_eviction(1, [RESEARCH], None, now_ms=1000.0, speculative=True)
+    assert observer.counters.speculative_evicted_before_confirm == 1
+
+
+def test_a_want_that_never_landed_is_distinguished_from_one_that_was_unused():
+    """`prefetch_want_hit_rate` asks whether the instruction reached HBM;
+    `speculative_waste` asks whether what landed was used. Collapsing them
+    would make "the phantom never ran" indistinguishable from "the forecast
+    was wrong" (02 §4)."""
+    observer = EvictionObserver()
+    observer.counters.prefetch_wants_satisfied = 3
+    observer.counters.prefetch_wants_expired = 1
+    assert observer.counters.prefetch_want_hit_rate == 0.75
+    assert observer.counters.speculative_waste == 0.0
 
 
 def test_decision_log_carries_the_terms_and_the_snapshot_age(tmp_path):

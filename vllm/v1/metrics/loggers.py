@@ -1252,6 +1252,7 @@ _CSV_COLUMNS = [
     "agent_id",
     "langgraph_node",
     "call_type",
+    "prefetch_only",
     "input_text",
     "output_text",
     "finish_reason",
@@ -1336,6 +1337,7 @@ class FileStatLogger(StatLoggerBase):
                 "agent_id": req.agent_id,
                 "langgraph_node": req.langgraph_node,
                 "call_type": req.call_type,
+                "prefetch_only": req.prefetch_only,
                 "input_text": req.input_text,
                 "output_text": req.output_text,
                 "finish_reason": str(req.finish_reason)

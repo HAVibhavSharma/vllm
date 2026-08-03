@@ -78,7 +78,22 @@ def _get_or_init_state(
     chat_handler: "OpenAIServingChat",
 ) -> tuple[AgentPrefixRegistry, PhantomPrefetchSubmitter]:
     """Lazy-init the registry + submitter on the app state."""
-    state = raw_request.app.state
+    return get_or_init_agent_prefetch_state(
+        raw_request.app.state, chat_handler.engine_client
+    )
+
+
+def get_or_init_agent_prefetch_state(
+    state,
+    engine_client,
+) -> tuple[AgentPrefixRegistry, PhantomPrefetchSubmitter]:
+    """The singletons, keyed on app state.
+
+    Split out from the request-scoped helper so the want-list drainer
+    (`vllm/v1/agent_prefetch/drain.py`), which starts at server startup and
+    has no request, shares *these* instances. Two registries would mean the
+    drainer fanning out over prefixes the chat endpoint never recorded.
+    """
     registry: AgentPrefixRegistry | None = getattr(state, _REGISTRY_ATTR, None)
     submitter: PhantomPrefetchSubmitter | None = getattr(
         state, _SUBMITTER_ATTR, None
@@ -96,7 +111,7 @@ def _get_or_init_state(
         )
     if submitter is None:
         submitter = PhantomPrefetchSubmitter(
-            engine_client=chat_handler.engine_client,
+            engine_client=engine_client,
             max_inflight_per_agent=64,
         )
         setattr(state, _SUBMITTER_ATTR, submitter)

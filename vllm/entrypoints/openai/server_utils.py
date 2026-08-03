@@ -460,12 +460,25 @@ async def lifespan(app: FastAPI):
         else:
             task = None
 
+        # Front-end half of node-eviction prefetch origination (02 §4). A
+        # no-op unless VLLM_NODE_EVICTION_PREFETCH_DRAIN is set, and it never
+        # raises: a server that cannot prefetch still has to serve.
+        from vllm.v1.agent_prefetch.drain import maybe_start_prefetch_drainer
+
+        try:
+            drainer = maybe_start_prefetch_drainer(app)
+        except Exception:
+            logger.exception("Failed to start the prefetch want-list drainer")
+            drainer = None
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
         try:
             yield
         finally:
+            if drainer is not None:
+                await drainer.stop()
             if task is not None:
                 task.cancel()
     finally:
