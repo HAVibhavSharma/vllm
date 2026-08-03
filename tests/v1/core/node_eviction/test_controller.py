@@ -77,9 +77,13 @@ def make_controller(pool, rows=None, **overrides):
     )
 
 
-def fresh_rows(**per_key) -> dict[NodeKey, ImportanceRow]:
+def fresh_rows(per_key: dict[NodeKey, dict]) -> dict[NodeKey, ImportanceRow]:
     """Rows with an update_ts far in the future so the staleness gate is not
-    what the test is measuring."""
+    what the test is measuring.
+
+    Takes the mapping positionally rather than as `**kwargs`: the keys are
+    `NodeKey` tuples, and `**` unpacking requires string keys.
+    """
     import time
 
     now_ms = time.time() * 1000.0
@@ -159,7 +163,7 @@ def test_low_scoring_blocks_move_to_the_head():
     because it was freed first; the policy must evict `supervisor`."""
     pool = FakePool(num_blocks=16)
     rows = fresh_rows(
-        **{
+        {
             RESEARCH: dict(prob=0.92, time_to_next_call_ms=8_000.0),
             SUPERVISOR: dict(prob=0.85, time_to_next_call_ms=60_000.0),
         }
@@ -182,7 +186,7 @@ def test_worst_block_ends_up_first_out():
     first, and the only symptom is an inverted hit rate."""
     pool = FakePool(num_blocks=16)
     rows = fresh_rows(
-        **{
+        {
             RESEARCH: dict(prob=0.9, time_to_next_call_ms=1_000.0),
             SUPERVISOR: dict(prob=0.1, time_to_next_call_ms=600_000.0),
         }
@@ -200,7 +204,7 @@ def test_tail_of_prefix_is_evicted_before_its_head():
     position 0, so freeing from the middle reclaims one block and destroys
     the whole match."""
     pool = FakePool(num_blocks=16)
-    rows = fresh_rows(**{RESEARCH: dict(prob=0.5, time_to_next_call_ms=1_000.0)})
+    rows = fresh_rows({RESEARCH: dict(prob=0.5, time_to_next_call_ms=1_000.0)})
     controller = make_controller(pool, rows)
     index_prefix(controller, pool, RESEARCH, [1, 2, 3], start=0)
 
@@ -214,7 +218,7 @@ def test_unscored_blocks_keep_their_lru_position():
     """Rule 2: the splice only *moves* the worst K, so an unscored block is
     simply never selected. No neutral-score arithmetic is needed."""
     pool = FakePool(num_blocks=16)
-    rows = fresh_rows(**{SUPERVISOR: dict(prob=0.1, time_to_next_call_ms=600_000.0)})
+    rows = fresh_rows({SUPERVISOR: dict(prob=0.1, time_to_next_call_ms=600_000.0)})
     controller = make_controller(pool, rows)
     index_prefix(controller, pool, RESEARCH, [1, 2])  # no forecast row
     index_prefix(controller, pool, SUPERVISOR, [5])
@@ -232,7 +236,7 @@ def test_running_blocks_are_never_selected():
     """Invariant 8: ref_cnt > 0 keeps a running node's blocks out of the
     free queue entirely."""
     pool = FakePool(num_blocks=16)
-    rows = fresh_rows(**{RESEARCH: dict(prob=0.01, time_to_next_call_ms=600_000.0)})
+    rows = fresh_rows({RESEARCH: dict(prob=0.01, time_to_next_call_ms=600_000.0)})
     controller = make_controller(pool, rows)
     index_prefix(controller, pool, RESEARCH, [1, 2])
 
@@ -247,7 +251,7 @@ def test_running_blocks_are_never_selected():
 
 def test_splice_is_bounded_by_k():
     pool = FakePool(num_blocks=16)
-    rows = fresh_rows(**{RESEARCH: dict(prob=0.1, time_to_next_call_ms=600_000.0)})
+    rows = fresh_rows({RESEARCH: dict(prob=0.1, time_to_next_call_ms=600_000.0)})
     controller = make_controller(pool, rows, splice_max_blocks=2)
     index_prefix(controller, pool, RESEARCH, [1, 2, 3, 4, 5])
 
@@ -260,7 +264,7 @@ def test_splice_skipped_while_fresh_blocks_are_plentiful():
     cached block ahead of a fresh one throws away a prefix while a free
     unused block was available."""
     pool = FakePool(num_blocks=16, cached=False)
-    rows = fresh_rows(**{RESEARCH: dict(prob=0.1, time_to_next_call_ms=600_000.0)})
+    rows = fresh_rows({RESEARCH: dict(prob=0.1, time_to_next_call_ms=600_000.0)})
     controller = make_controller(pool, rows)
     index_prefix(controller, pool, RESEARCH, [10, 11])
     # Nothing in this pool carries a hash, so every queued block is fresh.
@@ -277,7 +281,7 @@ def test_multi_owner_takes_the_max():
     worth; summing would make common prefixes permanently unevictable."""
     pool = FakePool(num_blocks=16)
     rows = fresh_rows(
-        **{
+        {
             RESEARCH: dict(prob=0.99, time_to_next_call_ms=100.0),
             SUPERVISOR: dict(prob=0.01, time_to_next_call_ms=600_000.0),
         }
@@ -293,7 +297,7 @@ def test_multi_owner_takes_the_max():
 
 def test_score_threshold_leaves_valuable_blocks_alone():
     pool = FakePool(num_blocks=16)
-    rows = fresh_rows(**{RESEARCH: dict(prob=0.99, time_to_next_call_ms=0.0)})
+    rows = fresh_rows({RESEARCH: dict(prob=0.99, time_to_next_call_ms=0.0)})
     controller = make_controller(pool, rows, score_threshold=1e-9)
     index_prefix(controller, pool, RESEARCH, [1, 2])
 
@@ -312,7 +316,7 @@ def test_a_fresh_prefetch_is_protected_from_its_own_policy():
     (02 §5)."""
     pool = FakePool(num_blocks=16)
     rows = fresh_rows(
-        **{
+        {
             RESEARCH: dict(prob=0.01, time_to_next_call_ms=30_000.0),
             SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=1_000.0),
         }
@@ -376,7 +380,7 @@ def test_per_request_consult_is_a_lookup():
     """02 §2: the tick computes, the request reads. A miss returns None,
     which callers read as 'use the default'."""
     pool = FakePool(num_blocks=16)
-    rows = fresh_rows(**{RESEARCH: dict(prob=0.5, time_to_next_call_ms=1_000.0)})
+    rows = fresh_rows({RESEARCH: dict(prob=0.5, time_to_next_call_ms=1_000.0)})
     controller = make_controller(pool, rows)
     index_prefix(controller, pool, RESEARCH, list(range(1, 16)))
 

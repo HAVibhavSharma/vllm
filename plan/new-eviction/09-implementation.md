@@ -5,12 +5,42 @@
 Where this doc and 00–08 disagree about *intent*, they win; where they
 disagree about *what the code does*, this one does.
 
-**Not verified.** Nothing in this changeset has been executed. The test
-suite could not be run on the machine it was written on: the global
-interpreter has no `torch`, and the checkout's `.venv` has an `xgrammar`
-whose native TVM FFI library segfaults on import, which takes down `pytest`
-via the `tests/` conftest. Everything below is written and statically
-checked; none of it has passed a test.
+**First run: 2026-08-03**, on `chisel-8` (Python 3.10, pytest 9.1.1).
+`tests/v1/core/node_eviction/`: 104 collected, **92 passed, 12 failed**.
+`tests/v1/metrics/test_request_stats_logger.py`: **2 passed, 1 failed**.
+No failure was in production code:
+
+- 11 x `TypeError: keywords must be strings` — the `fresh_rows` helper in
+  `test_controller.py` took `**kwargs`, but every caller keys it by `NodeKey`
+  tuples. Test-helper bug; the helper now takes the mapping positionally.
+- 1 x `test_ablation_changes_the_ranking` — asserted that ablating `decay`
+  must change hit rate. On this fixture it cannot: under `oracle` every live
+  key has `prob=1.0`, all three keys are the same size so `blocks` is
+  constant, and `E_miss` is constant under the default hit-class assumption,
+  so decay is the *only* varying term. Remove it and every live key scores
+  identically (confirmed numerically: one value for live keys, that value
+  x0.01 for dead ones), the splice ties everywhere, and Rule 3's tail-first
+  tie-break selects the same blocks. The test prejudged the question the
+  ablation harness exists to answer; split into
+  `test_ablation_reaches_the_score` (mechanism is plumbed) and
+  `test_a_uniform_workload_gives_decay_nothing_to_separate` (records the
+  fixture's limit).
+- 1 x `test_finished_request_stats_include_request_logger_fields` —
+  `assert queued_time == 0.1` on a value that is `scheduled_ts - queued_ts`,
+  i.e. `100.2 - 100.1 == 0.10000000000000853`. **Pre-existing**: the
+  assertion dates to `00d4fc4c0`, before any of this work, and all four
+  duration assertions in it are exact comparisons of float subtractions, so
+  the test has never passed. Now `pytest.approx`. The `call_type`,
+  `arrival_ts` and `finish_ts` assertions this changeset added all passed.
+
+Note the second one is a real limitation of the replay fixture, not just a
+bad assertion: **no ablation can separate terms on `walkthrough_trace()`**,
+because it varies only one of them. A trace that can answer "which terms are
+load-bearing" (09 §4 step 3) needs keys of differing size or differing
+recurrence. Until then `--ablate` will report every term as inert.
+
+The engine has still never been run end to end, and no test exercises a real
+Redis, a real GPU, or a real workflow.
 
 ---
 
@@ -158,8 +188,12 @@ no amount of decoding leniency fixes it.
 
 Inside vLLM:
 
-- **Tests have never been executed** (see the note at the top). This is the
-  largest gap and everything below is secondary to it.
+- **The replay fixture cannot separate scoring terms** (see the note at the
+  top). `walkthrough_trace()` holds `prob`, `E_miss` and `blocks` constant,
+  so `--ablate` cannot report anything but "inert" for every term. This
+  blocks 09 §4 step 3 and is now the largest gap in the harness.
+- **No end-to-end run.** The unit tests pass; the engine has never been
+  started with the policy on, against a real Redis and a real workflow.
 - **No Prometheus export.** Counters exist and are readable via
   `KVCacheManager.get_node_eviction_stats()`, but nothing publishes them.
   There are no Prometheus metrics anywhere in this fork (01 §8).

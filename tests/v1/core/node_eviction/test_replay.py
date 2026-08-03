@@ -9,6 +9,8 @@ with need. With a forecast the policy should keep `research`; LRU cannot.
 
 import json
 
+import pytest
+
 from vllm.v1.core.node_eviction.config import NodeEvictionConfig
 from vllm.v1.core.node_eviction.replay import (
     ReplayRequest,
@@ -97,10 +99,17 @@ def test_ablations_parse():
     assert _Ablation.parse("prob,decay,blocks") == _Ablation(False, False, False)
 
 
-def test_ablation_changes_the_ranking():
-    """The falsification test: it is entirely possible that one term carries
-    everything and the rest are decoration — better to learn that from a
-    sweep than to ship three terms and tune all of them."""
+def test_ablation_reaches_the_score():
+    """The falsification harness: it is entirely possible that one term
+    carries everything and the rest are decoration — better to learn that
+    from a sweep than to ship three terms and tune all of them.
+
+    What a unit test can assert is that the ablation is **plumbed**, i.e.
+    that turning a term off actually changes the scores the splice ranks on.
+    Whether a term is load-bearing *for hit rate* is the empirical question
+    the sweep exists to answer, and asserting an answer here would prejudge
+    it — see `test_a_uniform_workload_gives_decay_nothing_to_separate`.
+    """
     trace = walkthrough_trace()
     config = NodeEvictionConfig(enabled=True, splice_max_blocks=512)
     full = replay(
@@ -120,12 +129,58 @@ def test_ablation_changes_the_ranking():
         forecast_mode="oracle",
         ablation=_Ablation(decay=False),
     )
-    # Not asserting which is better — only that the term is load-bearing
-    # enough to change the outcome, which is what the sweep measures.
-    assert (
-        full.block_hit_rate != without_decay.block_hit_rate
-        or full.evictions != without_decay.evictions
-    )
+    assert full.needed_score_sum != without_decay.needed_score_sum
+    assert full.not_needed_score_sum != without_decay.not_needed_score_sum
+
+
+def test_a_uniform_workload_gives_decay_nothing_to_separate():
+    """Records what the fixture can and cannot show, so it is not rediscovered
+    as a bug.
+
+    Under `oracle`, every key that still recurs gets `prob=1.0`; the fixture
+    gives all three keys the same size, so `blocks` is constant; and with the
+    default hit-class assumption `E_miss` is constant too. **Decay is the only
+    term that varies here.** Ablate it and every live key collapses to one
+    identical score, the splice ties everywhere, and Rule 3's tail-first
+    position tie-break decides alone — which on a workload this uniform and
+    this oversubscribed (3 x 100 blocks against a 256-block pool) selects the
+    same blocks anyway.
+
+    So the outcome is unchanged while the scores are not. That is a property
+    of the fixture, not a broken ablation: a trace where the terms can
+    actually separate needs keys of differing size or differing recurrence.
+    """
+    trace = walkthrough_trace()
+    config = NodeEvictionConfig(enabled=True, splice_max_blocks=512)
+    arms = {
+        name: replay(
+            trace,
+            policy="scored",
+            num_blocks=256,
+            block_size=16,
+            config=config,
+            forecast_mode="oracle",
+            ablation=ablation,
+        )
+        for name, ablation in (
+            ("full", None),
+            ("no_decay", _Ablation(decay=False)),
+        )
+    }
+    full, no_decay = arms["full"], arms["no_decay"]
+
+    # The scores moved...
+    assert full.needed_score_sum != no_decay.needed_score_sum
+    # ...and with decay gone the live keys are indistinguishable: every
+    # regretted eviction carries the identical score, and the only other
+    # value in the run is that score scaled by the 0.01 "never again" floor.
+    live = no_decay.needed_score_sum / no_decay.needed_count
+    dead = no_decay.not_needed_score_sum / no_decay.not_needed_count
+    assert dead == pytest.approx(live * 0.01, rel=1e-9)
+    # ...so the outcome cannot move. Asserting otherwise is what made this
+    # test fail for a reason that was never in the production code.
+    assert full.block_hit_rate == no_decay.block_hit_rate
+    assert full.evictions == no_decay.evictions
 
 
 def test_causal_forecast_needs_no_lookahead():

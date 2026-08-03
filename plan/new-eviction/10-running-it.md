@@ -3,9 +3,9 @@
 **What this is:** how to stand up the three components and the Redis between
 them so a LangGraph workflow runs against the node-aware eviction policy.
 
-**Read this first.** Nothing in the vLLM changeset has ever been executed
-(09 §1). The bring-up below is written against the code as it exists, but
-step 0 is not optional and the whole thing should be treated as a first
+**Read this first.** The unit tests pass as of 2026-08-03 (09 §1), but the
+engine has never been *run* with the policy on — no end-to-end pass against a
+real Redis, a real GPU and a real workflow. Treat the below as a first
 bring-up, not a deployment of something known to work.
 
 ---
@@ -82,8 +82,8 @@ is trivial — a few KB per active job.
 
 ## 3. Step 0 — run the tests
 
-Blocking. 102 tests exist in `tests/v1/core/node_eviction/` and none has ever
-been executed. Do this on the GPU box, not a dev machine.
+105 tests in `tests/v1/core/node_eviction/`; all passing as of 2026-08-03 on
+Python 3.10. Re-run after install, on the GPU box rather than a dev machine.
 
 ```bash
 cd /path/to/vllm
@@ -366,8 +366,13 @@ python -m vllm.v1.core.node_eviction.replay \
 
 **If the oracle arm does not beat LRU, stop.** The enforcement path is broken
 and no amount of prediction work will help. Only after that passes are
-`--forecast history` (the realistic ceiling) and `--ablate` (which terms are
-load-bearing) meaningful.
+`--forecast history` (the realistic ceiling) and `--ablate` meaningful.
+
+`--ablate` needs a **real captured trace**, not the built-in fixture. The
+synthetic `walkthrough_trace()` holds `prob`, `E_miss` and block count
+constant across its keys, so decay is the only term that varies and every
+ablation reports as inert (09 §1). A trace with keys of differing prefix size
+and differing recurrence is what makes the sweep able to answer anything.
 
 `use_call_type: false` is the fallback if labels turn out not to be
 deterministic across turns — it keys at `(job_id, node)` instead. It is a

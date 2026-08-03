@@ -52,10 +52,13 @@ def test_finished_request_stats_include_request_logger_fields():
     assert finished_request.output_text == "hello output"
     assert finished_request.num_cached_tokens == 5
     assert finished_request.prefix_cache_hit_rate == 0.25
-    assert finished_request.queued_time == 0.1
-    assert finished_request.prefill_time == 0.3
-    assert finished_request.inference_time == 0.9
-    assert finished_request.decode_time == 0.6
+    # Every duration below is a subtraction of two wall-clock floats
+    # (100.1 - 100.0 is 0.10000000000000853, not 0.1), so none of them can be
+    # compared exactly.
+    assert finished_request.queued_time == pytest.approx(0.1)
+    assert finished_request.prefill_time == pytest.approx(0.3)
+    assert finished_request.inference_time == pytest.approx(0.9)
+    assert finished_request.decode_time == pytest.approx(0.6)
     # Absolute wall-clock timestamps: the Trace Analyser infers tool
     # execution time from the gap between two requests of a job, and a gap
     # cannot be derived from durations.
