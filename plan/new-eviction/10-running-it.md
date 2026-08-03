@@ -39,7 +39,9 @@ Four processes. Only three of them are servers.
 ```
 
 - **kv-prediction-engine is a library, not a service.** It runs inside the
-  workflow process, because it needs the workflow's state transitions.
+  workflow process, because it needs the workflow's state transitions. For
+  LangGraph it is wrapped by `KVForecastSession` in the langgraph fork; for
+  Open Deep Research the whole path is already wired — see §7.4.
 - **kv-trace-analyser is a daemon** and it tails a file vLLM writes. That is
   the one hard co-location constraint — see §2.
 - The engine never writes to Redis and never reads a socket on the request
@@ -136,20 +138,32 @@ export VLLM_NODE_EVICTION_POLICY=1
 export VLLM_NODE_EVICTION_REDIS_URL=redis://localhost:6379/0
 
 # Required for the analyser — this is the trace transport.
-export VLLM_REQUEST_STATS_DIR=/var/log/vllm/stats
+export VLLM_REQUEST_STATS_DIR=/disk2/vibhav/vllm-logs/stats
 
 # Optional, debugging only. Unbounded under pressure.
-export VLLM_NODE_EVICTION_DECISION_LOG=/var/log/vllm/evictions.jsonl
+export VLLM_NODE_EVICTION_DECISION_LOG=/disk2/vibhav/vllm-logs/debug/evictions.jsonl
 
 # Optional, all tunables. See §9.
-export VLLM_NODE_EVICTION_CONFIG=/etc/vllm/node_eviction.json
+export VLLM_NODE_EVICTION_CONFIG=/home/vibhav/Build/KVCOMM-VLLM/vllm/node_eviction.json
 
-mkdir -p "$VLLM_REQUEST_STATS_DIR"
-vllm serve <model> --host 0.0.0.0 --port 8000
-```
+
+LMCACHE_MP_FULL_HIT_ONLY=0 VLLM_USE_DEEP_GEMM=0 \
+vllm serve Qwen/Qwen2.5-72B-Instruct-AWQ --port 8000 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --max-model-len 120000 \
+  --hf-overrides '{"rope_parameters":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}' \
+  --gpu-memory-utilization 0.95 \
+  --block-size 16 \
+  --max-num-seqs 1 \
+  --enable-prefix-caching \
+  --enforce-eager \
+  --seed 0 \
+  --enable-prompt-tokens-details
+
 
 Do **not** pass `--disable-log-stats`; the `FileStatLogger` will not run and
 the analyser will have nothing to tail.
+```
 
 ### Verify
 
@@ -160,7 +174,8 @@ tail -1 $VLLM_REQUEST_STATS_DIR/finished_requests_engine*.jsonl \
   | python -c 'import json,sys; r=json.load(sys.stdin); print({k:r[k] for k in ("job_id","langgraph_node","call_type","arrival_ts","finish_ts")})'
 ```
 
-If `call_type` is `null`, the workflow is not sending `vllm_xargs` — go to §7.
+If `call_type` is `null`, the workflow is not attaching identity to its
+requests — go to §7.3.
 
 The A/B baseline is `VLLM_NODE_EVICTION_POLICY=0`, which is byte-identical to
 upstream: the controller is never built and every hook is a null check.
@@ -206,7 +221,8 @@ observations, and updates are debounced to 1/s per job.
 
 ## 7. Step 4 — the workflow
 
-This is the only part that needs code you write.
+For the Open Deep Research benchmark this is **already wired**; see §7.4 for
+what changed and where. For any other workflow, §7.1–7.3 are the contract.
 
 ```bash
 cd ~/Projects/kv-prediction-engine
@@ -221,24 +237,11 @@ inherits instead of starting from uniform successors.
 
 ### 7.1 Declare the graph
 
-Either from a compiled LangGraph:
-
-```python
-from kv_prediction_engine import PredictionEngine, PredictionConfig
-from kv_prediction_engine.adapters import graph_from_langgraph
-from kv_prediction_engine.publisher import build_client
-
-graph = graph_from_langgraph(
-    compiled_graph,
-    react_nodes={"research"},
-    call_sites={
-        "supervisor": ["plan"],
-        "research":   ["summary", ("summary", "tavily")],
-    },
-)
-```
-
-or, with no framework:
+`react_nodes` and `call_sites` cannot be inferred — LangGraph does not know
+which nodes accumulate a prefix, and `call_type` **must** come from declared
+structure rather than runtime content (05 §4). A label derived from message
+count, tool output, or an LLM-call index drifts, re-keys the same blocks every
+turn, and is worse than no policy at all.
 
 ```python
 from kv_prediction_engine.adapters import graph_from_spec
@@ -252,49 +255,106 @@ graph = graph_from_spec({
 })
 ```
 
-`react_nodes` and `call_sites` cannot be inferred — LangGraph does not know
-which nodes accumulate a prefix, and `call_type` **must** come from declared
-structure rather than runtime content (05 §4). A label derived from message
-count or tool output drifts, re-keys the same blocks every turn, and is worse
-than no policy at all.
+> **`graph_from_langgraph` is usually the wrong tool, and fails silently.**
+> It reads `compiled.get_graph()`, which sees only top-level nodes. Passing
+> `xray=True` is not a fix: `Graph.extend(subgraph, prefix=name)` emits
+> `f"{prefix}:{id}"`, so a subgraph node arrives as
+> `research_supervisor:supervisor` while the runtime
+> `metadata["langgraph_node"]` — the value actually sent to vLLM — is the bare
+> `supervisor`. Every row then mis-joins with no error. Worse, a subgraph
+> invoked *imperatively* rather than registered with `add_node` is invisible at
+> any xray depth. Check both before trusting it; prefer a hand-written spec
+> using the names the runtime emits, and reconcile it at startup.
 
 ### 7.2 Drive the lifecycle
 
 ```python
-config = PredictionConfig.from_env()
-engine = PredictionEngine(graph, config, client=build_client(config.redis_url))
-
 engine.start_job(job_id)              # writes INFO + initial PROB
-...
 engine.enter_node(job_id, "research") # republishes PROB
 engine.start_tool(job_id, "research", "tavily")
 engine.exit_node(job_id, "research")
-...
 engine.end_job(job_id)                # floors every key, saves transitions
 ```
 
 `end_job` is what frees a finished job's blocks promptly rather than waiting
-for the age term to decay them out. Put it in a `finally`.
+for the age term to decay them out. Put it in a `finally` — a job that died
+still has to release its blocks.
+
+Under LangGraph, `astream(stream_mode="tasks", subgraphs=True)` already emits
+exactly these transitions, so the lifecycle needs no hook inside the Pregel
+loop. Drive it from that stream rather than from the transition-prediction
+tracker: the tracker is gated on a `transition_prediction` config, which is
+the same switch that turns the prefix-prefetch worker on — and an eviction
+experiment usually wants prefetch *off* (§7.4).
 
 ### 7.3 Attach identity to every LLM request
 
-```python
-extra = engine.call_context(job_id, node="research", call="summary", tool="tavily")
-# -> {"job_id": ..., "langgraph_node": "research", "call_type": "tavily:summary"}
+Three fields must ride on every request: `job_id`, `langgraph_node`,
+`call_type`. Both of these reach `sampling_params.extra_args`:
 
-client.chat.completions.create(
-    model=...,
-    messages=...,
-    extra_body={"vllm_xargs": extra},
-)
+```python
+# (a) explicit — vllm_xargs is the documented field
+extra_body={"vllm_xargs": {"job_id": ..., "langgraph_node": ..., "call_type": ...}}
+
+# (b) top-level — what the ODR integration actually uses
+extra_body={"job_id": ..., "langgraph_node": ..., "call_type": ...}
 ```
 
-`vllm_xargs` is what becomes `sampling_params.extra_args` inside the engine,
-which is where both the index key and the trace fields are read from.
+(b) works because `OpenAIBaseModel` sets `extra="allow"`, so unknown top-level
+body fields land in `model_extra`, which `chat_completion/protocol.py` merges
+into `extra_args`. Either is fine; (b) is convenient when a LangChain
+integration already owns `extra_body`.
 
-`call_context` raises `UnknownCallSite` for an undeclared call site. That is
-deliberate: the alternative is a label that reaches vLLM with no matching
-`PROB` row and joins to nothing, silently.
+A request that arrives with no `call_type` is indexed under the empty label
+and will not join `PROB`/`HISTORY` rows that carry one. Send it, or set
+`use_call_type: false` in the vLLM config — **the two sides must agree.**
+
+### 7.4 What is wired for Open Deep Research
+
+| Where | Change |
+|---|---|
+| `langgraph-dev` `pregel/_vllm_agent.py` | `derive_call_type(node, tool)` — the label, beside the existing `derive_agent_id` |
+| `langgraph-dev` `pregel/_kv_forecast.py` | *new* — `KVForecastSession`, a generic driver owning the `PredictionEngine`; topology arrives as a spec, so it knows nothing about ODR |
+| `open_deep_research/llm_request_metadata.py` | sets `payload["call_type"]` beside the `job_id` / `langgraph_node` it already sent |
+| `tests/run_evaluate_node_eviction.py` | env setup, `ODR_GRAPH_SPEC`, lifecycle on the existing task stream, startup reconcile, shutdown flush |
+
+Run it:
+
+```bash
+export KV_FORECAST_REDIS_URL=redis://localhost:6379/0
+python tests/run_evaluate_node_eviction.py --max-queries 6
+```
+
+Notes specific to this integration:
+
+- **`LANGGRAPH_ABLATION_MODE` defaults to `baseline` here**, not `full`. The
+  prefix-prefetch worker is an independent mechanism; running both at once
+  means a hit-rate change cannot be attributed to either. Override explicitly
+  to measure the combination.
+- **`VLLM_REQUEST_STATS_DIR` is set by the harness** and defaults under its
+  own metrics directory. Point the analyser (§6) at the value it prints.
+- **The graph spec is hand-written** (9 nodes), for the reason in §7.1: ODR
+  nests `supervisor`/`supervisor_tools` in a registered subgraph and invokes
+  `researcher`/`researcher_tools`/`compress_research` imperatively, so no
+  reflection route names them the way the runtime does. `research_supervisor`
+  is declared with no call sites — it makes no LLM call but is a real
+  transition state.
+- **Drift is caught twice**: top-level nodes at startup, everything else from
+  the task stream via `unknown_nodes`, printed at the end of the run. An
+  undeclared node is not fatal — it gets no `PROB` row, so its blocks stay
+  unscored in LRU order — but it silently drops out of the experiment.
+
+Verify the spec builds before a long run:
+
+```bash
+python -c "
+from kv_prediction_engine.adapters import graph_from_spec
+import sys; sys.path.insert(0,'tests')
+from run_evaluate_node_eviction import ODR_GRAPH_SPEC as S
+g = graph_from_spec(S, name='open_deep_research')
+print('nodes', len(g.nodes), 'keys', len(g.keys()))
+"
+```
 
 ---
 
@@ -308,6 +368,27 @@ Start in this order and verify each before the next.
 | 2 | vLLM | JSONL file appears; `call_type` non-null after a workflow request |
 | 3 | Analyser | `HISTORY\|*` keys appear after ≥2 requests per node |
 | 4 | Workflow | `PROB\|*` and `INFO\|*` appear |
+
+The single most informative check is step 2's `call_type`. All three identity
+fields travel the same path, so if `call_type` is null in the JSONL then the
+`extra_body` plumbing is broken and **the policy is inert no matter what else
+is running** — every block indexes under a null key and nothing is ranked:
+
+```bash
+tail -1 $VLLM_REQUEST_STATS_DIR/finished_requests_engine*.jsonl \
+  | python -c 'import json,sys; r=json.load(sys.stdin); print({k:r[k] for k in ("job_id","langgraph_node","call_type")})'
+```
+
+Then confirm the forecast side is publishing, and that its labels match:
+
+```bash
+redis-cli --scan --pattern 'PROB|*'
+redis-cli GET "PROB|<job_id>" | python -m json.tool | grep -E 'node_name|call_type'
+```
+
+Those `call_type` values must be **byte-identical** to the ones in the JSONL
+above. A mismatch is the silent failure this whole contract exists to prevent:
+both sides keep working, nothing errors, and the join simply returns nothing.
 
 Then confirm the engine is actually consuming the forecast:
 
@@ -331,7 +412,8 @@ evicting your best blocks.
 transition counts, so `time_to_next_call` falls back to
 `default_llm_time_ms + default_tool_time_ms` and is marked low confidence,
 and reach probabilities start uniform. Do a warm-up run before judging
-anything.
+anything — and keep `KV_PREDICTION_TRANSITION_STORE` on a path that survives
+it, or every run is a cold start.
 
 ---
 
@@ -354,7 +436,12 @@ without a rebuild:
 }
 ```
 
-**Every one of these is an unvalidated default.** Do not tune them by
+`use_call_type` is the one entry here that is **not** a tuning knob — it is
+half of a contract. `true` requires the workflow to send a `call_type`;
+`false` keys at `(job_id, node)` and ignores it. The ODR integration sends one,
+so it stays `true`. Changing it on one side only makes every key miss.
+
+**Every other one is an unvalidated default.** Do not tune them by
 intuition — the offline harness replays a captured trace deterministically:
 
 ```bash

@@ -1,0 +1,12 @@
+{
+  "use_call_type": true,
+  "tick_period_ms": 250,
+  "splice_max_blocks": 256,
+  "fresh_skip_threshold": 0,
+  "tau_ms": 30000,
+  "delta_l1_ms": 180,
+  "delta_cold_ms": 11400,
+  "staleness_cutoff_ms": 300000,
+  "speculative_default_ttl_ms": 30000,
+  "index_hard_drop_age_ms": 1800000
+}
