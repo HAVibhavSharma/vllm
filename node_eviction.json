@@ -16,5 +16,9 @@
   "prefetch_max_per_drain": 4,
   "prefetch_want_ttl_ms": 30000,
   "prefetch_resubmit_backoff_ms": 60000,
-  "prefetch_agent_namespace": "langgraph"
+  "prefetch_agent_namespace": "langgraph",
+
+  "hbm_summary_period_ms": 30000,
+  "hbm_summary_top_keys": 5,
+  "remat_window_blocks": 0
 }
