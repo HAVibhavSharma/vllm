@@ -150,6 +150,19 @@ class KVCacheManager:
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
+        if self.block_pool.hbm_summary is not None:
+            # `BlockPool` builds the logger but does not know the byte size
+            # of a block — only the KVCacheConfig here does. Summed over
+            # groups: one block id covers a page in every group, so the KV
+            # rebuilt when that id is evicted and re-cached is the sum, not
+            # any one group's page.
+            self.block_pool.hbm_summary.configure(
+                block_size_bytes=sum(
+                    g.kv_cache_spec.page_size_bytes
+                    for g in kv_cache_config.kv_cache_groups
+                )
+            )
+
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
         # overhead.
@@ -218,6 +231,15 @@ class KVCacheManager:
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
+            )
+
+        if self.block_pool.hbm_summary is not None:
+            # Tracked separately from `prefix_cache_stats`, which whoever
+            # polls the metrics loggers drains on read — sharing it would
+            # make the summary line's hit rate depend on whether anything
+            # else was scraping, and on `log_stats` being on at all.
+            self.block_pool.hbm_summary.on_cache_query(
+                num_tokens=request.num_tokens, num_hits=num_new_computed_tokens
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens

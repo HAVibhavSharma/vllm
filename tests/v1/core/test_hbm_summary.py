@@ -27,6 +27,14 @@ EXPECTED_FIELDS = [
     "evicted",
     "evicted_by_score",
     "regret",
+    "hit_rate",
+    "hit_rate_win",
+    "hit_tokens",
+    "query_tokens",
+    "remat_blocks",
+    "remat_mb",
+    "remat_ratio",
+    "blocks_cached",
     "index_keys",
     "index_blocks",
     "top_evicted",
@@ -202,3 +210,158 @@ def test_logger_is_on_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_HBM_SUMMARY_PERIOD_MS", raising=False)
     built = HBMSummaryLogger.maybe_build(FakePool())
     assert built is not None and built.period_ms == 30_000.0
+
+
+# -- hit rate ------------------------------------------------------------
+
+
+def test_hit_rate_is_tokens_not_requests():
+    """A 10-token request that fully hit and a 10k-token one that missed are
+    not one hit and one miss — the second cost a thousand times more."""
+    logger = make_logger(FakePool())
+    logger.on_cache_query(num_tokens=10, num_hits=10)
+    logger.on_cache_query(num_tokens=10_000, num_hits=0)
+    assert logger.hit_rate == 10 / 10_010
+    assert float(parse(logger.summary())["hit_rate"]) == round(10 / 10_010, 4)
+
+
+def test_windowed_hit_rate_resets_but_cumulative_does_not():
+    """A cumulative rate over a long run is dominated by whatever the
+    workload did first, so the line carries both."""
+    pool = FakePool()
+    logger = make_logger(pool, period_ms=10_000.0)
+    logger.on_cache_query(num_tokens=100, num_hits=0)
+    logger.maybe_log(1_000_000.0)
+
+    logger.on_cache_query(num_tokens=100, num_hits=100)
+    fields = parse(logger.maybe_log(2_000_000.0))
+    assert float(fields["hit_rate_win"]) == 1.0
+    assert float(fields["hit_rate"]) == 0.5
+
+
+def test_hit_rate_is_zero_before_any_query():
+    """Not a crash, and not NaN — NaN poisons every downstream average."""
+    assert float(parse(make_logger(FakePool()).summary())["hit_rate"]) == 0.0
+
+
+# -- cache movement ------------------------------------------------------
+
+
+def cache_block(logger, pool, block_id, tag, node="research"):
+    block = pool.blocks[block_id]
+    if block.block_hash is not None:
+        block.reset_hash()
+    block.block_hash = tag
+    logger.on_blocks_cached(make_request(node=node), [block])
+
+
+def test_a_first_time_prefix_is_not_movement():
+    """The number must credit the policy only for work it made us redo. A
+    prefix the server has never seen is not that."""
+    pool = FakePool()
+    logger = make_logger(pool)
+    for i in (1, 2, 3):
+        cache_block(logger, pool, i, f"h{i}")
+    assert logger.remat_blocks == 0
+
+
+def test_recaching_an_evicted_hash_counts_as_movement():
+    pool = FakePool()
+    logger = make_logger(pool)
+    cache_block(logger, pool, 1, "hA")
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_blocks == 1
+
+
+def test_movement_needs_a_second_eviction_to_count_twice():
+    """Otherwise every later cache of a popular prefix reads as movement and
+    the number grows without anything being rebuilt."""
+    pool = FakePool()
+    logger = make_logger(pool)
+    cache_block(logger, pool, 1, "hA")
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_blocks == 1
+
+    # Cached again with no eviction in between: not movement.
+    pool.blocks[1].reset_hash()
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_blocks == 1
+
+    # A second eviction, then a second rebuild: movement again.
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_blocks == 2
+
+
+def test_the_evicted_ring_is_bounded():
+    """The ring is what bounds the memory, so its size has to actually bite."""
+    pool = FakePool(num_blocks=32)
+    logger = HBMSummaryLogger(pool, period_ms=10_000.0, remat_window_blocks=4)
+    for i in range(1, 11):
+        cache_block(logger, pool, i, f"h{i}")
+        logger.on_block_evicted(i)
+        pool.blocks[i].reset_hash()
+
+    assert len(logger._evicted_hashes) == 4
+    # h1 aged out, so rebuilding it is no longer attributed to this policy.
+    cache_block(logger, pool, 1, "h1")
+    assert logger.remat_blocks == 0
+    # h10 is still in the ring.
+    cache_block(logger, pool, 10, "h10")
+    assert logger.remat_blocks == 1
+
+
+def test_reset_prefix_cache_is_not_movement():
+    """An operator wiping the cache did not make the policy redo work."""
+    pool = FakePool()
+    logger = make_logger(pool)
+    cache_block(logger, pool, 1, "hA")
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+
+    logger.on_reset_prefix_cache()
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_blocks == 0
+
+
+def test_movement_in_mb_uses_the_configured_page_size():
+    pool = FakePool()
+    logger = make_logger(pool)
+    logger.configure(block_size_bytes=2_000_000)
+    cache_block(logger, pool, 1, "hA")
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_mb == 2.0
+    assert parse(logger.summary())["remat_mb"] == "2.0"
+
+
+def test_movement_in_mb_is_zero_when_the_page_size_is_unknown():
+    """Reported rather than guessed: a fabricated byte count is worse than an
+    absent one when the point is comparing two runs."""
+    pool = FakePool()
+    logger = make_logger(pool)
+    cache_block(logger, pool, 1, "hA")
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(logger, pool, 1, "hA")
+    assert logger.remat_blocks == 1
+    assert logger.remat_mb == 0.0
+
+
+def test_remat_ratio_is_over_all_caching_work():
+    pool = FakePool()
+    logger = make_logger(pool)
+    for i in (1, 2, 3):
+        cache_block(logger, pool, i, f"h{i}")
+    logger.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(logger, pool, 1, "h1")
+    # 4 blocks cached, 1 of them a rebuild.
+    assert logger.remat_ratio == 0.25

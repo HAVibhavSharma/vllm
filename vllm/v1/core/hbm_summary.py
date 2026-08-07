@@ -27,6 +27,7 @@ pressure has a source.
 
 import os
 import time
+from collections import deque
 
 from vllm.logger import init_logger
 
@@ -73,10 +74,20 @@ class HBMSummaryLogger:
         block_pool,
         period_ms: float,
         top_keys: int = 5,
+        remat_window_blocks: int = 0,
+        block_size_bytes: int = 0,
     ) -> None:
         self.block_pool = block_pool
         self.period_ms = period_ms
         self.top_keys = top_keys
+        self.block_size_bytes = block_size_bytes
+        # `0` sizes the ring to the pool: one full turnover is the horizon
+        # over which an eviction is still this policy's doing.
+        self.remat_window_blocks = (
+            remat_window_blocks
+            if remat_window_blocks > 0
+            else getattr(block_pool, "num_gpu_blocks", 0)
+        )
 
         # block_id -> owning node label. Bounded by the pool: an entry is
         # added when a block is given a hash and removed when that hash is
@@ -86,11 +97,34 @@ class HBMSummaryLogger:
         # stops being named instead of pinning its job_id forever.
         self._evictions_by_key: dict[str, int] = {}
 
+        # Hashes that were cached and then evicted. `set` for the O(1)
+        # membership test on the caching path, `deque` for the eviction order
+        # the ring needs; they are kept in step.
+        self._evicted_hashes: deque = deque()
+        self._evicted_hash_set: set = set()
+
         self.evictions_total = 0
         self.blocks_cached_total = 0
+        self.remat_blocks = 0
+        self.hit_tokens = 0
+        self.query_tokens = 0
+        # Reset when a line is emitted: a cumulative hit rate over a long run
+        # is dominated by whatever the workload did first.
+        self.window_hit_tokens = 0
+        self.window_query_tokens = 0
 
         self._last_log_monotonic = 0.0
         self._last_fingerprint: tuple[int, ...] | None = None
+
+    def configure(self, block_size_bytes: int) -> None:
+        """Told the KV page size after construction.
+
+        `BlockPool` builds this and does not know the byte size of a block —
+        only `KVCacheManager` holds the `KVCacheConfig`. Left at 0 the MB
+        figure reports 0 rather than a guess: a fabricated byte count is
+        worse than an absent one when the point is comparing two runs.
+        """
+        self.block_size_bytes = block_size_bytes
 
     @classmethod
     def maybe_build(cls, block_pool) -> "HBMSummaryLogger | None":
@@ -114,7 +148,16 @@ class HBMSummaryLogger:
             top_keys = int(os.environ.get("VLLM_HBM_SUMMARY_TOP_KEYS", "5"))
         except ValueError:
             top_keys = 5
-        return cls(block_pool, period_ms, max(top_keys, 0))
+        try:
+            window = int(os.environ.get("VLLM_HBM_REMAT_WINDOW_BLOCKS", "0"))
+        except ValueError:
+            window = 0
+        return cls(
+            block_pool,
+            period_ms,
+            max(top_keys, 0),
+            remat_window_blocks=max(window, 0),
+        )
 
     # -- hooks from BlockPool ---------------------------------------------
 
@@ -125,17 +168,105 @@ class HBMSummaryLogger:
                 continue
             self._owner[block.block_id] = label
             self.blocks_cached_total += 1
+            self._note_cached(block.block_hash)
 
     def on_block_evicted(self, block_id: int) -> None:
         label = self._owner.pop(block_id, UNTRACKED)
         self._evictions_by_key[label] = self._evictions_by_key.get(label, 0) + 1
         self.evictions_total += 1
+        # Read off the block rather than passed in: `BlockPool` calls this
+        # *before* `reset_hash()`, so the hash is still there.
+        self._note_evicted(self._hash_of(block_id))
+
+    def on_cache_query(self, num_tokens: int, num_hits: int) -> None:
+        """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
+
+        Counted here rather than read off `PrefixCacheStats` because that
+        object is drained by whoever polls the metrics loggers — sharing it
+        would make this hit rate depend on whether anything else was
+        scraping, and on `log_stats` being on at all.
+        """
+        self.query_tokens += num_tokens
+        self.hit_tokens += num_hits
+        self.window_query_tokens += num_tokens
+        self.window_hit_tokens += num_hits
 
     def on_reset_prefix_cache(self) -> None:
         # Every hash in the pool was just invalidated, so every claim here is
         # stale. Not counted as evictions: that would attribute an operator
         # action to whichever job happened to be resident.
         self._owner.clear()
+        # Nothing in the ring can be rematerialised either — a later cache of
+        # the same prefix is new work, not redone work.
+        self._evicted_hashes.clear()
+        self._evicted_hash_set.clear()
+
+    # -- rematerialisation --------------------------------------------------
+    #
+    # A block is counted as movement when its hash is cached *again* after
+    # having been evicted: the block existed, we threw it away, we rebuilt
+    # it. That is work the eviction forced, and a better policy avoids it.
+    #
+    # Deliberately not the miss count. Misses include every prefix the server
+    # has never seen, which no eviction policy can do anything about;
+    # counting them would credit a policy for a cold start. Rematerialisation
+    # is zero for a first-time prefix by construction.
+
+    def _hash_of(self, block_id: int):
+        blocks = getattr(self.block_pool, "blocks", None)
+        if blocks is None or block_id >= len(blocks):
+            return None
+        return blocks[block_id].block_hash
+
+    def _note_cached(self, block_hash) -> None:
+        if block_hash is None:
+            return
+        if block_hash in self._evicted_hash_set:
+            self.remat_blocks += 1
+            # Discard rather than leave it: the hash is resident again, so a
+            # *second* remat requires a second eviction. Leaving it would
+            # count every subsequent cache of the same prefix as movement.
+            self._evicted_hash_set.discard(block_hash)
+
+    def _note_evicted(self, block_hash) -> None:
+        if block_hash is None or self.remat_window_blocks == 0:
+            return
+        # The set is the membership test; the deque only supplies eviction
+        # order. A hash that was counted and discarded from the set can be
+        # appended again, leaving a stale duplicate in the deque — it pops
+        # early and shortens the window slightly for that one hash. The error
+        # is bounded and conservative (it can only *under*-count movement),
+        # which is the right direction for a number used to claim an
+        # improvement.
+        if block_hash not in self._evicted_hash_set:
+            self._evicted_hashes.append(block_hash)
+            self._evicted_hash_set.add(block_hash)
+        while len(self._evicted_hashes) > self.remat_window_blocks:
+            self._evicted_hash_set.discard(self._evicted_hashes.popleft())
+
+    @property
+    def hit_rate(self) -> float:
+        if self.query_tokens == 0:
+            return 0.0
+        return self.hit_tokens / self.query_tokens
+
+    @property
+    def window_hit_rate(self) -> float:
+        if self.window_query_tokens == 0:
+            return 0.0
+        return self.window_hit_tokens / self.window_query_tokens
+
+    @property
+    def remat_mb(self) -> float:
+        """The movement number, in MB of KV actually rebuilt."""
+        return self.remat_blocks * self.block_size_bytes / 1e6
+
+    @property
+    def remat_ratio(self) -> float:
+        """Fraction of all caching work that was redoing work."""
+        if self.blocks_cached_total == 0:
+            return 0.0
+        return self.remat_blocks / self.blocks_cached_total
 
     # -- reporting ---------------------------------------------------------
 
@@ -158,6 +289,14 @@ class HBMSummaryLogger:
             f"evicted={self.evictions_total} "
             f"evicted_by_score=0 "
             f"regret=0.000 "
+            f"hit_rate={self.hit_rate:.4f} "
+            f"hit_rate_win={self.window_hit_rate:.4f} "
+            f"hit_tokens={self.hit_tokens} "
+            f"query_tokens={self.query_tokens} "
+            f"remat_blocks={self.remat_blocks} "
+            f"remat_mb={self.remat_mb:.1f} "
+            f"remat_ratio={self.remat_ratio:.4f} "
+            f"blocks_cached={self.blocks_cached_total} "
             f"index_keys={len(set(self._owner.values()))} "
             f"index_blocks={len(self._owner)} "
             f"top_evicted={top_str}"
@@ -181,14 +320,23 @@ class HBMSummaryLogger:
 
         # Occupancy is deliberately not in the fingerprint: it moves by a
         # block on every step, which would defeat the gate entirely.
-        fingerprint = (self.evictions_total, self.blocks_cached_total)
+        fingerprint = (
+            self.evictions_total,
+            self.blocks_cached_total,
+            self.query_tokens,
+            self.remat_blocks,
+        )
         if fingerprint == self._last_fingerprint:
             return None
         self._last_log_monotonic = now
         self._last_fingerprint = fingerprint
         line = self.summary()
         logger.info("%s", line)
+        # Per window, so the next line names who is evicting *now* and shows
+        # the hit rate *now*.
         self._evictions_by_key.clear()
+        self.window_hit_tokens = 0
+        self.window_query_tokens = 0
         return line
 
     def stats(self) -> dict[str, float | int]:
@@ -204,6 +352,15 @@ class HBMSummaryLogger:
             "splices_total": 0,
             "blocks_spliced_total": 0,
             "evictions_total": self.evictions_total,
+            "hit_rate": self.hit_rate,
+            "hit_rate_window": self.window_hit_rate,
+            "hit_tokens": self.hit_tokens,
+            "query_tokens": self.query_tokens,
+            "remat_blocks": self.remat_blocks,
+            "remat_mb": self.remat_mb,
+            "remat_ratio": self.remat_ratio,
+            "blocks_cached_total": self.blocks_cached_total,
+            "block_size_bytes": self.block_size_bytes,
             "index_keys": len(set(self._owner.values())),
             "index_blocks": len(self._owner),
         }
