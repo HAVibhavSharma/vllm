@@ -286,6 +286,32 @@ halves of the rule are the step-3 machinery, consulted implicitly.
   index's own `speculative` flag, and counts a block as waste only when **every**
   owning key is still speculative.
 
+### 5.6 Rule 1 was measuring the wrong quantity — found from a real run
+
+**2026-08-03, from `evictions.jsonl` on `chisel-8`: 21,002 evictions, `score`
+and `rank_in_splice` null on every single one.** The value table had never been
+built.
+
+`maybe_tick` skipped the splice while `block_pool.num_free_fresh >
+fresh_skip_threshold`, i.e. while any unhashed block was queued anywhere. But
+a block freed *without* a hash — the partial tail block of a request — is
+`append`ed to the **tail** and counted as fresh (`kv_cache_utils.py:351`). A
+steady workload therefore parks a permanent floor of fresh-but-unreachable
+blocks behind the cached ones: on that run `num_free_fresh` never fell below
+**21**, so the tick took the `ticks_skipped_fresh` branch every time and the
+policy degraded silently to LRU while still indexing, logging and holding a
+Redis connection. Exactly the failure 07 opens by warning about.
+
+The rule only ever concerned blocks `appendleft` can jump, and `appendleft`
+inserts at the absolute head. So the guard now counts the fresh run **at the
+head** (`controller._head_fresh_run`), bounded by the threshold, which is O(1)
+at the default. `fresh_skip_threshold=0` now means what 01 §6 Rule 1 says:
+skip only while the very next block to be popped is unused.
+
+This also closes the "Rule 1 boundary is uninstrumented" gap by removing the
+boundary — at the head there is no band in which K cached blocks can be
+spliced ahead of a few fresh ones.
+
 New counters: `prefetch_wants_{created,dropped,drained,satisfied,expired}`,
 plus `prefetch_want_hit_rate` — which separates "the phantom never ran" from
 "the forecast was wrong", two failures `speculative_waste` alone cannot tell
@@ -327,9 +353,9 @@ Inside vLLM:
   scheduler step. Not done.
 - **No benchmark.** 01 §8 wants an undersized cache, a stated baseline, and
   the noisy-forecast arm the old caveats doc called for but never ran.
-- **Rule 1 boundary is uninstrumented.** 01 §6 leaves open that at the
-  `num_free_fresh` threshold, up to K cached blocks can still be spliced
-  ahead of a few fresh ones, and asks for a metric. There isn't one.
+- ~~**Rule 1 boundary is uninstrumented.**~~ Closed by §5.6: the guard is
+  measured at the head now, so the band in which K cached blocks could be
+  spliced ahead of a few fresh ones no longer exists.
 
 Outside vLLM — both components now exist as separate installable packages,
 and unlike the engine-side work **their tests have been run**:

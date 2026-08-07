@@ -135,9 +135,20 @@ class NodeEvictionConfig:
     heuristic."""
 
     fresh_skip_threshold: int = 0
-    """Skip the splice entirely while more than this many *fresh* (unhashed)
-    blocks are queued. Rule 1: an unused block must be consumed before any
-    cached block is destroyed, and `appendleft` inserts ahead of everything."""
+    """Skip the splice while more than this many *fresh* (unhashed) blocks sit
+    at the **head** of the free queue. Rule 1: an unused block must be consumed
+    before any cached block is destroyed, and `appendleft` inserts ahead of
+    everything.
+
+    Measured at the head, not over the whole queue. A block freed without a
+    hash is appended to the *tail* and is still "fresh", so the whole-queue
+    count has a permanent floor in any steady workload — on a real run it never
+    dropped below 21, which made the splice skip every tick and the policy
+    degrade silently to LRU. Only blocks at the head can be jumped by
+    `appendleft`, so only those are the ones Rule 1 is about.
+
+    0 means "skip only while the very next block to be popped is fresh", which
+    is the rule stated exactly."""
 
     score_threshold: float | None = None
     """If set, only blocks scoring below this are spliced. `None` means
@@ -163,6 +174,24 @@ class NodeEvictionConfig:
 
     regret_buffer_size: int = 4096
     """Bound on the ring buffer backing that counter."""
+
+    hbm_summary_period_ms: float = 30_000.0
+    """How often the tick may log one INFO line of HBM block accounting:
+    how many blocks exist, how many are in use, how many sit in the free
+    queue, how many the splice reshuffled, and which node keys the evictions
+    came from. Rate limited *and* change-gated like the prefetch line, so an
+    idle server stays silent. Set to 0 to turn the line off.
+
+    The line is emitted in the same `kv_hbm ...` key=value shape by the LRU
+    baseline, so the two runs diff directly. Without it there is no way to
+    tell a policy that reshuffled nothing from one that reshuffled
+    constantly — both look identical in the hit rate until the workload
+    changes."""
+
+    hbm_summary_top_keys: int = 5
+    """How many `job_id:node` keys the HBM line names as eviction sources.
+    Counted per window and reset after each line, which is also what bounds
+    the memory: a finished job stops appearing instead of accumulating."""
 
     # --- Redis transport (01 §2) ------------------------------------------
     redis_url: str | None = None
@@ -267,6 +296,8 @@ class NodeEvictionConfig:
             raise ValueError("prefetch_max_outstanding must be >= 0")
         if self.prefetch_max_per_drain < 0:
             raise ValueError("prefetch_max_per_drain must be >= 0")
+        if self.hbm_summary_top_keys < 0:
+            raise ValueError("hbm_summary_top_keys must be >= 0")
         if self.prefetch_wants_enabled and not self.prefetch_agent_namespace:
             # An empty namespace yields agent_id ":research", which matches
             # nothing in the registry — every want would fan out to zero

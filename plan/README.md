@@ -35,3 +35,5 @@ Related shipped entrypoint packages (no standalone doc yet — read the code):
 | [`num_computed_tokens_output.md`](num_computed_tokens_output.md) | `num_computed_tokens` accounting / job stats. | Recent (tracks current commits). |
 | [`prefix_token_sweep.md`](prefix_token_sweep.md) | Prefix token sweep experiment. | Reference. |
 | [`commands.md`](commands.md) | Run/serve commands used during development. | Verify flags against current CLI. |
+| [`hbm-logging-changes.md`](hbm-logging-changes.md) | The `kv_hbm` log line — HBM block accounting and `job:node` eviction attribution, added to both this branch and the LRU baseline clone for comparison. | **As-built** (2026-08-07); tests written, not yet run. |
+| [`hbm-timeline-visualisation.md`](hbm-timeline-visualisation.md) | Spec for an HTML timeline page built from the `kv_hbm` lines of both runs. | **Not built** — spec only. |

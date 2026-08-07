@@ -152,6 +152,14 @@ class NodeEvictionController:
         self._wants: PrefetchWantList | None = None
         self._last_prefetch_log_monotonic = 0.0
         self._last_prefetch_fingerprint: tuple[int, ...] | None = None
+
+        # HBM accounting line. `_evictions_by_key` counts per window and is
+        # cleared when the line is emitted: a job that finished stops being
+        # named instead of pinning its `job_id` in a dict for the lifetime
+        # of the server.
+        self._last_hbm_log_monotonic = 0.0
+        self._last_hbm_fingerprint: tuple[int, ...] | None = None
+        self._evictions_by_key: dict[str, int] = {}
         if config.prefetch_wants_enabled and self.enabled:
             self._wants = PrefetchWantList(
                 max_outstanding=config.prefetch_max_outstanding,
@@ -268,6 +276,18 @@ class NodeEvictionController:
             was_spliced=breakdown is not None and breakdown.scored,
             speculative=speculative,
         )
+        # Attribute the eviction to the node that owned the block, so the
+        # summary line can say *whose* prefix was destroyed rather than only
+        # how many blocks went. A block with several owners is charged to
+        # each: the eviction cost all of them their hit.
+        for key in keys:
+            label = f"{key.job_id}:{key.node}"
+            self._evictions_by_key[label] = self._evictions_by_key.get(label, 0) + 1
+        if not keys:
+            self._evictions_by_key["<untracked>"] = (
+                self._evictions_by_key.get("<untracked>", 0) + 1
+            )
+
         self.index.remove_block(block_id)
         self._evictions_since_tick += 1
 
@@ -354,6 +374,12 @@ class NodeEvictionController:
         counters = self.observer.counters
         counters.ticks_total += 1
 
+        # Above the early returns below: HBM occupancy and the splice volume
+        # are exactly what needs reporting when the tick is skipping, since
+        # a tick that never reaches the splice is the failure mode the line
+        # is meant to expose.
+        self._maybe_log_hbm_summary(now)
+
         snapshot = (
             self.snapshot_source.get_snapshot()
             if self.snapshot_source is not None
@@ -385,21 +411,50 @@ class NodeEvictionController:
         self._rebuild_want_list(snapshot, now, now_ms)
         self._maybe_log_prefetch_summary(now)
 
-        # Rule 1, an exact counter rather than an estimate. A fresh block is
-        # exactly `block_hash is None`; using one costs nothing while
-        # destroying a cached block costs its prefix. `appendleft` inserts at
-        # the *absolute* head, so splicing a cached block in front of a fresh
-        # one would throw away a prefix while a free unused block sat right
-        # there. The previous attempt reverse-engineered this quantity from
-        # aggregate counters and admitted in-code that getting it wrong
-        # collapsed the cache to a single prompt (00 Part 2, weakness 3).
-        num_free_fresh = self.block_pool.num_free_fresh
-        if num_free_fresh > self.config.fresh_skip_threshold:
+        # Rule 1, measured **at the head** rather than over the whole queue.
+        #
+        # The rule is: never splice a cached block in front of a block that
+        # would otherwise have been used for free. `appendleft` inserts at the
+        # absolute head, so the only fresh blocks that can be jumped are the
+        # ones already at the head — and `popleft` only ever takes from there.
+        #
+        # The whole-queue count `num_free_fresh` looks like it says the same
+        # thing and does not. A block freed with no hash (a partial tail
+        # block) is appended to the *tail* and counted as fresh, so a steady
+        # workload parks a permanent floor of fresh-but-unreachable blocks
+        # behind the cached ones. Measured on a real run: `num_free_fresh`
+        # never dropped below 21 across 21k evictions, so with the documented
+        # `fresh_skip_threshold=0` the tick skipped **every** time, the value
+        # table was never built, and the policy silently degraded to LRU —
+        # every score and rank in the decision log was null.
+        head_fresh = self._head_fresh_run(self.config.fresh_skip_threshold + 1)
+        if head_fresh > self.config.fresh_skip_threshold:
             counters.ticks_skipped_fresh += 1
             return
 
         self._rebuild_value_table(snapshot, now, now_ms)
         self._splice()
+
+    def _head_fresh_run(self, limit: int) -> int:
+        """How many blocks at the head of the free queue are fresh, capped.
+
+        `limit` bounds the walk, so the default `fresh_skip_threshold=0` costs
+        exactly one pointer dereference per tick — the same O(1) the whole-
+        queue counter was chosen for, without its blind spot.
+        """
+        queue = self.block_pool.free_block_queue
+        block = queue.fake_free_list_head.next_free_block
+        tail = queue.fake_free_list_tail
+        seen = 0
+        while (
+            seen < limit
+            and block is not None
+            and block is not tail
+            and block.block_hash is None
+        ):
+            seen += 1
+            block = block.next_free_block
+        return seen
 
     def _rebuild_want_list(
         self, snapshot: ImportanceSnapshot, now: float, now_ms: float
@@ -537,6 +592,76 @@ class NodeEvictionController:
         self._last_prefetch_fingerprint = fingerprint
         summary = self.prefetch_summary()
         logger.info("%s", summary)
+        return summary
+
+    def hbm_summary(self) -> str:
+        """One line of HBM block accounting, in `key=value` form.
+
+        The LRU baseline emits the *same* line with `variant=baseline` and
+        `splices=0`, which is the whole point: the two runs are meant to be
+        diffed field by field, and a format that drifts between them turns
+        the comparison into manual reading.
+
+        `top_evicted` names `job_id:node` because "we evicted 12k blocks" is
+        not actionable and "we evicted 12k blocks, 9k of them job7:research"
+        is — it says the forecast for one node is wrong, not that the cache
+        is small.
+        """
+        pool = self.block_pool
+        total = pool.num_gpu_blocks
+        free = pool.get_num_free_blocks()
+        used = total - free
+        c = self.observer.counters
+        top = sorted(
+            self._evictions_by_key.items(), key=lambda kv: (-kv[1], kv[0])
+        )[: self.config.hbm_summary_top_keys]
+        top_str = ",".join(f"{label}={n}" for label, n in top) or "-"
+        return (
+            "kv_hbm variant=node_eviction "
+            f"total={total} used={used} free={free} "
+            f"usage={(used / total * 100.0) if total else 0.0:.1f}% "
+            f"queue={pool.free_block_queue.num_free_blocks} "
+            f"splices={c.splices_total} "
+            f"spliced_blocks={c.blocks_spliced_total} "
+            f"evicted={c.evictions_total} "
+            f"evicted_by_score={c.evictions_by_score_total} "
+            f"regret={c.regret_rate:.3f} "
+            f"index_keys={self.index.num_keys} "
+            f"index_blocks={self.index.num_blocks} "
+            f"top_evicted={top_str}"
+        )
+
+    def _maybe_log_hbm_summary(self, now: float) -> str | None:
+        """Rate-limited and change-gated, exactly like the prefetch line.
+
+        Returns the line it logged, or None — `vllm`'s root logger sets
+        `propagate=False`, so a test written against pytest's `caplog` would
+        see nothing and pass vacuously.
+        """
+        if self.config.hbm_summary_period_ms <= 0:
+            return None
+        period_s = self.config.hbm_summary_period_ms / 1000.0
+        if now - self._last_hbm_log_monotonic < period_s:
+            return None
+
+        c = self.observer.counters
+        # Occupancy is deliberately *not* in the fingerprint: it moves by a
+        # block on every step, so including it would defeat the change gate
+        # and print a line every period forever.
+        fingerprint = (
+            c.splices_total,
+            c.blocks_spliced_total,
+            c.evictions_total,
+            c.evictions_by_score_total,
+        )
+        if fingerprint == self._last_hbm_fingerprint:
+            return None
+        self._last_hbm_log_monotonic = now
+        self._last_hbm_fingerprint = fingerprint
+        summary = self.hbm_summary()
+        logger.info("%s", summary)
+        # Per-window, so the next line names who is evicting *now*.
+        self._evictions_by_key.clear()
         return summary
 
     def drain_prefetch_wants(self, max_items: int) -> list[dict[str, str | float]]:
@@ -722,6 +847,13 @@ class NodeEvictionController:
 
     def stats(self) -> dict[str, float | int | bool]:
         out = dict(self.observer.counters.as_dict())
+        total = self.block_pool.num_gpu_blocks
+        free = self.block_pool.get_num_free_blocks()
+        out["hbm_total_blocks"] = total
+        out["hbm_free_blocks"] = free
+        out["hbm_used_blocks"] = total - free
+        out["hbm_usage"] = (total - free) / total if total else 0.0
+        out["free_queue_len"] = self.block_pool.free_block_queue.num_free_blocks
         out["index_keys"] = self.index.num_keys
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys

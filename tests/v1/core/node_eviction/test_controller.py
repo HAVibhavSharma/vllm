@@ -35,6 +35,7 @@ class FakePool:
 
     def __init__(self, num_blocks: int = 16, cached: bool = True):
         self.blocks = [KVCacheBlock(i) for i in range(num_blocks)]
+        self.num_gpu_blocks = num_blocks
         if cached:
             for block in self.blocks:
                 block.block_hash = f"h{block.block_id}".encode()
@@ -45,6 +46,9 @@ class FakePool:
     @property
     def num_free_fresh(self) -> int:
         return self.free_block_queue.num_free_fresh
+
+    def get_num_free_blocks(self) -> int:
+        return self.free_block_queue.num_free_blocks
 
     def queue_ids(self) -> list[int]:
         return [b.block_id for b in self.free_block_queue.get_all_free_blocks()]
@@ -362,6 +366,52 @@ def test_a_phantom_cannot_confirm_another_phantoms_guess():
     assert controller.index.get_entry(RESEARCH).speculative
 
 
+def test_fresh_blocks_behind_cached_ones_do_not_block_the_splice():
+    """Rule 1 is about blocks `appendleft` can jump, i.e. the head. A block
+    freed with no hash is appended to the *tail* and still counts as fresh, so
+    the whole-queue count has a permanent floor in a steady workload — a real
+    run never saw it below 21, the tick skipped every time, and every score in
+    the decision log was null."""
+    pool = FakePool(num_blocks=16)
+    # Head is cached, tail is fresh: the next allocation destroys a prefix no
+    # matter what, so the splice is exactly what should decide which one.
+    for block in pool.blocks[-4:]:
+        block.block_hash = None
+    assert pool.num_free_fresh == 4, "the whole-queue count is above threshold"
+
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.92, time_to_next_call_ms=8_000.0),
+            SUPERVISOR: dict(prob=0.85, time_to_next_call_ms=60_000.0),
+        }
+    )
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1])
+    index_prefix(controller, pool, SUPERVISOR, [2])
+
+    controller.maybe_tick()
+
+    assert controller.observer.counters.ticks_skipped_fresh == 0
+    assert pool.queue_ids()[0] == 2, "supervisor is worth less and must go first"
+
+
+def test_a_fresh_head_still_stops_the_splice():
+    """The other half of the rule: while the very next block to be popped is
+    unused, splicing a cached block in front of it would throw away a prefix
+    with a free block sitting right there."""
+    pool = FakePool(num_blocks=16)
+    pool.blocks[0].block_hash = None
+
+    rows = fresh_rows({SUPERVISOR: dict(prob=0.1, time_to_next_call_ms=60_000.0)})
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, SUPERVISOR, [2])
+
+    controller.maybe_tick()
+
+    assert controller.observer.counters.ticks_skipped_fresh == 1
+    assert controller.observer.counters.splices_total == 0
+
+
 def test_waste_is_counted_even_before_a_tick_has_scored_the_key():
     """Provenance comes from the index, which knows at insert time. Reading
     it off the score breakdown instead loses every prefetch evicted inside
@@ -468,3 +518,109 @@ def test_config_rejects_a_floor_below_the_score_range():
 def test_config_rejects_a_cold_miss_cheaper_than_l1():
     with pytest.raises(ValueError):
         NodeEvictionConfig(delta_l1_ms=500.0, delta_cold_ms=100.0).validate()
+
+
+# -- HBM accounting line -------------------------------------------------
+
+
+def test_hbm_summary_reports_the_pool_split():
+    """total = used + free, and `queue` is the eviction candidate count.
+
+    Asserted as an identity rather than against literals so the test still
+    means something if the fake pool's size changes.
+    """
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool)
+    pool.blocks[3].ref_cnt = 1
+    pool.free_block_queue.remove(pool.blocks[3])
+
+    line = controller.hbm_summary()
+    fields = dict(
+        part.split("=", 1) for part in line.split() if "=" in part
+    )
+    assert fields["variant"] == "node_eviction"
+    total = int(fields["total"])
+    used = int(fields["used"])
+    free = int(fields["free"])
+    assert total == 16
+    assert used + free == total
+    assert used == 1
+    assert int(fields["queue"]) == free
+
+
+def test_hbm_summary_names_the_node_that_lost_the_block():
+    """The point of the line: not "12k blocks went" but whose they were."""
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+    index_prefix(controller, pool, SUPERVISOR, [4])
+
+    for block_id in (1, 2, 3):
+        controller.on_block_evicted(block_id)
+    controller.on_block_evicted(4)
+
+    line = controller.hbm_summary()
+    assert "top_evicted=run-42:research=3,run-42:supervisor=1" in line
+
+
+def test_hbm_summary_attributes_untracked_blocks_separately():
+    """A block nobody claimed must not be silently dropped from the tally,
+    or `evicted=` and `top_evicted=` stop adding up."""
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool)
+    controller.on_block_evicted(7)
+    assert "top_evicted=<untracked>=1" in controller.hbm_summary()
+
+
+def test_hbm_line_is_rate_limited_and_change_gated():
+    """An idle server must log nothing: an identical line every period
+    trains everyone to filter the line out."""
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool, hbm_summary_period_ms=10_000.0)
+
+    assert controller._maybe_log_hbm_summary(1000.0) is not None
+    # Same window.
+    assert controller._maybe_log_hbm_summary(1001.0) is None
+    # New window, but nothing moved.
+    assert controller._maybe_log_hbm_summary(1_000_000.0) is None
+
+    index_prefix(controller, pool, RESEARCH, [1])
+    controller.on_block_evicted(1)
+    assert controller._maybe_log_hbm_summary(2_000_000.0) is not None
+
+
+def test_hbm_attribution_is_per_window():
+    """Counts reset when the line is emitted, which is also what stops a
+    finished job's id from being pinned for the life of the server."""
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool, hbm_summary_period_ms=10_000.0)
+    index_prefix(controller, pool, RESEARCH, [1])
+    controller.on_block_evicted(1)
+
+    first = controller._maybe_log_hbm_summary(1_000_000.0)
+    assert "run-42:research=1" in first
+
+    index_prefix(controller, pool, SUPERVISOR, [4])
+    controller.on_block_evicted(4)
+    second = controller._maybe_log_hbm_summary(2_000_000.0)
+    assert "run-42:supervisor=1" in second
+    assert "run-42:research" not in second
+
+
+def test_hbm_line_can_be_switched_off():
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool, hbm_summary_period_ms=0.0)
+    controller.on_block_evicted(1)
+    assert controller._maybe_log_hbm_summary(1_000_000.0) is None
+
+
+def test_stats_carry_the_pool_split():
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool)
+    stats = controller.stats()
+    assert stats["hbm_total_blocks"] == 16
+    assert (
+        stats["hbm_used_blocks"] + stats["hbm_free_blocks"]
+        == stats["hbm_total_blocks"]
+    )
+    assert stats["free_queue_len"] == stats["hbm_free_blocks"]
