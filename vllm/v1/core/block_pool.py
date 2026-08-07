@@ -11,6 +11,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.hbm_summary import HBMSummaryLogger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -181,6 +182,12 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # HBM accounting line, for diffing this LRU baseline against the
+        # node-aware eviction branch. None when the period is set to 0.
+        self.hbm_summary = (
+            HBMSummaryLogger.maybe_build(self) if enable_caching else None
+        )
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -272,6 +279,11 @@ class BlockPool:
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+
+        if self.hbm_summary is not None:
+            # Claim the blocks for this request's node, so the eviction that
+            # eventually destroys them can name who lost the hit.
+            self.hbm_summary.on_blocks_cached(request, new_full_blocks)
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
@@ -371,7 +383,17 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
-        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
+        popped = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
+
+        if self.hbm_summary is not None:
+            # A cached block just lost its identity — the one event the
+            # baseline and the policy branch must count identically, so this
+            # sits *outside* the `popped is None` guard below to match where
+            # the policy branch releases its ownership claim. Counting the
+            # two differently would make `evicted=` mean two things.
+            self.hbm_summary.on_block_evicted(block.block_id)
+
+        if popped is None:
             # block not found in cached_block_hash_to_block,
             # eviction is not needed
             return False
@@ -467,6 +489,9 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+
+        if self.hbm_summary is not None:
+            self.hbm_summary.on_reset_prefix_cache()
 
         logger.info("Successfully reset prefix cache")
 

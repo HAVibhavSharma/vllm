@@ -539,3 +539,14 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
+        if self.block_pool.hbm_summary is not None:
+            # Wall-clock paced and change-gated, so the common case is one
+            # clock read and a comparison on the thread that owns BlockPool.
+            self.block_pool.hbm_summary.maybe_log()
+
+    def get_hbm_summary_stats(self) -> dict[str, float | int] | None:
+        """The same numbers as the log line, for a caller that wants them
+        structured rather than parsed back out of the line."""
+        if self.block_pool.hbm_summary is None:
+            return None
+        return self.block_pool.hbm_summary.stats()
