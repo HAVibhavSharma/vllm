@@ -200,6 +200,139 @@ class EvictionCounters:
         return (needed_mean - not_needed_mean) / denom
 
 
+class CacheMovementTracker:
+    """Prefix-cache effectiveness, and the KV volume eviction forced back in.
+
+    Two numbers, and the second is the one an eviction policy is actually
+    judged on.
+
+    **Hit rate** answers "did the cache work". It is necessary but not
+    sufficient: a bigger cache raises it too, so on its own it cannot
+    separate a better policy from more HBM.
+
+    **Rematerialisation** answers "how much work did we redo". A block is
+    counted when its hash is cached *again* after having been evicted — the
+    block existed, we threw it away, we rebuilt it. That is movement the
+    policy caused and a better policy avoids.
+
+    Deliberately not the miss count. Misses include every prefix the server
+    has never seen, which no eviction policy can do anything about; counting
+    them would credit a policy for a cold start and bury the signal under
+    first-contact traffic. Rematerialisation is zero for a first-time prefix
+    by construction.
+
+    The evicted-hash ring is what bounds the memory. A block evicted more
+    than one full pool turnover ago is not something the policy is still
+    responsible for, so the window defaults to the pool size.
+    """
+
+    def __init__(self, window_blocks: int, block_size_bytes: int = 0) -> None:
+        self.window_blocks = max(int(window_blocks), 0)
+        self.block_size_bytes = block_size_bytes
+
+        # Ring of hashes that were cached and then evicted. `set` for the
+        # O(1) membership test on the caching path, `deque` for the eviction
+        # order the ring needs; they are kept in step.
+        self._evicted: deque = deque()
+        self._evicted_set: set = set()
+
+        self.remat_blocks = 0
+        self.blocks_cached = 0
+        self.hit_tokens = 0
+        self.query_tokens = 0
+        # Reset when a summary line is emitted, so the line can show the
+        # rate *now* next to the rate since boot. A cumulative hit rate over
+        # a long run is dominated by whatever the workload did first.
+        self.window_hit_tokens = 0
+        self.window_query_tokens = 0
+
+    def on_cache_query(self, num_tokens: int, num_hits: int) -> None:
+        self.query_tokens += num_tokens
+        self.hit_tokens += num_hits
+        self.window_query_tokens += num_tokens
+        self.window_hit_tokens += num_hits
+
+    def on_block_cached(self, block_hash) -> None:
+        self.blocks_cached += 1
+        if block_hash is None:
+            return
+        if block_hash in self._evicted_set:
+            self.remat_blocks += 1
+            # Discard rather than leave it: the hash is resident again, so a
+            # *second* remat requires a second eviction. Leaving it would
+            # count every subsequent cache of the same prefix as movement.
+            self._evicted_set.discard(block_hash)
+
+    def on_block_evicted(self, block_hash) -> None:
+        if block_hash is None or self.window_blocks == 0:
+            return
+        # The set is the membership test; the deque only supplies eviction
+        # order. A hash that was counted and discarded from the set can be
+        # appended again, leaving a stale duplicate in the deque — it pops
+        # early and shortens the window slightly for that one hash. The error
+        # is bounded and conservative (it can only *under*-count movement),
+        # which is the right direction for a number used to claim an
+        # improvement.
+        if block_hash not in self._evicted_set:
+            self._evicted.append(block_hash)
+            self._evicted_set.add(block_hash)
+        while len(self._evicted) > self.window_blocks:
+            self._evicted_set.discard(self._evicted.popleft())
+
+    def on_reset(self) -> None:
+        # Every hash in the pool was just invalidated, so nothing in the ring
+        # can be rematerialised — a later cache of the same prefix is new
+        # work, not redone work.
+        self._evicted.clear()
+        self._evicted_set.clear()
+
+    @property
+    def hit_rate(self) -> float:
+        if self.query_tokens == 0:
+            return 0.0
+        return self.hit_tokens / self.query_tokens
+
+    @property
+    def window_hit_rate(self) -> float:
+        if self.window_query_tokens == 0:
+            return 0.0
+        return self.window_hit_tokens / self.window_query_tokens
+
+    @property
+    def remat_mb(self) -> float:
+        """The movement number, in MB of KV actually rebuilt.
+
+        Zero when the block size is unknown — reported rather than guessed,
+        because a fabricated byte count is worse than an absent one when the
+        whole point is comparing two runs.
+        """
+        return self.remat_blocks * self.block_size_bytes / 1e6
+
+    @property
+    def remat_ratio(self) -> float:
+        """Fraction of all caching work that was redoing work."""
+        if self.blocks_cached == 0:
+            return 0.0
+        return self.remat_blocks / self.blocks_cached
+
+    def reset_window(self) -> None:
+        self.window_hit_tokens = 0
+        self.window_query_tokens = 0
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "hit_rate": self.hit_rate,
+            "hit_rate_window": self.window_hit_rate,
+            "hit_tokens": self.hit_tokens,
+            "query_tokens": self.query_tokens,
+            "remat_blocks": self.remat_blocks,
+            "remat_mb": self.remat_mb,
+            "remat_ratio": self.remat_ratio,
+            "blocks_cached_total": self.blocks_cached,
+            "block_size_bytes": self.block_size_bytes,
+        }
+
+
 class EvictionObserver:
     """Counters, the regret ring buffer, and the optional decision log."""
 

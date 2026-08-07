@@ -66,6 +66,7 @@ def maybe_build_controller(
     block_pool,
     num_kv_cache_groups: int,
     config: NodeEvictionConfig | None = None,
+    block_size_bytes: int = 0,
 ) -> NodeEvictionController | None:
     """Build the controller if the policy is switched on, else None.
 
@@ -98,6 +99,7 @@ def maybe_build_controller(
         config=config,
         snapshot_source=source,
         num_kv_cache_groups=num_kv_cache_groups,
+        block_size_bytes=block_size_bytes,
     )
     if not controller.enabled:
         return None

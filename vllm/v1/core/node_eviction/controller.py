@@ -30,7 +30,10 @@ from collections.abc import Sequence
 from vllm.logger import init_logger
 from vllm.v1.core.node_eviction.config import NodeEvictionConfig
 from vllm.v1.core.node_eviction.index import BlockOwnershipIndex
-from vllm.v1.core.node_eviction.metrics import EvictionObserver
+from vllm.v1.core.node_eviction.metrics import (
+    CacheMovementTracker,
+    EvictionObserver,
+)
 from vllm.v1.core.node_eviction.scoring import (
     apply_speculative_floor,
     build_value_table,
@@ -104,6 +107,7 @@ class NodeEvictionController:
         config: NodeEvictionConfig,
         snapshot_source: SnapshotSource | None = None,
         num_kv_cache_groups: int = 1,
+        block_size_bytes: int = 0,
     ) -> None:
         config.validate()
         self.config = config
@@ -160,6 +164,18 @@ class NodeEvictionController:
         self._last_hbm_log_monotonic = 0.0
         self._last_hbm_fingerprint: tuple[int, ...] | None = None
         self._evictions_by_key: dict[str, int] = {}
+
+        # Hit rate and the movement number. The default window is one full
+        # pool turnover: a block evicted longer ago than that is not
+        # something this policy is still answerable for.
+        self.movement = CacheMovementTracker(
+            window_blocks=(
+                config.remat_window_blocks
+                if config.remat_window_blocks > 0
+                else getattr(block_pool, "num_gpu_blocks", 0)
+            ),
+            block_size_bytes=block_size_bytes,
+        )
         if config.prefetch_wants_enabled and self.enabled:
             self._wants = PrefetchWantList(
                 max_outstanding=config.prefetch_max_outstanding,
@@ -194,6 +210,16 @@ class NodeEvictionController:
         """
         if not self.enabled:
             return
+
+        # Above the identity check on purpose. Movement is a property of the
+        # cache, not of the workflow: a block rebuilt for an anonymous
+        # request cost exactly as much as one rebuilt for a named node, and
+        # the LRU baseline counts all of them. Skipping the unnamed ones here
+        # would make the two runs' `remat_blocks` incomparable.
+        for block in blocks:
+            if not block.is_null:
+                self.movement.on_block_cached(block.block_hash)
+
         key = node_key_for_request(request, self.config.use_call_type)
         if key is None:
             return
@@ -288,12 +314,37 @@ class NodeEvictionController:
                 self._evictions_by_key.get("<untracked>", 0) + 1
             )
 
+        # Remember the hash so a later re-cache of the same prefix can be
+        # recognised as redone work. Read off the block rather than passed
+        # in: `BlockPool` calls this *before* `reset_hash()`, so the hash is
+        # still there, and taking it here keeps the hook signature stable.
+        self.movement.on_block_evicted(self._hash_of(block_id))
+
         self.index.remove_block(block_id)
         self._evictions_since_tick += 1
+
+    def _hash_of(self, block_id: int):
+        blocks = getattr(self.block_pool, "blocks", None)
+        if blocks is None or block_id >= len(blocks):
+            return None
+        return blocks[block_id].block_hash
+
+    def on_cache_query(self, num_tokens: int, num_hits: int) -> None:
+        """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
+
+        Counted here rather than read off `PrefixCacheStats` because that
+        object is drained by whoever polls the metrics loggers — reading it
+        would make these numbers depend on whether anything else was
+        scraping, and on `log_stats` being on at all.
+        """
+        if not self.enabled:
+            return
+        self.movement.on_cache_query(num_tokens, num_hits)
 
     def on_reset_prefix_cache(self) -> None:
         if not self.enabled:
             return
+        self.movement.on_reset()
         self.index.clear()
         self._value_table = {}
         self._spliced_scores.clear()
@@ -612,6 +663,7 @@ class NodeEvictionController:
         free = pool.get_num_free_blocks()
         used = total - free
         c = self.observer.counters
+        m = self.movement
         top = sorted(
             self._evictions_by_key.items(), key=lambda kv: (-kv[1], kv[0])
         )[: self.config.hbm_summary_top_keys]
@@ -626,6 +678,14 @@ class NodeEvictionController:
             f"evicted={c.evictions_total} "
             f"evicted_by_score={c.evictions_by_score_total} "
             f"regret={c.regret_rate:.3f} "
+            f"hit_rate={m.hit_rate:.4f} "
+            f"hit_rate_win={m.window_hit_rate:.4f} "
+            f"hit_tokens={m.hit_tokens} "
+            f"query_tokens={m.query_tokens} "
+            f"remat_blocks={m.remat_blocks} "
+            f"remat_mb={m.remat_mb:.1f} "
+            f"remat_ratio={m.remat_ratio:.4f} "
+            f"blocks_cached={m.blocks_cached} "
             f"index_keys={self.index.num_keys} "
             f"index_blocks={self.index.num_blocks} "
             f"top_evicted={top_str}"
@@ -653,6 +713,8 @@ class NodeEvictionController:
             c.blocks_spliced_total,
             c.evictions_total,
             c.evictions_by_score_total,
+            self.movement.query_tokens,
+            self.movement.remat_blocks,
         )
         if fingerprint == self._last_hbm_fingerprint:
             return None
@@ -660,8 +722,11 @@ class NodeEvictionController:
         self._last_hbm_fingerprint = fingerprint
         summary = self.hbm_summary()
         logger.info("%s", summary)
-        # Per-window, so the next line names who is evicting *now*.
+        # Per-window, so the next line names who is evicting *now* and shows
+        # the hit rate *now* rather than one dominated by whatever the
+        # workload happened to do first.
         self._evictions_by_key.clear()
+        self.movement.reset_window()
         return summary
 
     def drain_prefetch_wants(self, max_items: int) -> list[dict[str, str | float]]:
@@ -854,6 +919,7 @@ class NodeEvictionController:
         out["hbm_used_blocks"] = total - free
         out["hbm_usage"] = (total - free) / total if total else 0.0
         out["free_queue_len"] = self.block_pool.free_block_queue.num_free_blocks
+        out.update(self.movement.as_dict())
         out["index_keys"] = self.index.num_keys
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys

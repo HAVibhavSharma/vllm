@@ -624,3 +624,169 @@ def test_stats_carry_the_pool_split():
         == stats["hbm_total_blocks"]
     )
     assert stats["free_queue_len"] == stats["hbm_free_blocks"]
+
+
+# -- hit rate and cache movement -----------------------------------------
+
+
+def cache_block(controller, pool, block_id, tag, node="research"):
+    block = pool.blocks[block_id]
+    if block.block_hash is not None:
+        block.reset_hash()
+    block.block_hash = tag
+    controller.on_blocks_cached(
+        make_request(node=node), [block], start_position=0
+    )
+
+
+def test_hit_rate_is_tokens_not_requests():
+    """A 10-token request that fully hit and a 10k-token one that missed are
+    not one hit and one miss — the second cost a thousand times more."""
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=10, num_hits=10)
+    controller.on_cache_query(num_tokens=10_000, num_hits=0)
+    assert controller.movement.hit_rate == 10 / 10_010
+
+
+def test_windowed_hit_rate_resets_but_cumulative_does_not():
+    """A cumulative rate over a long run is dominated by whatever the
+    workload did first, so the line carries both."""
+    controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
+    controller.on_cache_query(num_tokens=100, num_hits=0)
+    controller._maybe_log_hbm_summary(1_000_000.0)
+
+    controller.on_cache_query(num_tokens=100, num_hits=100)
+    line = controller._maybe_log_hbm_summary(2_000_000.0)
+    fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
+    assert float(fields["hit_rate_win"]) == 1.0
+    assert float(fields["hit_rate"]) == 0.5
+
+
+def test_a_first_time_prefix_is_not_movement():
+    """The number must credit the policy only for work it made us redo. A
+    prefix the server has never seen is not that."""
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    for i in (1, 2, 3):
+        cache_block(controller, pool, i, f"h{i}")
+    assert controller.movement.remat_blocks == 0
+
+
+def test_recaching_an_evicted_hash_counts_as_movement():
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    cache_block(controller, pool, 1, "hA")
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_blocks == 1
+
+
+def test_movement_needs_a_second_eviction_to_count_twice():
+    """Otherwise every later cache of a popular prefix reads as movement and
+    the number grows without anything being rebuilt."""
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    cache_block(controller, pool, 1, "hA")
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_blocks == 1
+
+    pool.blocks[1].reset_hash()
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_blocks == 1
+
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_blocks == 2
+
+
+def test_movement_counts_blocks_from_requests_with_no_identity():
+    """Movement is a property of the cache, not the workflow. The baseline
+    counts anonymous blocks, so skipping them here would make the two runs'
+    numbers incomparable — which is the whole point of the line."""
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    anon = make_request(job_id=None)
+    pool.blocks[1].block_hash = "hA"
+    controller.on_blocks_cached(anon, [pool.blocks[1]], start_position=0)
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    pool.blocks[1].block_hash = "hA"
+    controller.on_blocks_cached(anon, [pool.blocks[1]], start_position=0)
+
+    assert controller.index.num_keys == 0, "still not indexed"
+    assert controller.movement.remat_blocks == 1
+
+
+def test_reset_prefix_cache_is_not_movement():
+    """An operator wiping the cache did not make the policy redo work."""
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    cache_block(controller, pool, 1, "hA")
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+
+    controller.on_reset_prefix_cache()
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_blocks == 0
+
+
+def test_movement_in_mb_uses_the_configured_page_size():
+    pool = FakePool(cached=False)
+    config = NodeEvictionConfig(enabled=True, tick_period_ms=0.0)
+    controller = NodeEvictionController(
+        block_pool=pool,
+        config=config,
+        snapshot_source=StaticSnapshotSource({}),
+        block_size_bytes=2_000_000,
+    )
+    cache_block(controller, pool, 1, "hA")
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_mb == 2.0
+    assert "remat_mb=2.0 " in controller.hbm_summary()
+
+
+def test_movement_in_mb_is_zero_when_the_page_size_is_unknown():
+    """Reported rather than guessed: a fabricated byte count is worse than an
+    absent one when the point is comparing two runs."""
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    cache_block(controller, pool, 1, "hA")
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(controller, pool, 1, "hA")
+    assert controller.movement.remat_blocks == 1
+    assert controller.movement.remat_mb == 0.0
+
+
+def test_the_evicted_ring_is_bounded():
+    """The ring is what bounds the memory, so its size has to actually bite."""
+    pool = FakePool(num_blocks=32, cached=False)
+    controller = make_controller(pool, remat_window_blocks=4)
+    for i in range(1, 11):
+        cache_block(controller, pool, i, f"h{i}")
+        controller.on_block_evicted(i)
+        pool.blocks[i].reset_hash()
+
+    cache_block(controller, pool, 1, "h1")
+    assert controller.movement.remat_blocks == 0, "h1 aged out of the ring"
+    cache_block(controller, pool, 10, "h10")
+    assert controller.movement.remat_blocks == 1
+
+
+def test_remat_ratio_is_over_all_caching_work():
+    pool = FakePool(cached=False)
+    controller = make_controller(pool)
+    for i in (1, 2, 3):
+        cache_block(controller, pool, i, f"h{i}")
+    controller.on_block_evicted(1)
+    pool.blocks[1].reset_hash()
+    cache_block(controller, pool, 1, "h1")
+    # 4 blocks cached, 1 of them a rebuild.
+    assert controller.movement.remat_ratio == 0.25

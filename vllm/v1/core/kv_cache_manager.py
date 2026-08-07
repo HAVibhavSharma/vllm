@@ -159,6 +159,13 @@ class KVCacheManager:
         self.node_eviction = maybe_build_controller(
             block_pool=self.block_pool,
             num_kv_cache_groups=self.num_kv_cache_groups,
+            # Summed over groups: one block id covers a page in every group,
+            # so the KV rebuilt when that id is evicted and re-cached is the
+            # sum, not any one group's page.
+            block_size_bytes=sum(
+                g.kv_cache_spec.page_size_bytes
+                for g in kv_cache_config.kv_cache_groups
+            ),
         )
         if self.node_eviction is not None:
             self.block_pool.attach_node_eviction(self.node_eviction)
@@ -231,6 +238,15 @@ class KVCacheManager:
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
+            )
+
+        if self.node_eviction is not None:
+            # Tracked separately from `prefix_cache_stats`, which whoever
+            # polls the metrics loggers drains on read — sharing it would
+            # make the summary line's hit rate depend on whether anything
+            # else was scraping, and on `log_stats` being on at all.
+            self.node_eviction.on_cache_query(
+                num_tokens=request.num_tokens, num_hits=num_new_computed_tokens
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens

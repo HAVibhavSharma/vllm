@@ -188,6 +188,17 @@ class NodeEvictionConfig:
     constantly — both look identical in the hit rate until the workload
     changes."""
 
+    remat_window_blocks: int = 0
+    """How many recently-evicted block hashes to remember when counting
+    rematerialisation — a block cached again after being evicted, i.e. work
+    the eviction forced us to redo. `0` sizes the ring to the pool, which is
+    the meaningful horizon: a block evicted more than one full turnover ago
+    is not something this policy is still answerable for.
+
+    This is the number the policy is judged on. Hit rate alone cannot
+    separate a better policy from more HBM, and raw miss counts credit a
+    policy for cold starts it had no part in."""
+
     hbm_summary_top_keys: int = 5
     """How many `job_id:node` keys the HBM line names as eviction sources.
     Counted per window and reset after each line, which is also what bounds
@@ -298,6 +309,8 @@ class NodeEvictionConfig:
             raise ValueError("prefetch_max_per_drain must be >= 0")
         if self.hbm_summary_top_keys < 0:
             raise ValueError("hbm_summary_top_keys must be >= 0")
+        if self.remat_window_blocks < 0:
+            raise ValueError("remat_window_blocks must be >= 0")
         if self.prefetch_wants_enabled and not self.prefetch_agent_namespace:
             # An empty namespace yields agent_id ":research", which matches
             # nothing in the registry — every want would fan out to zero

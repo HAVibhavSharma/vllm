@@ -14,15 +14,21 @@ not a description of something that exists. Nothing here is built yet.
 In priority order. A panel that does not serve one of these does not belong on
 the page.
 
-1. **Did the policy change what HBM held?** Occupancy over time, both runs.
-2. **Did it actually do anything?** Splice volume. A flat `spliced_blocks=0`
+1. **How much KV did each run have to rebuild?** `remat_mb` over time, both
+   runs. This is the claim; everything else is supporting evidence. See
+   §2 of [`hbm-logging-changes.md`](hbm-logging-changes.md) for why this and
+   not the miss count.
+2. **Did the cache work at all?** Hit rate, both runs. Necessary context — a
+   movement reduction bought by serving fewer hits is not a win.
+3. **Did the policy change what HBM held?** Occupancy over time.
+4. **Did it actually do anything?** Splice volume. A flat `spliced_blocks=0`
    on the policy run means the tick never reached the splice — the silent
    failure the line was added to catch.
-3. **Did it evict less, or just differently?** Eviction rate, both runs.
-4. **Whose blocks went?** `job:node` attribution over time. This is the panel
+5. **Did it evict less, or just differently?** Eviction rate, both runs.
+6. **Whose blocks went?** `job:node` attribution over time. This is the panel
    that turns "the hit rate got worse" into "the forecast for `research` is
    wrong".
-5. **Was it right?** Regret over time, policy run only.
+7. **Was it right?** Regret over time, policy run only.
 
 ---
 
@@ -63,7 +69,9 @@ Note `indexOf("=")` rather than `split("=")`: `top_evicted`'s value contains
 `=` characters. Splitting on all of them silently truncates the attribution.
 
 Numeric coercion: everything except `variant` and `top_evicted` is a number.
-`usage` has a trailing `%`. Strip it and store the fraction.
+`usage` has a trailing `%`. Strip it and store the fraction. `hit_rate`,
+`hit_rate_win`, `remat_ratio` and `regret` are already fractions — do not
+divide them by 100.
 
 `top_evicted` is `-` when empty, otherwise
 `label=count,label=count,...` where `label` is `job_id:node` — and `job_id`
@@ -95,6 +103,13 @@ Sample {
   splices, splicedBlocks: number,      // cumulative
   evicted, evictedByScore: number,     // cumulative
   regret: number,                      // ratio, already windowed by the engine
+  hitRate: number,                     // cumulative, 0..1
+  hitRateWin: number,                  // THIS window only
+  hitTokens, queryTokens: number,      // cumulative
+  rematBlocks: number,                 // cumulative
+  rematMb: number,                     // cumulative
+  rematRatio: number,                  // cumulative
+  blocksCached: number,                // cumulative
   indexKeys, indexBlocks: number,
   topEvicted: Map<label, count>,       // THIS window only
 }
@@ -113,7 +128,21 @@ rate(field, i) = (s[i][field] - s[i-1][field]) / (s[i].t - s[i-1].t)
 Emit rates in **blocks per second**, not per window — window lengths are not
 uniform (§5).
 
-`topEvicted` is already per window. Do **not** difference it.
+`topEvicted`, `hitRateWin` and `regret` are already per window. Do **not**
+difference them.
+
+`hitRate`, `rematRatio` and friends are cumulative **ratios**, not counters.
+Differencing a ratio is meaningless. To get a windowed `rematRatio`, difference
+the two counters and divide:
+
+```
+rematRatioWin(i) = ΔrematBlocks(i) / Δblocks_cached(i)   // guard /0
+```
+
+The same applies to a windowed hit rate — except the engine already computes
+it, so use `hitRateWin` and do not recompute it from
+`ΔhitTokens / ΔqueryTokens`. They agree, but only the engine's version is
+correct across a `reset_prefix_cache`.
 
 ---
 
@@ -151,7 +180,17 @@ raise `hbm_summary_top_keys` — not to conclude that five nodes did everything.
 `<untracked>` is a real category, not a remainder — requests carrying no
 `job_id`. Give it its own band, distinct from `other`.
 
-### 5.3 The two runs have different key sets
+### 5.3 `remat_mb` is zero when the page size was never configured
+
+The engine reports `remat_mb=0.0` rather than guessing when it does not know
+the KV page size. A page that plots that as "no movement" inverts the
+conclusion.
+
+Detect it: `rematBlocks > 0 && rematMb === 0` for a whole run means the byte
+size was missing. Fall back to plotting `rematBlocks` and label the axis
+"blocks", with a note on the panel. Never plot a zero line.
+
+### 5.4 The two runs have different key sets
 
 Colour assignment must be **stable across both runs**: build one label →
 colour map from the union of labels in both files, sorted, before rendering
@@ -168,28 +207,41 @@ separate columns — the eye cannot align two columns across a scroll.
 
 | # | Panel | Encoding |
 |---|---|---|
-| 1 | **Occupancy** | `used`/`total` as a percentage. Two lines, one per variant. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
-| 2 | **Free queue depth** | `queue`, two lines. Same treatment. This is the eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
-| 3 | **Eviction rate** | `Δevicted / Δt`, blocks/s, two lines. The headline comparison. |
-| 4 | **Splice activity** | `Δsplicedblocks / Δt`, policy only, filled area. Annotate `splices=0 for the whole run` in red if the policy series is flat zero — that is a bug, not a result. |
-| 5 | **Attribution — policy** | Stacked area, one band per `job:node`, plus `<untracked>` and `other`. Y is blocks evicted per window. |
-| 6 | **Attribution — baseline** | Same, same colours, same y-scale as panel 5. Locking the y-scale across the two is what makes them comparable at a glance. |
-| 7 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
-| 8 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
+| 1 | **KV rebuilt (cumulative)** | `rematMb`, two lines, MB. **The headline.** The gap between the two curves at the right edge *is* the result. Shade it and label the final delta in the panel. |
+| 2 | **Rebuild rate** | `ΔrematBlocks / Δt`, blocks/s, two lines. Shows *when* the policy helped — a gap that opens only under pressure is a different story from a constant offset. |
+| 3 | **Hit rate** | `hitRateWin`, two lines, 0–1. Read against panel 1: movement down with hit rate flat or up is the win. Movement down *and* hit rate down means it served less, not better. |
+| 4 | **Redo share** | Windowed `ΔrematBlocks / Δblocks_cached`, two lines, 0–1. Normalises panel 2 for throughput, so a quiet run cannot fake an improvement. |
+| 5 | **Occupancy** | `used`/`total` as a percentage. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
+| 6 | **Free queue depth** | `queue`, two lines. The eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
+| 7 | **Eviction rate** | `Δevicted / Δt`, blocks/s, two lines. |
+| 8 | **Splice activity** | `ΔsplicedBlocks / Δt`, policy only, filled area. Annotate `splices=0 for the whole run` in red if the policy series is flat zero — that is a bug, not a result. |
+| 9 | **Attribution — policy** | Stacked area, one band per `job:node`, plus `<untracked>` and `other`. Y is blocks evicted per window. |
+| 10 | **Attribution — baseline** | Same, same colours, same y-scale as panel 9. Locking the y-scale across the two is what makes them comparable at a glance. |
+| 11 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
+| 12 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
 
 ### Summary header
 
 Above the panels, a compact row of paired numbers — baseline vs policy, with
-the delta:
+the delta. Movement first, because that is the claim:
 
+- **KV rebuilt (`remat_mb`), and the delta as a percentage** — the headline
+- redo share (`remat_ratio`)
+- hit rate (cumulative)
 - total evictions
 - mean occupancy
 - blocks spliced
 - final regret
-- peak eviction rate
 - distinct `job:node` keys seen
 
 This is what gets screenshotted into a writeup. Make it copyable as text.
+
+**Guard against the flattering comparison.** If the two runs differ in
+`query_tokens` by more than ~10%, they did not serve the same work and the
+absolute `remat_mb` delta is not a fair number. Detect it and print a warning
+banner: *"runs differ in served tokens by N% — compare `remat_ratio`, not
+`remat_mb`."* A visualisation that lets someone quote a win they did not earn
+is worse than no visualisation.
 
 ---
 
