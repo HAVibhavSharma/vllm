@@ -1,0 +1,1173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV eviction — HBM timeline</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #16191d; --muted: #6b7280; --line: #e3e6ea;
+    --panel: #fafbfc; --warn-bg: #fff4e5; --warn-fg: #8a4b00; --warn-br: #f0c68a;
+    --baseline: #d97528; --policy: #1f8f7a; --grid: #eceff3;
+    --good: #147a5e; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --fg: #e6e9ed; --muted: #98a2b3; --line: #2a2f36;
+      --panel: #1a1e23; --warn-bg: #3a2a12; --warn-fg: #f0c68a; --warn-br: #6b4a1c;
+      --baseline: #f0913f; --policy: #35bda3; --grid: #23282e;
+      --good: #35bda3; --bad: #f2726a;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --fg: #16191d; --muted: #6b7280; --line: #e3e6ea;
+    --panel: #fafbfc; --warn-bg: #fff4e5; --warn-fg: #8a4b00; --warn-br: #f0c68a;
+    --baseline: #d97528; --policy: #1f8f7a; --grid: #eceff3;
+    --good: #147a5e; --bad: #b3261e;
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171a; --fg: #e6e9ed; --muted: #98a2b3; --line: #2a2f36;
+    --panel: #1a1e23; --warn-bg: #3a2a12; --warn-fg: #f0c68a; --warn-br: #6b4a1c;
+    --baseline: #f0913f; --policy: #35bda3; --grid: #23282e;
+    --good: #35bda3; --bad: #f2726a;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 80px; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  /* --- input ------------------------------------------------------- */
+  #intake { border: 1px dashed var(--line); border-radius: 10px; padding: 18px;
+            background: var(--panel); margin-bottom: 20px; }
+  #intake.drag { border-color: var(--policy); background: color-mix(in srgb, var(--policy) 8%, var(--panel)); }
+  .intake-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .paste-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+  @media (max-width: 720px) { .paste-grid { grid-template-columns: 1fr; } }
+  textarea { width: 100%; min-height: 90px; resize: vertical; padding: 8px;
+             border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+             color: var(--fg); font-family: ui-monospace, Menlo, Consolas, monospace;
+             font-size: 11px; }
+  label.fld { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  button:hover { border-color: var(--muted); }
+  button.on { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .hint { color: var(--muted); font-size: 12px; }
+
+  /* --- banners ------------------------------------------------------ */
+  .banner { border: 1px solid var(--warn-br); background: var(--warn-bg);
+            color: var(--warn-fg); padding: 10px 14px; border-radius: 8px;
+            margin-bottom: 16px; font-size: 13px; }
+  .banner b { font-weight: 600; }
+
+  /* --- summary ------------------------------------------------------ */
+  #summary { margin-bottom: 22px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 620px; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  tr.headline td { font-weight: 600; }
+  .delta.good { color: var(--good); }
+  .delta.bad  { color: var(--bad); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+            margin-right: 6px; vertical-align: baseline; }
+
+  /* --- panels ------------------------------------------------------- */
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 12px 14px 6px; margin-bottom: 14px; }
+  .panel h3 { margin: 0; font-size: 13px; font-weight: 600; }
+  .panel .why { margin: 2px 0 8px; font-size: 12px; color: var(--muted); }
+  .panel svg { display: block; width: 100%; touch-action: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 6px 0 8px; font-size: 12px; }
+  .legend span.item { cursor: pointer; user-select: none; color: var(--muted); }
+  .legend span.item.active { color: var(--fg); }
+  .flag { font-size: 12px; color: var(--bad); margin: 4px 0 8px; font-weight: 600; }
+
+  #tooltip { position: fixed; pointer-events: none; z-index: 40; display: none;
+             background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+             padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.14);
+             max-width: 320px; }
+  #tooltip .tt-t { color: var(--muted); margin-bottom: 4px; }
+  #tooltip .tt-row { display: flex; justify-content: space-between; gap: 14px; }
+  #tooltip .tt-v { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+             margin-bottom: 14px; }
+  .toolbar .spacer { flex: 1; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>KV eviction — HBM timeline</h1>
+  <p class="sub">
+    Drop the <code>kv_hbm</code> lines from both runs. Everything is computed in
+    the page; nothing leaves your machine.
+  </p>
+
+  <div id="intake">
+    <div class="intake-row">
+      <input type="file" id="files" multiple accept=".log,.txt,.kv_hbm,*/*">
+      <span class="hint">…or drag files here, or paste below.</span>
+      <span class="spacer" style="flex:1"></span>
+      <button id="demo" type="button">Load sample data</button>
+    </div>
+    <div class="paste-grid">
+      <div>
+        <label class="fld" for="pasteA">Run A — paste <code>grep 'kv_hbm ' baseline.log</code></label>
+        <textarea id="pasteA" spellcheck="false" placeholder="kv_hbm variant=baseline total=…"></textarea>
+      </div>
+      <div>
+        <label class="fld" for="pasteB">Run B — paste <code>grep 'kv_hbm ' test_our.log</code></label>
+        <textarea id="pasteB" spellcheck="false" placeholder="kv_hbm variant=node_eviction total=…"></textarea>
+      </div>
+    </div>
+    <div class="intake-row" style="margin-top:10px">
+      <button id="parsePaste" type="button">Plot pasted text</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+  </div>
+
+  <div id="banners"></div>
+
+  <div class="toolbar" id="toolbar" hidden>
+    <button data-solo="all" class="on" type="button">Both runs</button>
+    <button data-solo="baseline" type="button">Baseline only</button>
+    <button data-solo="node_eviction" type="button">Policy only</button>
+    <span class="spacer"></span>
+    <span class="hint" id="zoomHint">Drag on any panel to zoom · double-click to reset</span>
+    <button id="theme" type="button">Theme</button>
+  </div>
+
+  <div id="summary"></div>
+  <div id="panels"><div class="empty">No data loaded yet.</div></div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+
+/* ==================================================================== *
+ * 1. Parsing
+ *
+ * The payload is flat key=value separated by single spaces. `top_evicted`
+ * carries `=` inside its value, so every split is on the FIRST `=` of a
+ * token — splitting on all of them silently truncates the attribution.
+ * ==================================================================== */
+
+const NUMERIC_FIELDS = new Set([
+  "total","used","free","usage","queue","splices","spliced_blocks","evicted",
+  "evicted_by_score","regret","hit_rate","hit_rate_win","hit_tokens",
+  "query_tokens","remat_blocks","remat_mb","remat_ratio","blocks_cached",
+  "index_keys","index_blocks",
+]);
+
+// vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
+// optionally behind `(EngineCore_0 pid=123)`. Year is absent; only
+// differences matter, so any year works.
+const STAMP_RE = /(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/;
+
+function parseStamp(prefix) {
+  const m = STAMP_RE.exec(prefix);
+  if (!m) return null;
+  const [, mo, d, h, mi, s] = m.map(Number);
+  return Date.UTC(2000, mo - 1, d, h, mi, s) / 1000;
+}
+
+function parseTopEvicted(raw) {
+  const out = new Map();
+  if (!raw || raw === "-") return out;
+  for (const entry of raw.split(",")) {
+    const i = entry.lastIndexOf("=");   // labels contain `:` and may contain `=`
+    if (i < 0) continue;
+    const label = entry.slice(0, i);
+    const n = Number(entry.slice(i + 1));
+    if (label && Number.isFinite(n)) out.set(label, (out.get(label) || 0) + n);
+  }
+  return out;
+}
+
+function parseLine(line) {
+  const at = line.indexOf("kv_hbm ");
+  if (at < 0) return null;
+  const stamp = parseStamp(line.slice(0, at));
+  const fields = {};
+  for (const tok of line.slice(at).split(/\s+/)) {
+    const i = tok.indexOf("=");
+    if (i < 0) continue;
+    const k = tok.slice(0, i);
+    let v = tok.slice(i + 1);
+    if (k === "usage") v = v.replace(/%$/, "");
+    fields[k] = NUMERIC_FIELDS.has(k) ? Number(v) : v;
+  }
+  if (!fields.variant) return null;
+  fields._stamp = stamp;
+  fields._top = parseTopEvicted(fields.top_evicted);
+  return fields;
+}
+
+function parseRun(text) {
+  const rows = [];
+  for (const line of text.split(/\r?\n/)) {
+    const f = parseLine(line);
+    if (f) rows.push(f);
+  }
+  if (!rows.length) return null;
+
+  // Absolute stamps -> elapsed seconds from this run's first line. The two
+  // runs happened at different wall-clock times; comparing them on absolute
+  // time puts two disjoint traces on one axis.
+  let base = null, prev = null, dayRoll = 0;
+  const haveStamps = rows.every(r => r._stamp !== null);
+  rows.forEach((r, i) => {
+    if (haveStamps) {
+      let s = r._stamp + dayRoll;
+      if (prev !== null && s < prev - 3600) { dayRoll += 86400; s += 86400; }
+      prev = s;
+      if (base === null) base = s;
+      r.t = s - base;
+    } else {
+      r.t = i * 30;   // no parsable clock: fall back to nominal period
+    }
+  });
+
+  const variant = rows[0].variant;
+  const missing = ["remat_mb", "hit_rate"].filter(k => rows[0][k] === undefined);
+  return { variant, rows, syntheticTime: !haveStamps, missingFields: missing };
+}
+
+/* ==================================================================== *
+ * 2. Derived series
+ *
+ * Cumulative counters mean nothing undifferenced: a monotonically rising
+ * `evicted` looks the same for a healthy run and a thrashing one. Ratios
+ * are NOT differenced — differencing a ratio is meaningless; the two
+ * underlying counters are differenced and divided instead.
+ * ==================================================================== */
+
+function num(v) { return Number.isFinite(v) ? v : 0; }
+
+function rateSeries(rows, field) {
+  // Emitted as explicit step rectangles: the rate over [t(i-1), t(i)] is a
+  // property of the interval, not of an instant.
+  const pts = [];
+  for (let i = 1; i < rows.length; i++) {
+    const dt = rows[i].t - rows[i - 1].t;
+    if (dt <= 0) continue;
+    const r = (num(rows[i][field]) - num(rows[i - 1][field])) / dt;
+    pts.push([rows[i - 1].t, r], [rows[i].t, r]);
+  }
+  return pts;
+}
+
+function ratioSeries(rows, numField, denField) {
+  const pts = [];
+  for (let i = 1; i < rows.length; i++) {
+    const dn = num(rows[i][numField]) - num(rows[i - 1][numField]);
+    const dd = num(rows[i][denField]) - num(rows[i - 1][denField]);
+    const v = dd > 0 ? dn / dd : 0;
+    pts.push([rows[i - 1].t, v], [rows[i].t, v]);
+  }
+  return pts;
+}
+
+function levelSeries(rows, field, scale) {
+  return rows.map(r => [r.t, num(r[field]) * (scale === undefined ? 1 : scale)]);
+}
+
+// Median sample spacing, used to mark idle gaps. The line is change-gated,
+// so a gap means "nothing moved", not "no data" — but the reader still has
+// to be able to tell those apart from a dropped log.
+function medianDt(rows) {
+  const d = [];
+  for (let i = 1; i < rows.length; i++) d.push(rows[i].t - rows[i - 1].t);
+  if (!d.length) return 30;
+  d.sort((a, b) => a - b);
+  return d[Math.floor(d.length / 2)] || 30;
+}
+
+/* ==================================================================== *
+ * 3. State
+ * ==================================================================== */
+
+const S = {
+  runs: {},                 // variant -> parsed run
+  domain: null,             // [t0, t1] or null for full extent
+  solo: "all",
+  hiddenLabels: new Set(),
+  labelColour: new Map(),
+  panels: [],               // render handles for crosshair
+};
+
+const PALETTE = [
+  "#4c78a8","#f58518","#54a24b","#b279a2","#e45756","#72b7b2",
+  "#ff9da6","#9d755d","#bab0ac","#7f7f7f","#17becf","#bcbd22",
+];
+
+function runList() {
+  const out = [];
+  if (S.runs.baseline) out.push(S.runs.baseline);
+  if (S.runs.node_eviction) out.push(S.runs.node_eviction);
+  return out.filter(r => S.solo === "all" || r.variant === S.solo);
+}
+function colourFor(variant) {
+  return variant === "baseline" ? "var(--baseline)" : "var(--policy)";
+}
+function labelFor(variant) {
+  return variant === "baseline" ? "baseline (LRU)" : "node_eviction";
+}
+
+/* ==================================================================== *
+ * 4. Formatting
+ * ==================================================================== */
+
+function fmtNum(v, digits) {
+  if (!Number.isFinite(v)) return "–";
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + "G";
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + "M";
+  if (a >= 1e3) return (v / 1e3).toFixed(a >= 1e4 ? 0 : 1) + "k";
+  return v.toFixed(digits === undefined ? (a < 10 ? 2 : 0) : digits);
+}
+function fmtPct(v) { return Number.isFinite(v) ? (v * 100).toFixed(1) + "%" : "–"; }
+function fmtMB(v) {
+  if (!Number.isFinite(v)) return "–";
+  return v >= 1024 ? (v / 1024).toFixed(2) + " GB" : v.toFixed(1) + " MB";
+}
+function fmtTime(sec) {
+  const s = Math.max(0, Math.round(sec));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}h${String(m).padStart(2,"0")}m` :
+         m ? `${m}m${String(r).padStart(2,"0")}s` : `${r}s`;
+}
+
+/* ==================================================================== *
+ * 5. Chart primitives — hand-rolled SVG, no library, no external host
+ * ==================================================================== */
+
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(name, attrs) {
+  const n = document.createElementNS(SVGNS, name);
+  for (const k in attrs) if (attrs[k] !== undefined) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+function niceTicks(lo, hi, count) {
+  if (!(hi > lo)) return [lo];
+  const span = hi - lo;
+  const raw = span / Math.max(1, count);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) {
+    out.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  }
+  return out;
+}
+
+const M = { top: 8, right: 12, bottom: 22, left: 56 };
+const PANEL_H = 150;
+
+function fullExtent() {
+  let hi = 0;
+  for (const r of Object.values(S.runs)) {
+    if (r && r.rows.length) hi = Math.max(hi, r.rows[r.rows.length - 1].t);
+  }
+  return [0, hi || 1];
+}
+function xDomain() { return S.domain || fullExtent(); }
+
+/**
+ * Line panel. Series are step-after: the value holds until the next sample.
+ * Linear interpolation across an idle gap would draw a smooth ramp through
+ * a state the server was never in.
+ */
+function drawLinePanel(host, cfg) {
+  const width = host.clientWidth || 800;
+  const h = PANEL_H;
+  const svg = el("svg", { viewBox: `0 0 ${width} ${h}`, height: h });
+  const [x0, x1] = xDomain();
+  const iw = width - M.left - M.right, ih = h - M.top - M.bottom;
+
+  let lo = 0, hi = 0;
+  for (const s of cfg.series) {
+    for (const [t, v] of s.points) {
+      if (t < x0 || t > x1) continue;
+      if (!Number.isFinite(v)) continue;
+      lo = Math.min(lo, v); hi = Math.max(hi, v);
+    }
+  }
+  if (cfg.yMax !== undefined) hi = cfg.yMax;
+  if (cfg.yMin !== undefined) lo = cfg.yMin;
+  if (hi <= lo) hi = lo + 1;
+  if (cfg.yMax === undefined) hi *= 1.08;
+
+  const X = t => M.left + (t - x0) / ((x1 - x0) || 1) * iw;
+  const Y = v => M.top + ih - (v - lo) / ((hi - lo) || 1) * ih;
+
+  for (const tick of niceTicks(lo, hi, 4)) {
+    const y = Y(tick);
+    svg.appendChild(el("line", { x1: M.left, x2: width - M.right, y1: y, y2: y,
+                                stroke: "var(--grid)", "stroke-width": 1 }));
+    const tx = el("text", { x: M.left - 8, y: y + 3.5, "text-anchor": "end",
+                            fill: "var(--muted)", "font-size": 10 });
+    tx.textContent = cfg.fmtY ? cfg.fmtY(tick) : fmtNum(tick);
+    svg.appendChild(tx);
+  }
+  for (const tick of niceTicks(x0, x1, 6)) {
+    const x = X(tick);
+    const tx = el("text", { x, y: h - 6, "text-anchor": "middle",
+                            fill: "var(--muted)", "font-size": 10 });
+    tx.textContent = fmtTime(tick);
+    svg.appendChild(tx);
+  }
+
+  for (const s of cfg.series) {
+    const pts = s.points.filter(p => Number.isFinite(p[1]));
+    if (!pts.length) continue;
+    const solid = [], dashed = [];
+    let cur = solid, started = false, d = "";
+    const flush = arr => { if (d) arr.push(d); d = ""; };
+
+    for (let i = 0; i < pts.length; i++) {
+      const [t, v] = pts[i];
+      if (!started) { d = `M ${X(t)} ${Y(v)}`; started = true; continue; }
+      const gap = s.stepped === false
+        ? false
+        : (t - pts[i - 1][0]) > (s.gapThreshold || Infinity);
+      if (gap) {
+        // Break the run: the held segment across an idle window is drawn
+        // dashed so silence reads differently from continuous data.
+        flush(cur);
+        dashed.push(`M ${X(pts[i - 1][0])} ${Y(pts[i - 1][1])} L ${X(t)} ${Y(pts[i - 1][1])}`);
+        d = `M ${X(t)} ${Y(pts[i - 1][1])} L ${X(t)} ${Y(v)}`;
+        cur = solid;
+        continue;
+      }
+      d += s.stepped === false
+        ? ` L ${X(t)} ${Y(v)}`
+        : ` L ${X(t)} ${Y(pts[i - 1][1])} L ${X(t)} ${Y(v)}`;
+    }
+    flush(cur);
+
+    for (const path of solid) {
+      svg.appendChild(el("path", { d: path, fill: "none", stroke: s.colour,
+        "stroke-width": s.width || 1.8, "stroke-dasharray": s.dash,
+        "stroke-linejoin": "round" }));
+    }
+    for (const path of dashed) {
+      svg.appendChild(el("path", { d: path, fill: "none", stroke: s.colour,
+        "stroke-width": 1, "stroke-dasharray": "2 4", opacity: 0.55 }));
+    }
+  }
+
+  return finishPanel(host, svg, width, X, x0, x1, cfg);
+}
+
+/**
+ * Stacked attribution. Windowed data, so it is drawn as rectangles over the
+ * interval each sample covers — not as a smooth area, which would imply
+ * per-instant values the log does not carry.
+ */
+function drawStackPanel(host, cfg) {
+  const width = host.clientWidth || 800;
+  const h = PANEL_H;
+  const svg = el("svg", { viewBox: `0 0 ${width} ${h}`, height: h });
+  const [x0, x1] = xDomain();
+  const iw = width - M.left - M.right, ih = h - M.top - M.bottom;
+  const hi = Math.max(cfg.yMax || 0, 1);
+
+  const X = t => M.left + (t - x0) / ((x1 - x0) || 1) * iw;
+  const Y = v => M.top + ih - v / hi * ih;
+
+  for (const tick of niceTicks(0, hi, 4)) {
+    const y = Y(tick);
+    svg.appendChild(el("line", { x1: M.left, x2: width - M.right, y1: y, y2: y,
+                                stroke: "var(--grid)", "stroke-width": 1 }));
+    const tx = el("text", { x: M.left - 8, y: y + 3.5, "text-anchor": "end",
+                            fill: "var(--muted)", "font-size": 10 });
+    tx.textContent = fmtNum(tick, 0);
+    svg.appendChild(tx);
+  }
+  for (const tick of niceTicks(x0, x1, 6)) {
+    const tx = el("text", { x: X(tick), y: h - 6, "text-anchor": "middle",
+                            fill: "var(--muted)", "font-size": 10 });
+    tx.textContent = fmtTime(tick);
+    svg.appendChild(tx);
+  }
+
+  for (const w of cfg.windows) {
+    if (w.t1 < x0 || w.t0 > x1) continue;
+    const xa = X(Math.max(w.t0, x0)), xb = X(Math.min(w.t1, x1));
+    let acc = 0;
+    for (const [label, v] of w.bands) {
+      if (v <= 0) continue;
+      const yTop = Y(acc + v), yBot = Y(acc);
+      svg.appendChild(el("rect", {
+        x: xa, y: yTop, width: Math.max(0.5, xb - xa), height: Math.max(0, yBot - yTop),
+        fill: S.labelColour.get(label) || "#888", opacity: 0.9,
+      }));
+      acc += v;
+    }
+  }
+
+  return finishPanel(host, svg, width, X, x0, x1, cfg);
+}
+
+// Crosshair, zoom brush and hover target, shared by both panel kinds.
+function finishPanel(host, svg, width, X, x0, x1, cfg) {
+  const cross = el("line", { y1: M.top, y2: PANEL_H - M.bottom, stroke: "var(--muted)",
+                             "stroke-width": 1, "stroke-dasharray": "3 3",
+                             opacity: 0, "pointer-events": "none" });
+  svg.appendChild(cross);
+  const brush = el("rect", { y: M.top, height: PANEL_H - M.top - M.bottom,
+                             fill: "var(--fg)", opacity: 0, "pointer-events": "none" });
+  svg.appendChild(brush);
+  const hit = el("rect", { x: M.left, y: M.top, width: Math.max(0, width - M.left - M.right),
+                           height: PANEL_H - M.top - M.bottom, fill: "transparent" });
+  svg.appendChild(hit);
+  host.appendChild(svg);
+
+  const invX = px => x0 + (px - M.left) / (Math.max(1, width - M.left - M.right)) * (x1 - x0);
+  const handle = { cross, X, invX, cfg, svg, brush };
+  S.panels.push(handle);
+
+  let dragFrom = null;
+  hit.addEventListener("pointerdown", ev => {
+    dragFrom = localX(svg, ev);
+    hit.setPointerCapture(ev.pointerId);
+  });
+  hit.addEventListener("pointermove", ev => {
+    const px = localX(svg, ev);
+    if (dragFrom !== null) {
+      const a = Math.min(dragFrom, px), b = Math.max(dragFrom, px);
+      brush.setAttribute("x", a);
+      brush.setAttribute("width", Math.max(0, b - a));
+      brush.setAttribute("opacity", 0.12);
+    }
+    showCrosshair(invX(px), ev.clientX, ev.clientY, cfg);
+  });
+  hit.addEventListener("pointerup", ev => {
+    const px = localX(svg, ev);
+    if (dragFrom !== null && Math.abs(px - dragFrom) > 8) {
+      const a = invX(Math.min(dragFrom, px)), b = invX(Math.max(dragFrom, px));
+      S.domain = [a, b];
+      render();
+    }
+    dragFrom = null;
+    brush.setAttribute("opacity", 0);
+  });
+  hit.addEventListener("pointerleave", () => { hideCrosshair(); });
+  hit.addEventListener("dblclick", () => { S.domain = null; render(); });
+
+  return handle;
+}
+function localX(svg, ev) {
+  const r = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal.width || r.width;
+  return (ev.clientX - r.left) * (vb / r.width);
+}
+
+/* ==================================================================== *
+ * 6. Crosshair + tooltip
+ * ==================================================================== */
+
+const tooltip = document.getElementById("tooltip");
+
+function nearest(rows, t) {
+  let best = null, bd = Infinity;
+  for (const r of rows) {
+    const d = Math.abs(r.t - t);
+    if (d < bd) { bd = d; best = r; }
+  }
+  return best;
+}
+
+function showCrosshair(t, clientX, clientY, cfg) {
+  for (const p of S.panels) {
+    const px = p.X(t);
+    p.cross.setAttribute("x1", px);
+    p.cross.setAttribute("x2", px);
+    p.cross.setAttribute("opacity", 0.7);
+  }
+  const rows = [];
+  rows.push(`<div class="tt-t">t = ${fmtTime(t)}</div>`);
+  for (const run of runList()) {
+    const s = nearest(run.rows, t);
+    if (!s) continue;
+    const v = cfg.readout ? cfg.readout(s, run) : null;
+    if (v === null || v === undefined) continue;
+    rows.push(
+      `<div class="tt-row"><span><span class="swatch" style="background:${colourFor(run.variant)}"></span>${labelFor(run.variant)}</span>` +
+      `<span class="tt-v">${v}</span></div>`
+    );
+  }
+  tooltip.innerHTML = rows.join("");
+  tooltip.style.display = "block";
+  const r = tooltip.getBoundingClientRect();
+  let left = clientX + 14, top = clientY + 14;
+  if (left + r.width > window.innerWidth - 8) left = clientX - r.width - 14;
+  if (top + r.height > window.innerHeight - 8) top = clientY - r.height - 14;
+  tooltip.style.left = left + "px";
+  tooltip.style.top = top + "px";
+}
+function hideCrosshair() {
+  tooltip.style.display = "none";
+  for (const p of S.panels) p.cross.setAttribute("opacity", 0);
+}
+
+/* ==================================================================== *
+ * 7. Attribution windows
+ *
+ * `top_evicted` names only the top N keys, so the named bands do NOT sum to
+ * the eviction total. The remainder gets an explicit band: without it the
+ * chart silently under-reports and a reader concludes five nodes did
+ * everything. `<untracked>` is a real category (requests with no job_id),
+ * not a remainder, so it keeps its own band.
+ * ==================================================================== */
+
+const OTHER = "other (untruncated)";
+
+function attributionWindows(run) {
+  const out = [];
+  for (let i = 0; i < run.rows.length; i++) {
+    const r = run.rows[i];
+    const prev = i > 0 ? run.rows[i - 1] : null;
+    const t0 = prev ? prev.t : Math.max(0, r.t - 30);
+    const dEvicted = prev ? num(r.evicted) - num(prev.evicted) : num(r.evicted);
+    let named = 0;
+    const bands = [];
+    for (const [label, v] of r._top) {
+      named += v;
+      if (S.hiddenLabels.has(label)) continue;
+      bands.push([label, v]);
+    }
+    bands.sort((a, b) => a[0].localeCompare(b[0]));
+    const other = Math.max(0, dEvicted - named);
+    if (other > 0 && !S.hiddenLabels.has(OTHER)) bands.push([OTHER, other]);
+    out.push({ t0, t1: r.t, bands });
+  }
+  return out;
+}
+
+function collectLabels() {
+  const set = new Set();
+  for (const run of Object.values(S.runs)) {
+    if (!run) continue;
+    for (const r of run.rows) for (const k of r._top.keys()) set.add(k);
+  }
+  const sorted = [...set].sort();
+  S.labelColour = new Map();
+  sorted.forEach((l, i) => S.labelColour.set(l, PALETTE[i % PALETTE.length]));
+  // Stable across BOTH runs — if a node is teal on one panel and amber on
+  // the other, the comparison is unreadable.
+  S.labelColour.set(OTHER, "var(--muted)");
+  S.labelColour.set("<untracked>", "#9d755d");
+  return sorted;
+}
+
+/* ==================================================================== *
+ * 8. Summary header
+ * ==================================================================== */
+
+function last(run) { return run.rows[run.rows.length - 1]; }
+
+function buildSummary() {
+  const host = document.getElementById("summary");
+  host.innerHTML = "";
+  const b = S.runs.baseline, p = S.runs.node_eviction;
+  if (!b && !p) return;
+
+  // "lower is better" for movement; "higher is better" for hit rate.
+  const metrics = [
+    { key: "KV rebuilt (remat_mb)", headline: true, lowerBetter: true,
+      get: r => num(last(r).remat_mb), fmt: fmtMB },
+    { key: "Blocks rebuilt (remat_blocks)", lowerBetter: true,
+      get: r => num(last(r).remat_blocks), fmt: v => fmtNum(v, 0) },
+    { key: "Redo share (remat_ratio)", lowerBetter: true,
+      get: r => num(last(r).remat_ratio), fmt: fmtPct },
+    { key: "Hit rate (cumulative)", lowerBetter: false,
+      get: r => num(last(r).hit_rate), fmt: fmtPct },
+    { key: "Evictions", lowerBetter: true,
+      get: r => num(last(r).evicted), fmt: v => fmtNum(v, 0) },
+    { key: "Mean occupancy", lowerBetter: null,
+      get: r => r.rows.reduce((a, x) => a + num(x.usage), 0) / r.rows.length / 100,
+      fmt: fmtPct },
+    { key: "Blocks spliced", lowerBetter: null,
+      get: r => num(last(r).spliced_blocks), fmt: v => fmtNum(v, 0) },
+    { key: "Final regret", lowerBetter: true,
+      get: r => num(last(r).regret), fmt: v => v.toFixed(3) },
+    { key: "Tokens served (query_tokens)", lowerBetter: null,
+      get: r => num(last(r).query_tokens), fmt: v => fmtNum(v, 0) },
+    { key: "Distinct job:node keys", lowerBetter: null,
+      get: r => new Set(r.rows.flatMap(x => [...x._top.keys()])).size,
+      fmt: v => String(v) },
+  ];
+
+  const rows = metrics.map(m => {
+    const bv = b ? m.get(b) : null, pv = p ? m.get(p) : null;
+    let deltaCell = "<td>–</td>";
+    if (bv !== null && pv !== null && Number.isFinite(bv) && Number.isFinite(pv)) {
+      const abs = pv - bv;
+      const pct = bv !== 0 ? (abs / bv) * 100 : null;
+      let cls = "";
+      if (m.lowerBetter === true) cls = abs < 0 ? "good" : abs > 0 ? "bad" : "";
+      if (m.lowerBetter === false) cls = abs > 0 ? "good" : abs < 0 ? "bad" : "";
+      const sign = abs > 0 ? "+" : "";
+      const txt = pct === null ? `${sign}${m.fmt(abs)}`
+                               : `${sign}${pct.toFixed(1)}%`;
+      deltaCell = `<td class="num delta ${cls}">${txt}</td>`;
+    }
+    return `<tr class="${m.headline ? "headline" : ""}">
+      <td>${m.key}</td>
+      <td class="num">${b ? m.fmt(bv) : "–"}</td>
+      <td class="num">${p ? m.fmt(pv) : "–"}</td>
+      ${deltaCell}</tr>`;
+  }).join("");
+
+  host.innerHTML = `<div class="scroll"><table>
+    <thead><tr><th>Metric</th>
+      <th><span class="swatch" style="background:var(--baseline)"></span>baseline (LRU)</th>
+      <th><span class="swatch" style="background:var(--policy)"></span>node_eviction</th>
+      <th>Δ</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+/* ==================================================================== *
+ * 9. Banners — refuse to let the page flatter the result
+ * ==================================================================== */
+
+function buildBanners() {
+  const host = document.getElementById("banners");
+  host.innerHTML = "";
+  const add = html => {
+    const d = document.createElement("div");
+    d.className = "banner";
+    d.innerHTML = html;
+    host.appendChild(d);
+  };
+
+  const b = S.runs.baseline, p = S.runs.node_eviction;
+  if (!b || !p) {
+    if (b || p) {
+      add(`<b>One run loaded</b> (${labelFor((b || p).variant)}). ` +
+          `Comparison columns stay empty — load the other run to fill them.`);
+    }
+    return;
+  }
+
+  // Runs that did not serve the same work cannot be compared on absolute MB.
+  const qb = num(last(b).query_tokens), qp = num(last(p).query_tokens);
+  if (qb > 0 && qp > 0) {
+    const diff = Math.abs(qp - qb) / Math.max(qb, qp);
+    if (diff > 0.10) {
+      add(`<b>Runs served different amounts of work</b> — ` +
+          `query_tokens differ by ${(diff * 100).toFixed(0)}% ` +
+          `(${fmtNum(qb, 0)} vs ${fmtNum(qp, 0)}). The absolute ` +
+          `<code>remat_mb</code> delta is not a fair number here; quote ` +
+          `<code>remat_ratio</code> instead.`);
+    }
+  }
+
+  // remat_mb == 0 with remat_blocks > 0 means the page size was never
+  // configured. Plotting that as "no movement" inverts the conclusion.
+  for (const r of [b, p]) {
+    const L = last(r);
+    if (num(L.remat_blocks) > 0 && num(L.remat_mb) === 0) {
+      add(`<b>${labelFor(r.variant)}: KV page size unknown</b> — ` +
+          `<code>remat_mb</code> is 0 while <code>remat_blocks</code> is ` +
+          `${fmtNum(L.remat_blocks, 0)}. Panel 1 falls back to blocks. ` +
+          `This is the engine declining to guess, not an absence of movement.`);
+    }
+  }
+
+  if (num(last(p).splices) === 0) {
+    add(`<b>The policy never spliced</b> — <code>splices=0</code> for the ` +
+        `whole run. The tick never reached the splice, so this is a bug in ` +
+        `the run, not a result about the policy.`);
+  }
+
+  for (const r of [b, p]) {
+    if (r.syntheticTime) {
+      add(`<b>${labelFor(r.variant)}: no parsable timestamps</b> — the x-axis ` +
+          `assumes the nominal 30s period. Rates are approximate.`);
+    }
+    if (r.missingFields.length) {
+      add(`<b>${labelFor(r.variant)}: log predates some fields</b> ` +
+          `(${r.missingFields.join(", ")}). Those panels will be empty — ` +
+          `re-run against the updated build.`);
+    }
+  }
+}
+
+/* ==================================================================== *
+ * 10. Panel definitions
+ * ==================================================================== */
+
+function useBlocksForMovement() {
+  // Fall back to blocks when no run knows its page size.
+  for (const r of Object.values(S.runs)) {
+    if (r && num(last(r).remat_mb) > 0) return false;
+  }
+  return true;
+}
+
+function panelDefs() {
+  const asBlocks = useBlocksForMovement();
+  const movField = asBlocks ? "remat_blocks" : "remat_mb";
+  const movFmt = asBlocks ? (v => fmtNum(v, 0)) : fmtMB;
+  const movUnit = asBlocks ? "blocks" : "MB";
+
+  return [
+  { id: "rebuilt",
+    title: `1 · KV rebuilt, cumulative (${movUnit})`,
+    why: "The headline. The gap between the two curves at the right edge is the result.",
+    kind: "line",
+    fmtY: movFmt,
+    series: run => [{ points: levelSeries(run.rows, movField) }],
+    readout: s => movFmt(num(s[movField])),
+  },
+  { id: "rebuildRate",
+    title: `2 · Rebuild rate (${movUnit}/s)`,
+    why: "When the policy helped. A gap that opens only under pressure is a different story from a constant offset.",
+    kind: "line",
+    fmtY: v => fmtNum(v, 2),
+    series: run => [{ points: rateSeries(run.rows, movField) }],
+    readout: (s, run) => {
+      const i = run.rows.indexOf(s);
+      if (i < 1) return "–";
+      const dt = s.t - run.rows[i-1].t;
+      return dt > 0 ? fmtNum((num(s[movField]) - num(run.rows[i-1][movField])) / dt, 2) + "/s" : "–";
+    },
+  },
+  { id: "hit",
+    title: "3 · Prefix cache hit rate (this window)",
+    why: "Read against panel 1. Movement down with hit rate flat or up is the win; movement down and hit rate down means it served less, not better.",
+    kind: "line", yMin: 0, yMax: 1, fmtY: fmtPct,
+    series: run => [{ points: levelSeries(run.rows, "hit_rate_win") }],
+    readout: s => fmtPct(num(s.hit_rate_win)) + " (cum " + fmtPct(num(s.hit_rate)) + ")",
+  },
+  { id: "redo",
+    title: "4 · Redo share — rebuilt / cached (this window)",
+    why: "Normalises panel 2 for throughput, so a quiet run cannot fake an improvement.",
+    kind: "line", yMin: 0, fmtY: fmtPct,
+    series: run => [{ points: ratioSeries(run.rows, "remat_blocks", "blocks_cached") }],
+    readout: (s, run) => {
+      const i = run.rows.indexOf(s);
+      if (i < 1) return "–";
+      const dn = num(s.remat_blocks) - num(run.rows[i-1].remat_blocks);
+      const dd = num(s.blocks_cached) - num(run.rows[i-1].blocks_cached);
+      return dd > 0 ? fmtPct(dn / dd) : "–";
+    },
+  },
+  { id: "occupancy",
+    title: "5 · HBM occupancy",
+    why: "used / total. Fixed 0–100% axis so the two runs are directly comparable.",
+    kind: "line", yMin: 0, yMax: 100, fmtY: v => v.toFixed(0) + "%",
+    series: run => [{ points: levelSeries(run.rows, "usage") }],
+    readout: s => num(s.usage).toFixed(1) + "%  (" + fmtNum(s.used, 0) + " / " + fmtNum(s.total, 0) + ")",
+  },
+  { id: "queue",
+    title: "6 · Free queue depth (eviction candidates)",
+    why: "A policy that keeps this deeper is holding more evictable-but-cached blocks.",
+    kind: "line", yMin: 0, fmtY: v => fmtNum(v, 0),
+    series: run => [{ points: levelSeries(run.rows, "queue") }],
+    readout: s => fmtNum(num(s.queue), 0) + " blocks",
+  },
+  { id: "evictRate",
+    title: "7 · Eviction rate (blocks/s)",
+    why: "Churn volume, for context on panels 1 and 2.",
+    kind: "line", yMin: 0, fmtY: v => fmtNum(v, 1),
+    series: run => [{ points: rateSeries(run.rows, "evicted") }],
+    readout: (s, run) => {
+      const i = run.rows.indexOf(s);
+      if (i < 1) return "–";
+      const dt = s.t - run.rows[i-1].t;
+      return dt > 0 ? fmtNum((num(s.evicted) - num(run.rows[i-1].evicted)) / dt, 1) + "/s" : "–";
+    },
+  },
+  { id: "splice",
+    title: "8 · Splice activity (blocks/s)",
+    why: "Policy only — LRU never reorders the queue. A flat zero here is a bug in the run, not a result.",
+    kind: "line", yMin: 0, fmtY: v => fmtNum(v, 1), policyOnly: true,
+    series: run => [{ points: rateSeries(run.rows, "spliced_blocks") }],
+    readout: s => fmtNum(num(s.spliced_blocks), 0) + " cumulative",
+  },
+  { id: "attrPolicy",  kind: "stack", variant: "node_eviction",
+    title: "9 · Evictions by job:node — policy",
+    why: "Per window. Bands do not sum to the eviction total, so the remainder is drawn explicitly.",
+  },
+  { id: "attrBaseline", kind: "stack", variant: "baseline",
+    title: "10 · Evictions by job:node — baseline",
+    why: "Same colours and the same y-scale as panel 9. Locking the scale is what makes them comparable at a glance.",
+  },
+  { id: "regret",
+    title: "11 · Regret",
+    why: "Policy only. The baseline emits a constant 0.000 — plotting it would read as 'no regret' rather than 'not measured'.",
+    kind: "line", yMin: 0, yMax: 1, fmtY: v => v.toFixed(2), policyOnly: true,
+    series: run => [{ points: levelSeries(run.rows, "regret") }],
+    readout: s => num(s.regret).toFixed(3),
+  },
+  { id: "scored",
+    title: "12 · Scored coverage — evicted_by_score / evicted",
+    why: "Policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so.",
+    kind: "line", yMin: 0, yMax: 1, fmtY: fmtPct, policyOnly: true,
+    series: run => [{ points: run.rows.map(r => [r.t, num(r.evicted) > 0 ? num(r.evicted_by_score) / num(r.evicted) : 0]) }],
+    readout: s => num(s.evicted) > 0 ? fmtPct(num(s.evicted_by_score) / num(s.evicted)) : "–",
+  },
+  ];
+}
+
+/* ==================================================================== *
+ * 11. Render
+ * ==================================================================== */
+
+function render() {
+  const host = document.getElementById("panels");
+  host.innerHTML = "";
+  S.panels = [];
+
+  const runs = runList();
+  if (!runs.length) {
+    host.innerHTML = `<div class="empty">No data loaded yet.</div>`;
+    document.getElementById("toolbar").hidden = true;
+    return;
+  }
+  document.getElementById("toolbar").hidden = false;
+
+  const labels = collectLabels();
+
+  // Panels 9 and 10 share a y-scale; that is what makes them comparable.
+  let stackMax = 1;
+  const stackCache = {};
+  for (const v of ["baseline", "node_eviction"]) {
+    if (!S.runs[v]) continue;
+    const w = attributionWindows(S.runs[v]);
+    stackCache[v] = w;
+    for (const win of w) {
+      const sum = win.bands.reduce((a, x) => a + x[1], 0);
+      if (sum > stackMax) stackMax = sum;
+    }
+  }
+
+  for (const def of panelDefs()) {
+    const sec = document.createElement("section");
+    sec.className = "panel";
+    sec.innerHTML = `<h3>${def.title}</h3><p class="why">${def.why}</p>`;
+
+    if (def.kind === "stack") {
+      if (!S.runs[def.variant]) continue;
+      if (S.solo !== "all" && S.solo !== def.variant) continue;
+      if (labels.length) {
+        const leg = document.createElement("div");
+        leg.className = "legend";
+        for (const l of [...labels, OTHER]) {
+          const s = document.createElement("span");
+          s.className = "item" + (S.hiddenLabels.has(l) ? "" : " active");
+          s.innerHTML = `<span class="swatch" style="background:${S.labelColour.get(l)}"></span>${l}`;
+          s.onclick = () => {
+            S.hiddenLabels.has(l) ? S.hiddenLabels.delete(l) : S.hiddenLabels.add(l);
+            render();
+          };
+          leg.appendChild(s);
+        }
+        sec.appendChild(leg);
+      }
+      host.appendChild(sec);
+      drawStackPanel(sec, {
+        windows: stackCache[def.variant] || [],
+        yMax: stackMax,
+        readout: s => {
+          const parts = [...s._top].map(([k, v]) => `${k}=${v}`);
+          return parts.length ? parts.join(", ") : "–";
+        },
+      });
+      continue;
+    }
+
+    const series = [];
+    for (const run of runs) {
+      if (def.policyOnly && run.variant !== "node_eviction") continue;
+      const gap = medianDt(run.rows) * 3;
+      for (const s of def.series(run)) {
+        series.push({
+          points: s.points,
+          colour: colourFor(run.variant),
+          dash: run.variant === "baseline" ? "5 3" : undefined,
+          gapThreshold: gap,
+        });
+      }
+    }
+    if (!series.length) continue;
+
+    const leg = document.createElement("div");
+    leg.className = "legend";
+    for (const run of runs) {
+      if (def.policyOnly && run.variant !== "node_eviction") continue;
+      const s = document.createElement("span");
+      s.className = "item active";
+      s.innerHTML = `<span class="swatch" style="background:${colourFor(run.variant)}"></span>${labelFor(run.variant)}`;
+      leg.appendChild(s);
+    }
+    sec.appendChild(leg);
+    host.appendChild(sec);
+
+    drawLinePanel(sec, {
+      series, yMin: def.yMin, yMax: def.yMax,
+      fmtY: def.fmtY, readout: def.readout,
+    });
+  }
+
+  buildSummary();
+}
+
+/* ==================================================================== *
+ * 12. Intake
+ * ==================================================================== */
+
+function ingest(text, hintVariant) {
+  const run = parseRun(text);
+  if (!run) return false;
+  if (hintVariant && run.variant !== hintVariant) {
+    // The line names its own variant; trust it over which box it was pasted in.
+  }
+  S.runs[run.variant] = run;
+  return true;
+}
+
+function afterLoad() {
+  S.domain = null;
+  S.hiddenLabels.clear();
+  buildBanners();
+  render();
+}
+
+document.getElementById("files").addEventListener("change", ev => {
+  const files = [...ev.target.files];
+  let pending = files.length;
+  if (!pending) return;
+  for (const f of files) {
+    const fr = new FileReader();
+    fr.onload = () => { ingest(fr.result); if (--pending === 0) afterLoad(); };
+    fr.onerror = () => { if (--pending === 0) afterLoad(); };
+    fr.readAsText(f);
+  }
+});
+
+const intake = document.getElementById("intake");
+intake.addEventListener("dragover", ev => { ev.preventDefault(); intake.classList.add("drag"); });
+intake.addEventListener("dragleave", () => intake.classList.remove("drag"));
+intake.addEventListener("drop", ev => {
+  ev.preventDefault();
+  intake.classList.remove("drag");
+  const files = [...(ev.dataTransfer.files || [])];
+  let pending = files.length;
+  if (!pending) return;
+  for (const f of files) {
+    const fr = new FileReader();
+    fr.onload = () => { ingest(fr.result); if (--pending === 0) afterLoad(); };
+    fr.onerror = () => { if (--pending === 0) afterLoad(); };
+    fr.readAsText(f);
+  }
+});
+
+document.getElementById("parsePaste").addEventListener("click", () => {
+  const a = document.getElementById("pasteA").value;
+  const b = document.getElementById("pasteB").value;
+  let ok = false;
+  if (a.trim()) ok = ingest(a, "baseline") || ok;
+  if (b.trim()) ok = ingest(b, "node_eviction") || ok;
+  if (!ok) {
+    alert("No kv_hbm lines found. Paste the output of:  grep 'kv_hbm ' <log>");
+    return;
+  }
+  afterLoad();
+});
+
+document.getElementById("clear").addEventListener("click", () => {
+  S.runs = {};
+  document.getElementById("pasteA").value = "";
+  document.getElementById("pasteB").value = "";
+  document.getElementById("banners").innerHTML = "";
+  document.getElementById("summary").innerHTML = "";
+  afterLoad();
+});
+
+for (const btn of document.querySelectorAll("[data-solo]")) {
+  btn.addEventListener("click", () => {
+    S.solo = btn.dataset.solo;
+    for (const b of document.querySelectorAll("[data-solo]")) b.classList.toggle("on", b === btn);
+    render();
+  });
+}
+
+document.getElementById("theme").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "dark" ? "light" : cur === "light" ? "" : "dark";
+  if (next) document.documentElement.setAttribute("data-theme", next);
+  else document.documentElement.removeAttribute("data-theme");
+  render();
+});
+
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (Object.keys(S.runs).length) render(); }, 120);
+});
+
+/* --- sample data, so the page is inspectable before a real run ------- */
+document.getElementById("demo").addEventListener("click", () => {
+  const mk = (variant, seed) => {
+    const lines = [];
+    let evicted = 0, remat = 0, cached = 0, spliced = 0, splices = 0;
+    let hitT = 0, qT = 0;
+    const total = 24000;
+    const rematRate = variant === "baseline" ? 1.0 : 0.55;
+    const hit = variant === "baseline" ? 0.62 : 0.71;
+    for (let i = 0; i < 60; i++) {
+      const t = new Date(Date.UTC(2026, 7, 7, 12, 0, 0) + i * 30000);
+      const load = 0.6 + 0.4 * Math.sin(i / 7 + seed);
+      evicted += Math.round(220 * load);
+      cached += Math.round(340 * load);
+      remat += Math.round(90 * load * rematRate);
+      if (variant !== "baseline") { splices += 1; spliced += Math.round(180 * load); }
+      const q = Math.round(52000 * load); qT += q;
+      const hw = hit + 0.06 * Math.sin(i / 4 + seed);
+      hitT += Math.round(q * hw);
+      const used = Math.round(total * (0.72 + 0.2 * load * 0.5));
+      const stamp = `INFO 08-07 ${String(t.getUTCHours()).padStart(2,"0")}:` +
+                    `${String(t.getUTCMinutes()).padStart(2,"0")}:` +
+                    `${String(t.getUTCSeconds()).padStart(2,"0")} [controller.py:600]`;
+      const topA = Math.round(120 * load), topB = Math.round(70 * load);
+      lines.push(
+        `${stamp} kv_hbm variant=${variant} total=${total} used=${used} ` +
+        `free=${total-used} usage=${(used/total*100).toFixed(1)}% queue=${total-used} ` +
+        `splices=${splices} spliced_blocks=${spliced} evicted=${evicted} ` +
+        `evicted_by_score=${variant==="baseline"?0:Math.round(evicted*0.72)} ` +
+        `regret=${variant==="baseline"?"0.000":(0.09+0.02*Math.sin(i/5)).toFixed(3)} ` +
+        `hit_rate=${(hitT/qT).toFixed(4)} hit_rate_win=${hw.toFixed(4)} ` +
+        `hit_tokens=${hitT} query_tokens=${qT} remat_blocks=${remat} ` +
+        `remat_mb=${(remat*2).toFixed(1)} remat_ratio=${(remat/cached).toFixed(4)} ` +
+        `blocks_cached=${cached} index_keys=112 index_blocks=9130 ` +
+        `top_evicted=run-42:research=${topA},run-42:supervisor=${topB},<untracked>=${Math.round(20*load)}`
+      );
+    }
+    return lines.join("\n");
+  };
+  ingest(mk("baseline", 0));
+  ingest(mk("node_eviction", 1.2));
+  afterLoad();
+});
+</script>
+</body>
+</html>

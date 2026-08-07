@@ -87,6 +87,35 @@ def is_stale(row: ImportanceRow, now_wall_ms: float, cutoff_ms: float) -> bool:
     return (now_wall_ms - row.update_ts_ms) > cutoff_ms
 
 
+def is_uninformative(row: ImportanceRow, config: NodeEvictionConfig) -> bool:
+    """Whether a row that *arrived* still carries no forecast.
+
+    The companion to `is_stale`, and the harder case. A stale row is
+    detectably old; a sentinel row is fresh, well-formed, and wrong — the
+    prediction engine's way of saying "no idea" is a value, not an absence,
+    so it flows through scoring and comes out as a confident near-zero.
+
+    That matters because of what the score does when its numerator is
+    constant. `score = prob * decay * E_miss / blocks`: hold the first three
+    fixed across every key and the ranking is exactly `1/blocks`, i.e. "evict
+    from whichever key holds the most".
+
+    **Both gates are off by default** — see the config. On the one workload
+    where this was measured the low-end sentinel turned out to mark genuinely
+    dead keys (24.3% needed again, against 54.7% for the saturated class), so
+    treating it as absent would have discarded real signal. Enable only for a
+    source that publishes a true blackout, and only with per-class come-back
+    rates in hand.
+    """
+    prob_gate = config.uninformative_prob_at_or_below
+    if prob_gate >= 0.0 and row.prob <= prob_gate:
+        return True
+    ttnc_gate = config.uninformative_ttnc_at_or_above_ms
+    if ttnc_gate > 0.0 and row.time_to_next_call_ms >= ttnc_gate:
+        return True
+    return False
+
+
 def score_key(
     row: ImportanceRow,
     num_blocks: int,
@@ -192,14 +221,22 @@ def build_value_table(
 
     This is the "tick computes, request reads" split (02 §2): the result is a
     plain dict, and the per-request path is a single lookup in it. Keys with
-    no forecast row, or a stale one, are simply absent — an unscored block is
-    never selected by the splice and therefore keeps its LRU position, which
-    is exactly what a neutral score should mean, with no arithmetic (08 §4).
+    no forecast row, a stale one, or one carrying no signal are simply absent
+    — an unscored block is never selected by the splice and therefore keeps
+    its LRU position, which is exactly what a neutral score should mean, with
+    no arithmetic (08 §4).
+
+    All three exclusions are the same rule: **act only on a forecast that
+    says something.** Missing, expired and don't-know are the same state as
+    far as this policy is concerned, and treating the third differently from
+    the first two is what made a real run lose to LRU.
     """
     table: dict[NodeKey, ScoreBreakdown] = {}
     for key, num_blocks in key_block_counts.items():
         row = snapshot.get(key)
         if row is None or is_stale(row, now_wall_ms, config.staleness_cutoff_ms):
+            continue
+        if is_uninformative(row, config):
             continue
         table[key] = score_key(row, num_blocks, config)
     return table

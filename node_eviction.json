@@ -1,7 +1,7 @@
 {
   "use_call_type": true,
   "tick_period_ms": 250,
-  "splice_max_blocks": 256,
+  "splice_max_blocks": 32,
   "fresh_skip_threshold": 0,
   "tau_ms": 30000,
   "delta_l1_ms": 180,
@@ -9,7 +9,6 @@
   "staleness_cutoff_ms": 300000,
   "speculative_default_ttl_ms": 30000,
   "index_hard_drop_age_ms": 1800000,
-
   "prefetch_min_prob": 0.5,
   "prefetch_horizon_ms": 60000,
   "prefetch_max_outstanding": 8,
@@ -17,7 +16,6 @@
   "prefetch_want_ttl_ms": 30000,
   "prefetch_resubmit_backoff_ms": 60000,
   "prefetch_agent_namespace": "langgraph",
-
   "hbm_summary_period_ms": 30000,
   "hbm_summary_top_keys": 5,
   "remat_window_blocks": 0

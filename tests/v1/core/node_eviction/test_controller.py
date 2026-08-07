@@ -790,3 +790,153 @@ def test_remat_ratio_is_over_all_caching_work():
     cache_block(controller, pool, 1, "h1")
     # 4 blocks cached, 1 of them a rebuild.
     assert controller.movement.remat_ratio == 0.25
+
+
+# -- treating a sentinel row as an absent one (opt-in) --------------------
+#
+# From the 2026-08-07 run: 80% of scored evictions ran on the prediction
+# engine's extreme values, and the score collapsed to `constant / blocks`.
+# The gate that would treat those as absent is **off by default** — the same
+# run showed the low-end sentinel marks genuinely dead keys — so these tests
+# opt in explicitly.
+
+GATE_ON = dict(
+    uninformative_prob_at_or_below=0.01,
+    uninformative_ttnc_at_or_above_ms=3_600_000.0,
+)
+
+
+def test_a_sentinel_forecast_leaves_the_key_unscored():
+    """`prob=0.01, ttnc=1h` is the engine saying "no idea". Acting on it
+    ranks by `1/blocks` and nothing else."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.01, time_to_next_call_ms=3_600_000.0)}
+    )
+    controller = make_controller(pool, rows, **GATE_ON)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+    before = pool.queue_ids()
+    controller.maybe_tick()
+
+    assert controller.get_value(RESEARCH) is None
+    assert pool.queue_ids() == before, "unscored blocks keep LRU order"
+    assert controller.observer.counters.blocks_spliced_total == 0
+
+
+def test_a_real_forecast_is_still_scored():
+    """The gate must not swallow the signal it exists to protect."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.45, time_to_next_call_ms=8_000.0)}
+    )
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+    controller.maybe_tick()
+    assert controller.get_value(RESEARCH) is not None
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        dict(prob=0.01, time_to_next_call_ms=5_000.0),      # prob gate
+        dict(prob=0.9, time_to_next_call_ms=3_600_000.0),   # horizon gate
+    ],
+)
+def test_each_half_of_the_gate_fires_on_its_own(row):
+    pool = FakePool(num_blocks=16)
+    controller = make_controller(pool, fresh_rows({RESEARCH: row}), **GATE_ON)
+    index_prefix(controller, pool, RESEARCH, [1])
+    controller.maybe_tick()
+    assert controller.get_value(RESEARCH) is None
+
+
+def test_the_gate_is_off_by_default():
+    """Measured: the low-end sentinel marked genuinely dead keys (24.3%
+    needed again vs 54.7% for the saturated class), so gating it out would
+    discard real signal. Off unless a deployment shows otherwise."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.01, time_to_next_call_ms=3_600_000.0)}
+    )
+    controller = make_controller(pool, rows)   # defaults = gate disabled
+    index_prefix(controller, pool, RESEARCH, [1])
+    controller.maybe_tick()
+    assert controller.get_value(RESEARCH) is not None
+
+
+def test_config_rejects_a_gate_above_the_probability_range():
+    with pytest.raises(ValueError):
+        NodeEvictionConfig(uninformative_prob_at_or_below=1.5).validate()
+
+
+# -- splice churn ---------------------------------------------------------
+
+
+def force_tick(controller):
+    """Run a tick that would otherwise short-circuit.
+
+    `maybe_tick` returns early when the snapshot object is unchanged *and*
+    nothing was evicted since the last tick, so a test that wants a genuine
+    second splice has to defeat that gate explicitly — otherwise it passes
+    because no tick ran, which proves nothing about the splice.
+    """
+    controller._evictions_since_tick = 1
+    controller.maybe_tick()
+
+
+def test_a_parked_block_is_not_respliced():
+    """2,054,400 relocations produced 47,363 evictions in the measured run.
+    A block already at the head and untouched has nowhere better to go."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=600_000.0)})
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+
+    controller.maybe_tick()
+    first = controller.observer.counters.blocks_spliced_total
+    assert first == 3
+
+    force_tick(controller)
+    force_tick(controller)
+    assert controller.observer.counters.blocks_spliced_total == first, (
+        "nothing changed, so the splice must be a no-op"
+    )
+
+
+def test_a_touched_block_becomes_splicable_again():
+    """The skip means "already parked at the head". A cache hit takes the
+    block out of the queue, so that stops being true and the bookkeeping has
+    to be dropped — otherwise the block is skipped forever."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=600_000.0)})
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+    controller.maybe_tick()
+    spliced = controller.observer.counters.blocks_spliced_total
+    assert 1 in controller._spliced_scores
+
+    controller.on_prefix_hit(make_request(), [[pool.blocks[1]]])
+    assert 1 not in controller._spliced_scores
+
+    force_tick(controller)
+    assert controller.observer.counters.blocks_spliced_total == spliced + 1
+
+
+def test_a_newly_worse_key_still_reaches_the_head():
+    """The skip must not freeze the ranking: a key that appears after the
+    first splice and scores lower still has to reach the head."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.9, time_to_next_call_ms=600_000.0),
+            SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=1_000_000.0),
+        }
+    )
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1])
+    controller.maybe_tick()
+    assert pool.queue_ids()[0] == 1
+
+    index_prefix(controller, pool, SUPERVISOR, [4, 5])
+    force_tick(controller)
+    assert pool.queue_ids()[0] in (4, 5), "the worse key must overtake"

@@ -155,6 +155,42 @@ class NodeEvictionConfig:
     unconditional worst-K. Which of the two is right is explicitly
     unresolved (08 §6)."""
 
+    # --- Treating a sentinel row as an absent one (OFF by default) --------
+    #
+    # These exist because 80% of scored evictions in the 2026-08-07 run ran
+    # on the prediction engine's extreme values rather than on a graded
+    # forecast (`prob=0.01, ttnc=1h` on 58% — its end-of-job floors;
+    # `prob=1.0, ttnc=60s` on 22% — its reach estimate saturating at the
+    # clamp). With the numerator constant the score collapses to
+    # `constant / blocks`, i.e. "evict from whichever key holds the most".
+    #
+    # **They default to off, because the measurement did not support turning
+    # them on.** Re-checked with same-millisecond duplicate records excluded,
+    # blocks evicted under the low-end sentinel were needed again only 24.3%
+    # of the time, against 54.7% for the saturated class and 26.1%/49.3%
+    # across the bottom/top score deciles. The floors are *good* decisions —
+    # they are the engine correctly saying a finished job's blocks are free
+    # to go — and gating them out would neuter the one thing the forecast
+    # currently does well.
+    #
+    # Kept, disabled, for the case they were written for: a source that
+    # publishes a true blackout sentinel (every key at the floor because it
+    # has no idea, not because the jobs ended). Turn them on only with the
+    # come-back rate per forecast class in hand.
+
+    uninformative_prob_at_or_below: float = -1.0
+    """A row whose `prob` is at or below this is treated as absent, so its
+    key stays unscored and keeps LRU order (01 §6 Rule 2).
+
+    Negative disables the gate, which is the default. `0.0` still gates,
+    because a published probability of exactly zero is a floor, not a
+    prediction."""
+
+    uninformative_ttnc_at_or_above_ms: float = 0.0
+    """A row predicting the next call this far out is treated as absent.
+
+    `0` or negative disables the gate, which is the default."""
+
     # --- Index lifetime (01 §5 Age) ---------------------------------------
     index_hard_drop_age_ms: float = 1_800_000.0
     """Entries untouched for this long are dropped so a silent job cannot
@@ -311,6 +347,14 @@ class NodeEvictionConfig:
             raise ValueError("hbm_summary_top_keys must be >= 0")
         if self.remat_window_blocks < 0:
             raise ValueError("remat_window_blocks must be >= 0")
+        if self.uninformative_prob_at_or_below > 1.0:
+            # A gate at prob > 1 would make every row uninformative and the
+            # policy permanently inert, which is a silent failure rather than
+            # a loud one.
+            raise ValueError(
+                "uninformative_prob_at_or_below must be <= 1.0; a gate above "
+                "the probability range would make every key unscored"
+            )
         if self.prefetch_wants_enabled and not self.prefetch_agent_namespace:
             # An empty namespace yields agent_id ":research", which matches
             # nothing in the registry — every want would fan out to zero
