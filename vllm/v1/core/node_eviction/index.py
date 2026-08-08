@@ -183,36 +183,29 @@ class BlockOwnershipIndex:
                 del self._owners[block_id]
         return len(entry.positions)
 
-    def gc(
-        self,
-        now: float,
-        hard_drop_age: float,
-        speculative_ttls: dict[NodeKey, float] | None = None,
-        speculative_ttl_multiple: float = 4.0,
-    ) -> int:
+    def gc(self, now: float, hard_drop_age: float) -> int:
         """Drop entries the policy can no longer say anything useful about.
 
-        Two clocks: a silent job decays out of the *score* via the time
+        One clock. A silent job decays out of the *score* via the time
         discount, but the index would still hold its keys forever, so there
-        is a hard age drop. Speculative entries additionally drop at
-        `TTL x multiple`, since a prediction that far past its own deadline
-        has been falsified (02 §5).
+        is a hard age drop on `last_seen`.
+
+        Speculative entries used to drop on a second clock — `TTL x multiple`
+        past creation, on the theory that a prediction that far past its own
+        deadline has been falsified. That TTL came from
+        `time_to_next_call_ms` and has been removed along with the floor
+        decay it shared a clock with (see `scoring.speculative_floor`).
+        Keeping it here would have been the same expiry wearing a different
+        name: a prefetched prefix held at the floor by the scorer, then
+        deleted out from under it by the GC.
 
         Returns the number of keys dropped.
         """
-        doomed: list[NodeKey] = []
-        for key, entry in self._entries.items():
-            age = now - entry.last_seen
-            if age >= hard_drop_age:
-                doomed.append(key)
-                continue
-            if entry.speculative:
-                ttl = None
-                if speculative_ttls is not None:
-                    ttl = speculative_ttls.get(key)
-                if ttl is not None and ttl > 0:
-                    if now - entry.created_at >= ttl * speculative_ttl_multiple:
-                        doomed.append(key)
+        doomed = [
+            key
+            for key, entry in self._entries.items()
+            if now - entry.last_seen >= hard_drop_age
+        ]
         for key in doomed:
             self.drop_key(key)
         return len(doomed)

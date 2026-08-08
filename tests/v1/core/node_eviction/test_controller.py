@@ -344,6 +344,41 @@ def test_a_fresh_prefetch_is_protected_from_its_own_policy():
     assert controller.observer.counters.speculative_created == 1
 
 
+def test_an_old_prefetch_is_still_protected():
+    """The floor does not expire. It used to decay to
+    `speculative_floor_low = -1.0` over `time_to_next_call_ms`, which put an
+    unused prefetch *below* every real score — so the block the policy paid a
+    prefill for became the first one evicted, at roughly the moment its
+    predicted call was due.
+
+    `time_to_next_call_ms` is deliberately 60s here, the arm that used to run
+    the countdown to first-out.
+    """
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.01, time_to_next_call_ms=60_000.0),
+            SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=1_000.0),
+        }
+    )
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1], speculative=True)
+    index_prefix(controller, pool, SUPERVISOR, [2])
+
+    # Backdate the entry well past every TTL that used to exist: the old
+    # default (30s), the row's own 60s, and the 4x hard-drop multiple.
+    entry = controller.index.get_entry(RESEARCH)
+    entry.created_at -= 600.0
+    entry.last_seen -= 600.0
+
+    controller.maybe_tick()
+
+    assert pool.queue_ids()[0] == 2, "the aged prefetch must still not go first"
+    assert controller.get_value(RESEARCH).score > controller.get_value(
+        SUPERVISOR
+    ).score
+
+
 def test_confirm_on_touch_clears_the_stamp():
     pool = FakePool(num_blocks=16)
     controller = make_controller(pool)
@@ -920,6 +955,100 @@ def test_a_touched_block_becomes_splicable_again():
 
     force_tick(controller)
     assert controller.observer.counters.blocks_spliced_total == spliced + 1
+
+
+def test_the_staged_region_grows_deeper_than_one_ticks_cap():
+    """Window 1. The policy governs exactly the prefix of the free queue it
+    has staged; past that, `popleft_n` evicts by raw LRU age. With the cap
+    read as a fixed K the staged region never exceeded K, so a request
+    needing more blocks than that popped straight through into unordered
+    territory. The cap is a catch-up rate, and depth accumulates across
+    ticks."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=600_000.0)})
+    controller = make_controller(
+        pool, rows, splice_max_blocks=2, splice_restage_period_ms=0.0
+    )
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3, 4, 5, 6])
+
+    controller.maybe_tick()
+    assert controller.observer.counters.splice_staged_blocks == 2
+
+    force_tick(controller)
+    force_tick(controller)
+    assert controller.observer.counters.splice_staged_blocks == 6, (
+        "depth must accumulate, not reset to the per-tick cap"
+    )
+
+
+def test_the_deficit_reports_blocks_left_in_raw_lru_order():
+    """The window-1 gauge. A block the policy wanted to rank and could not
+    is evicted by age, so a sustained deficit means the scores are not
+    governing evictions however good they are."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=600_000.0)})
+    controller = make_controller(
+        pool, rows, splice_max_blocks=2, splice_restage_period_ms=0.0
+    )
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3, 4, 5])
+
+    controller.maybe_tick()
+    assert controller.observer.counters.splice_deficit_blocks == 3
+
+    force_tick(controller)
+    force_tick(controller)
+    assert controller.observer.counters.splice_deficit_blocks == 0
+
+
+def test_restaging_re_sorts_the_whole_region():
+    """`appendleft_n` puts each tick's batch in front of the previous one, so
+    without re-staging the head is a stack of batches — newest first, each
+    internally sorted, globally unsorted. At two blocks deep that is
+    invisible; at thousands it inverts the policy."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.01, time_to_next_call_ms=600_000.0),
+            SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=1_000.0),
+        }
+    )
+    controller = make_controller(pool, rows, splice_restage_period_ms=0.0)
+
+    # research is the worse key and is staged first.
+    index_prefix(controller, pool, RESEARCH, [1, 2])
+    controller.maybe_tick()
+    # supervisor is better, and lands in front of it.
+    index_prefix(controller, pool, SUPERVISOR, [4, 5])
+    controller.snapshot_source.set_rows(rows)
+    force_tick(controller)
+    assert set(pool.queue_ids()[:2]) == {4, 5}, "the inversion this fixes"
+
+    # Now allow a re-stage: one pass re-sorts both batches together.
+    controller.config.splice_restage_period_ms = 1.0
+    controller._last_restage_monotonic = 0.0
+    controller.snapshot_source.set_rows(rows)
+    force_tick(controller)
+
+    assert set(pool.queue_ids()[:2]) == {1, 2}, (
+        "the worse key must be first out once the region is re-sorted"
+    )
+    assert controller.observer.counters.splice_restages_total >= 1
+
+
+def test_restaging_can_be_switched_off():
+    """0 restores the batch-stack behaviour, so the two can be A/B'd."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=600_000.0)})
+    controller = make_controller(pool, rows, splice_restage_period_ms=0.0)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+
+    controller.maybe_tick()
+    spliced = controller.observer.counters.blocks_spliced_total
+    for _ in range(5):
+        force_tick(controller)
+
+    assert controller.observer.counters.blocks_spliced_total == spliced
+    assert controller.observer.counters.splice_restages_total == 0
 
 
 def test_a_newly_worse_key_still_reaches_the_head():

@@ -172,9 +172,7 @@ Sized near the ~9 evictions/tick actually observed rather than 28× above it.
   0.75 / 0.875 / 1.0 where the current formula gives 1.0 / 1.0 / 1.0 / 0.01.
   Class E says the payoff is large: 0.3% come-back against 24–55%.
 - **`score_threshold` is still `None`** (unconditional worst-K, 08 §6).
-- **Prefetch never executed.** `speculative blocks=0` for the whole run, and
-  51 log lines of `want for langgraph:supervisor has no registered prefixes
-  yet -- nothing to warm`. Half the design is untested.
+- ~~**Prefetch never executed.**~~ Diagnosed and fixed — see §5.
 - **The measurement regime is wrong for the question.** `--max-num-seqs 1`
   meant `max running: 1` throughout, and LMCache absorbed ~50% of traffic at
   `delta_l1=180ms`, so an HBM miss is cheap and end-to-end latency was a wash
@@ -182,3 +180,147 @@ Sized near the ~9 evictions/tick actually observed rather than 28× above it.
 - **`GPU KV cache usage` reads ~4%** while `index_blocks` is 9,520/9,558.
   vLLM's usage counts referenced blocks only; the prefix cache was full the
   whole time. Do not read low usage as "no eviction pressure".
+
+---
+
+## 5. Why prefetch never executed (2026-08-08 run)
+
+Three independent reasons, all of which had to be false at once for a single
+phantom to fire. From the 2026-08-08 log: `wants created=96 drained=96`,
+`speculative keys=0 blocks=0`, 96 lines of `no registered prefixes yet`.
+
+### 5.1 The registry was never written — the structural blocker
+
+`AgentPrefixRegistry` was only written by `POST /v1/agents/chat/completions`
+and `POST /v1/agents/prefetch`. The workload posted 228 requests to plain
+`/v1/chat/completions` and zero to `/v1/agents/*`, so every want resolved to
+zero descriptors and was dropped in `drain.py::_submit_want`.
+
+The identity the policy keys on already rides in `vllm_xargs` on plain chat
+requests — that is how engine core learns it. So the plain path always
+carried what was needed and simply never recorded it.
+`agent_prefetch/auto_register.py` now records the chunk-aligned prefix from
+`OpenAIServingChat.create_chat_completion` whenever the request carries
+`langgraph_node` and a registry exists. No client change.
+
+The recorded prefix is hit-compatible by construction: the phantom passes
+`cache_salt` in `kv_transfer_params` (an LMCache input), while vLLM's own APC
+block hashing keys off `request.cache_salt` (`kv_cache_utils.py:645`), which
+a phantom never sets. Same tokens ⇒ same block hashes ⇒ a later real request
+hits them. Recording under the request's own salt rather than a synthetic
+`agent::` one keeps that true on the LMCache side as well.
+
+### 5.2 The residency test was all-or-nothing
+
+`_rebuild_want_list` skipped any key with `index.get_entry(key) is not None`,
+and `index.py:133` only deletes an entry when its **last** block goes. A key
+whose prefix had been 99% evicted still read as resident. With `index_keys`
+at 8–11 across a 9-node graph this gated out nearly everything — 96 wants in
+74 minutes.
+
+Replaced with `NodeEvictionController._is_resident`, a coverage ratio
+`num_blocks / run_len` against `prefetch_min_coverage` (default 1.0: anything
+short of fully resident is wanted). `run_len` derives from `max_position`,
+which only grows, so partial eviction genuinely drives the ratio down.
+Setting the threshold to 0 restores the old test for an A/B.
+
+### 5.3 The prob and horizon gates split on a binary signal
+
+`prefetch_min_prob=0.5` and `prefetch_horizon_ms=60s` were sized for a graded
+forecast. Per §2 the forecast is 0.01 or 1.0 with ~4% between, and ttnc is
+60s or 3600s — so both gates were selecting one arm of a broken binary rather
+than ranking. Both now default off (0.0 = disabled) and stay as knobs for
+when `reach_probabilities()` is fixed (§4). `prefetch_ignore_staleness`
+defaults true, asymmetrically with the eviction half: a stale row there
+destroys a block, here it costs at worst one redundant prefill.
+
+### 5.4 Bounds re-sized for the new volume
+
+`prefetch_max_outstanding` 8 → 64 and `prefetch_max_per_drain` 4 → 32 (both
+were sized behind the gates), `prefetch_resubmit_backoff_ms` 60s → 10s, and a
+new `prefetch_top_k_per_want` (default 1) caps the front-end fan-out — the
+drainer previously used `get_all()`, every prefix ever recorded for the
+agent, which was safe only while want volume was near zero. Registry growth
+is now capped at 32 descriptors per agent, since ordinary chat traffic writes
+one per turn.
+
+### 5.5 The speculative floor no longer decays
+
+The floor started at `speculative_floor_high` and decayed to
+`speculative_floor_low = -1.0` over the prediction's own deadline, so a
+falsified prediction became the *preferred* victim rather than merely losing
+protection. Sound in principle; unusable against this forecast.
+
+The deadline was `time_to_next_call_ms`, which is 60s or 3600s and nothing
+between (§2). So the decay never tracked a horizon — it read one bit of the
+broken forecast. On the 60s arm it was a countdown that put a prefetched
+prefix *below every real score* at approximately the moment its predicted
+call was due: the policy paid a prefill, protected the result for 60s, then
+made it first-out just before the payoff. On the 3600s arm it protected for
+an hour.
+
+`scoring.speculative_floor(config)` is now a constant, and takes no clock —
+asserted on the signature so the decay cannot be reintroduced silently.
+`speculative_floor_low`, `speculative_default_ttl_ms` and
+`speculative_hard_drop_ttl_multiple` are deleted. `BlockOwnershipIndex.gc`
+lost its second clock with them: it ran on the same
+`time_to_next_call_ms` TTL, so keeping it would have been the same expiry
+under another name, deleting an entry the scorer was still holding at the
+floor. Speculative and confirmed entries now age out together on
+`index_hard_drop_age_ms`.
+
+**What this trades away.** Nothing demotes a wrong prediction any more. An
+unconfirmed entry holds the floor until the index GC drops it at 30 minutes,
+and while it holds the floor the splice picks *real* blocks in preference to
+it. Confirmation (`on_prefix_hit`) is the only release. It stays a soft pin —
+a permanently high score only means "never volunteered by the splice"; the
+block keeps its LRU position and ordinary `popleft` can still take it, so
+this cannot strand a block the way a `ref_cnt` pin with a lost release would.
+If the forecast is wrong often, the cost now shows up as real blocks evicted
+to protect useless ones, and `waste=` is where it will be visible.
+
+### 5.6 The staged region was two blocks deep
+
+The splice never blocks an eviction — `get_new_blocks` stays an unmodified
+`popleft_n`. It reorders the queue that is popped from, so **the policy
+governs exactly the prefix of the free queue it has managed to stage**, and
+everything past that is evicted in raw LRU order with the scores having no
+say at all.
+
+`splice_max_blocks=32` (§3.4) against ~30 evictions per tick — measured over
+one 30s window of the 2026-08-08 log: 23 ticks, 734 blocks staged, 702
+evictions — left a margin of two blocks. A request needing up to
+`max_model_len / block_size` = 7,500 blocks pops through that in one
+allocation and takes the remainder by age. Every conclusion drawn about the
+scoring function was therefore drawn from a policy that was in charge of a
+rounding error's worth of the queue.
+
+`splice_max_blocks` is now a **catch-up rate limit rather than a fixed K**,
+defaulted to 4096. This is safe now and was not before: the 2,054,400
+relocations at K=256 came from the *absence* of the already-staged skip
+(§3.2), which made every tick re-move the same blocks 43 times each. With the
+skip, the candidate set holds only blocks that are free, scored and not yet
+staged, so steady-state work is bounded by the newly-freed count (~30/tick)
+and the cap binds only when there is a real deficit — which is exactly the
+burst it exists to absorb.
+
+Depth exposed a second-order bug worth naming: `appendleft_n` puts each
+tick's batch *in front of* the previous one, so the head is a stack of
+batches — newest first, each internally sorted, globally unsorted. At two
+deep that is invisible; at thousands it inverts the policy, because a block
+freed this tick lands ahead of a worthless one staged a minute ago. New
+`splice_restage_period_ms` (default 5s) clears the staging record so one pass
+re-sorts the whole region by current score, which also picks up forecast
+changes since a block was staged. 0 restores the batch-stack behaviour.
+
+Two new gauges on the `kv_hbm` line: **`staged`** — how deep the policy's
+authority reaches into the free queue — and **`deficit`** — blocks it wanted
+to rank and the cap could not take. A sustained non-zero `deficit` means
+window 1 is still open.
+
+**Untested at the time of writing.** The next run is the first that can
+produce a non-zero `speculative blocks`, and the number to watch is `waste=`
+on the prefetch line: with `--max-num-seqs 1` a phantom that misses in
+LMCache is a full prefill serialized ahead of real traffic. Read it against
+`staged`/`deficit` — a good forecast that governs 2 blocks of queue and a bad
+forecast that governs 9,000 look identical in `hit_rate` alone.

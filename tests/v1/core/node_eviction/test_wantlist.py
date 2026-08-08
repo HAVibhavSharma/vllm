@@ -200,6 +200,7 @@ def test_an_arriving_prefix_retires_an_outstanding_want():
 
 
 def test_an_unlikely_call_is_not_worth_a_prefill():
+    """The gate still works — it is just switched off by default now."""
     rows = fresh_rows({RESEARCH: dict(prob=0.1, time_to_next_call_ms=1_000.0)})
     controller = wants_controller(FakePool(), rows, prefetch_min_prob=0.5)
     controller.maybe_tick()
@@ -208,19 +209,88 @@ def test_an_unlikely_call_is_not_worth_a_prefill():
 
 def test_a_distant_call_is_real_but_not_imminent():
     """Warming a node predicted ten minutes out just evicts something needed
-    sooner. The diagram gates admission on the need being *imminent*."""
+    sooner. The diagram gates admission on the need being *imminent*.
+
+    Also opt-in now: `time_to_next_call_ms` is 60s or 3600s and nothing
+    between (12 §2), so as a default the gate splits on the forecast's broken
+    binary rather than on imminence."""
     rows = fresh_rows({RESEARCH: dict(prob=0.99, time_to_next_call_ms=600_000.0)})
     controller = wants_controller(FakePool(), rows, prefetch_horizon_ms=60_000.0)
     controller.maybe_tick()
     assert controller.drain_prefetch_wants(4) == []
 
 
-def test_a_stale_forecast_buys_no_prefill():
-    """The eviction half degrades to LRU on staleness; this half degrades to
-    doing nothing. Same conservative direction, and a missed pub/sub message
-    must never cause work."""
+def test_neither_gate_fires_by_default():
+    """The reason the first real run produced 96 wants in 74 minutes. With a
+    forecast that is 0.01 or 1.0 and nothing in between, a `prob >= 0.5` gate
+    is not selecting likely rows — it is selecting one arm of a binary
+    signal, and the other arm is where the come-back rate is highest."""
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.01, time_to_next_call_ms=3_600_000.0)}
+    )
+    controller = wants_controller(FakePool(), rows)
+    controller.maybe_tick()
+    assert len(controller.drain_prefetch_wants(4)) == 1
+
+
+def test_a_stale_forecast_buys_no_prefill_when_asked():
+    """The eviction half degrades to LRU on staleness; this half can be told
+    to degrade to doing nothing. Same conservative direction."""
+    rows = {RESEARCH: ImportanceRow(prob=0.99, time_to_next_call_ms=1_000.0)}
+    controller = wants_controller(
+        FakePool(), rows, prefetch_ignore_staleness=False
+    )
+    controller.maybe_tick()
+    assert controller.drain_prefetch_wants(4) == []
+
+
+def test_a_stale_forecast_still_warms_by_default():
+    """Asymmetric with the eviction half on purpose: a stale row there
+    destroys a block, here it costs at worst one redundant prefill of a
+    prefix this process has already served. A quiet forecast must not
+    silently switch prefetching off."""
     rows = {RESEARCH: ImportanceRow(prob=0.99, time_to_next_call_ms=1_000.0)}
     controller = wants_controller(FakePool(), rows)
+    controller.maybe_tick()
+    assert len(controller.drain_prefetch_wants(4)) == 1
+
+
+# -- residency -----------------------------------------------------------
+
+
+def test_a_mostly_evicted_prefix_is_wanted_again():
+    """The bug that made origination structurally dead. `remove_block` only
+    deletes an index entry when its *last* block goes, so `get_entry(key) is
+    not None` reported a key holding 1 of 4 blocks as resident and never
+    re-warmed it. A prefix is worth something only as a run from position 0,
+    so 1-of-4 is absent for hit-rate purposes."""
+    pool = FakePool()
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=1_000.0)})
+    controller = wants_controller(pool, rows)
+    controller.on_blocks_cached(make_request(), pool.blocks[:4], 0)
+
+    controller.maybe_tick()
+    assert controller.drain_prefetch_wants(4) == [], "fully resident"
+
+    # Evict all but the first block: run_len stays 4, num_blocks drops to 1.
+    for block in pool.blocks[1:4]:
+        controller.index.remove_block(block.block_id)
+    controller.snapshot_source.set_rows(rows)
+    controller.maybe_tick()
+
+    assert len(controller.drain_prefetch_wants(4)) == 1
+
+
+def test_partial_residency_counts_as_resident_when_coverage_is_off():
+    """`prefetch_min_coverage=0` restores the original all-or-nothing test,
+    so the two can be A/B'd without a code change."""
+    pool = FakePool()
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=1_000.0)})
+    controller = wants_controller(pool, rows, prefetch_min_coverage=0.0)
+    controller.on_blocks_cached(make_request(), pool.blocks[:4], 0)
+    for block in pool.blocks[1:4]:
+        controller.index.remove_block(block.block_id)
+
     controller.maybe_tick()
     assert controller.drain_prefetch_wants(4) == []
 

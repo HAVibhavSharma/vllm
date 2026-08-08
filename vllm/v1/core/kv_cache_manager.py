@@ -246,7 +246,9 @@ class KVCacheManager:
             # make the summary line's hit rate depend on whether anything
             # else was scraping, and on `log_stats` being on at all.
             self.node_eviction.on_cache_query(
-                num_tokens=request.num_tokens, num_hits=num_new_computed_tokens
+                num_tokens=request.num_tokens,
+                num_hits=num_new_computed_tokens,
+                preempted=request.num_preemptions > 0,
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens

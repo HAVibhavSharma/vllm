@@ -158,46 +158,50 @@ def score_key(
     )
 
 
-def speculative_floor(
-    age_ms: float, ttl_ms: float, config: NodeEvictionConfig
-) -> float:
-    """The decaying soft pin on prefetched entries (02 §5 part 3).
+def speculative_floor(config: NodeEvictionConfig) -> float:
+    """The soft pin on prefetched entries (02 §5 part 3).
 
-    Starts above the top of the normal score range and decays to *below* it
-    over the prediction's own deadline, so:
+    Constant, and it does not expire. It sits above the top of the normal
+    score range, so a prefetched prefix is never selected by the splice until
+    a real prefix hit confirms it and the floor stops applying.
 
-    - a correct prediction is protected until the block is used, and
-    - a falsified one becomes the preferred victim rather than merely losing
-      protection.
+    **This used to decay to `speculative_floor_low` over the prediction's own
+    deadline**, on the theory that a falsified prediction should become the
+    preferred victim rather than merely lose protection. Removed: the
+    deadline came from `time_to_next_call_ms`, which is 60s or 3600s and
+    nothing between (12 §2), so the decay was not tracking the prediction's
+    horizon — it was reading one bit of a broken forecast and, on the 60s
+    arm, turning the protection into a countdown to *first-out* status. A
+    prefetch whose call landed at 61s paid a prefill and then bought itself
+    the worst possible eviction rank.
 
-    A hard `ref_cnt` pin was rejected: it needs a leak-proof release path, and
-    one lost release strands a block for the process lifetime. A hard pin
-    turns a scoring bug into a leaked-block bug.
+    The consequence to be aware of: nothing now demotes a wrong prediction.
+    An unconfirmed entry keeps the floor until the index GC drops it at
+    `index_hard_drop_age_ms`, and while it holds the floor the splice will
+    choose *real* blocks over it. Confirmation (`on_prefix_hit`) is the only
+    release, so the waste ratio is the number that matters.
+
+    Still a soft pin, not a `ref_cnt` pin: a permanently high score only
+    means "never volunteered for eviction". The block stays in the free queue
+    at its LRU position and ordinary `popleft` can still take it, so this
+    cannot strand a block for the process lifetime the way a hard pin with a
+    lost release would.
     """
-    if ttl_ms <= 0.0:
-        ttl_ms = config.speculative_default_ttl_ms
-    if ttl_ms <= 0.0:
-        return config.speculative_floor_low
-    frac = min(max(age_ms / ttl_ms, 0.0), 1.0)
-    high = config.speculative_floor_high
-    low = config.speculative_floor_low
-    return high + (low - high) * frac
+    return config.speculative_floor_high
 
 
 def apply_speculative_floor(
     base: ScoreBreakdown,
-    age_ms: float,
-    ttl_ms: float,
     config: NodeEvictionConfig,
 ) -> ScoreBreakdown:
-    """`score = max(base, floor(age))`, for speculative entries only.
+    """`score = max(base, floor)`, for speculative entries only.
 
     `max`, not `+`: the floor only ever protects and never inflates, so a
     prefetch cannot contaminate the ranking it was supposed to serve. Once
     the entry is confirmed the floor is gone and the block is scored
     honestly.
     """
-    floor = speculative_floor(age_ms, ttl_ms, config)
+    floor = speculative_floor(config)
     return ScoreBreakdown(
         score=max(base.score, floor),
         prob=base.prob,

@@ -99,15 +99,22 @@ def get_or_init_agent_prefetch_state(
         state, _SUBMITTER_ATTR, None
     )
     if registry is None:
+        # `max_per_agent` was unlimited while the only writers were the two
+        # explicit /v1/agents/* endpoints. Ordinary chat traffic now records
+        # here too (`agent_prefetch/auto_register.py`), which is one
+        # descriptor per turn per node and unbounded over a long run. The
+        # inner map is LRU, so a cap keeps the newest prefixes — which are
+        # the ones a repeat call can actually match — and drops prompts from
+        # jobs that ended.
         registry = AgentPrefixRegistry(
             default_top_k=20,
             max_agents=10_000,
-            max_per_agent=None,  # no per-agent cap
+            max_per_agent=32,
         )
         setattr(state, _REGISTRY_ATTR, registry)
         logger.info(
             "agent_prefetch: initialized registry "
-            "(default_top_k=20, max_agents=10000, max_per_agent=unlimited)"
+            "(default_top_k=20, max_agents=10000, max_per_agent=32)"
         )
     if submitter is None:
         submitter = PhantomPrefetchSubmitter(

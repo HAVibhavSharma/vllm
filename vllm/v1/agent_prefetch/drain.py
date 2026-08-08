@@ -58,6 +58,9 @@ class PrefetchWantDrainer:
         # same default the /v1/agents/prefetch endpoint uses.
         self._top_k_per_want = top_k_per_want
         self._task: asyncio.Task | None = None
+        # Agents already reported as having nothing registered, so the line
+        # stays a diagnosis rather than a per-drain refrain.
+        self._logged_unknown_agents: set[str] = set()
         self._stats = {
             "polls": 0,
             "wants_received": 0,
@@ -152,13 +155,18 @@ class PrefetchWantDrainer:
             # and on any node whose preamble has not been recorded yet.
             self._stats["wants_unknown_agent"] += 1
             # Also INFO: this is the single most likely reason origination
-            # looks switched on and does nothing, and it is bounded by the
-            # want backoff. Expected on a job's first turn through a node.
-            logger.info(
-                "agent_prefetch: want for %s has no registered prefixes yet "
-                "-- nothing to warm",
-                agent_id,
-            )
+            # looks switched on and does nothing. Once per agent, not once
+            # per want — it used to be bounded by a 60s resubmit backoff and
+            # a probability gate, and with those relaxed the same line would
+            # repeat every drain interval for the whole run.
+            if agent_id not in self._logged_unknown_agents:
+                self._logged_unknown_agents.add(agent_id)
+                logger.info(
+                    "agent_prefetch: want for %s has no registered prefixes "
+                    "yet -- nothing to warm. Further wants for this agent "
+                    "are counted in wants_unknown_agent, not logged.",
+                    agent_id,
+                )
             return 0
 
         # Carried into the phantom's extra_args so the blocks it caches are
@@ -217,15 +225,22 @@ def maybe_start_prefetch_drainer(app) -> PrefetchWantDrainer | None:
     from vllm.entrypoints.openai.agent_chat.api_router import (
         get_or_init_agent_prefetch_state,
     )
+    from vllm.v1.core.node_eviction.config import NodeEvictionConfig
 
     registry, submitter = get_or_init_agent_prefetch_state(
         state, chat_handler.engine_client
     )
+    # Same config object engine core builds, from the same env var and JSON
+    # file, so the two halves cannot disagree about the fan-out bound.
+    cfg = NodeEvictionConfig.from_env()
+    top_k = cfg.prefetch_top_k_per_want
     drainer = PrefetchWantDrainer(
         chat_handler.engine_client,
         registry,
         submitter,
         interval_s=envs.VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S,
+        max_per_drain=cfg.prefetch_max_per_drain,
+        top_k_per_want=top_k if top_k > 0 else None,
     )
     drainer.start()
     state.prefetch_want_drainer = drainer

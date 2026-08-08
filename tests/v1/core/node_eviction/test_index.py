@@ -111,24 +111,21 @@ def test_gc_drops_silent_keys():
     assert index.owners_of(1) == set()
 
 
-def test_gc_drops_falsified_speculative_keys_at_ttl_multiple():
+def test_speculative_keys_age_out_on_the_same_clock_as_everything_else():
+    """Speculative entries used to drop on a second clock — `TTL x multiple`
+    past creation. That TTL was `time_to_next_call_ms`, the same clock the
+    floor decay ran on, and it went with the decay: keeping it would be the
+    same expiry under another name, deleting an entry the scorer is still
+    holding at the floor.
+    """
     index = BlockOwnershipIndex()
     index.add_blocks(RESEARCH, [(1, 0)], now=0.0, speculative=True)
 
-    # TTL of 10s, multiple of 4 -> dropped at 40s even though the hard age
-    # drop is far away.
-    assert index.gc(
-        now=30.0,
-        hard_drop_age=10_000.0,
-        speculative_ttls={RESEARCH: 10.0},
-        speculative_ttl_multiple=4.0,
-    ) == 0
-    assert index.gc(
-        now=41.0,
-        hard_drop_age=10_000.0,
-        speculative_ttls={RESEARCH: 10.0},
-        speculative_ttl_multiple=4.0,
-    ) == 1
+    # Far past any old TTL multiple, and still held.
+    assert index.gc(now=10_000.0, hard_drop_age=100_000.0) == 0
+    assert index.get_entry(RESEARCH) is not None
+
+    assert index.gc(now=100_001.0, hard_drop_age=100_000.0) == 1
     assert index.get_entry(RESEARCH) is None
 
 

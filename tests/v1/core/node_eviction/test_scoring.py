@@ -185,42 +185,56 @@ def test_row_without_a_timestamp_is_stale():
 # -- the speculative floor (02 §5) --------------------------------------
 
 
-def test_floor_starts_above_the_score_range_and_decays_below_it():
-    at_start = speculative_floor(0.0, 10_000.0, CONFIG)
-    at_ttl = speculative_floor(10_000.0, 10_000.0, CONFIG)
-    assert at_start > CONFIG.delta_cold_ms
-    # Decays past neutral, so a falsified prediction becomes the *preferred*
-    # victim rather than merely losing protection.
-    assert at_ttl < 0.0
-    assert at_ttl == pytest.approx(CONFIG.speculative_floor_low)
+def test_floor_sits_above_the_whole_score_range():
+    assert speculative_floor(CONFIG) > CONFIG.delta_cold_ms
+    assert speculative_floor(CONFIG) == pytest.approx(
+        CONFIG.speculative_floor_high
+    )
 
 
-def test_floor_decays_monotonically():
-    previous = float("inf")
-    for age in range(0, 11_000, 1_000):
-        current = speculative_floor(float(age), 10_000.0, CONFIG)
-        assert current < previous
-        previous = current
+def test_the_floor_takes_no_clock():
+    """The decay is gone. It ran on `time_to_next_call_ms`, which is 60s or
+    3600s and nothing between (12 §2), so it was not tracking the
+    prediction's horizon — on the 60s arm it was a countdown that turned the
+    protection into first-out status at the exact moment the predicted call
+    was due.
+
+    Asserted on the signature because that is what makes it unexpirable:
+    there is no age or TTL to pass, so no caller can reintroduce the decay
+    without changing this test.
+    """
+    import inspect
+
+    assert list(
+        inspect.signature(speculative_floor).parameters
+    ) == ["config"]
+    assert list(
+        inspect.signature(apply_speculative_floor).parameters
+    ) == ["base", "config"]
 
 
 def test_floor_only_ever_protects():
     """`max`, not `+`: the floor never inflates a score, so a prefetch cannot
     contaminate the ranking it was supposed to serve."""
     base = score_key(row(), 100, CONFIG)
-    # Well past TTL, so the floor is at its low value and loses to the base.
-    floored = apply_speculative_floor(base, 100_000.0, 10_000.0, CONFIG)
-    assert floored.score == base.score
-    assert floored.speculative
-
-    # Fresh prefetch: the floor dominates.
-    protected = apply_speculative_floor(base, 0.0, 10_000.0, CONFIG)
+    protected = apply_speculative_floor(base, CONFIG)
     assert protected.score > base.score
-
-
-def test_floor_falls_back_to_the_default_ttl():
-    assert speculative_floor(0.0, 0.0, CONFIG) == pytest.approx(
+    assert protected.speculative
+    assert protected.floor_applied == pytest.approx(
         CONFIG.speculative_floor_high
     )
+
+
+def test_a_base_above_the_floor_wins():
+    """The `max` has to be a real max, not an unconditional overwrite —
+    otherwise a confirmed-then-re-prefetched key would be *demoted* to the
+    floor."""
+    from dataclasses import replace
+
+    config = replace(CONFIG, speculative_floor_high=1e-9)
+    base = score_key(row(), 1, config)
+    assert base.score > config.speculative_floor_high
+    assert apply_speculative_floor(base, config).score == base.score
 
 
 # -- the value table -----------------------------------------------------

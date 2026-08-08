@@ -54,6 +54,13 @@ class EvictionCounters:
     ticks_skipped_unchanged: int = 0
     splices_total: int = 0
     blocks_spliced_total: int = 0
+    splice_restages_total: int = 0
+    # Gauges, not totals: the state of the staged region at the last splice.
+    # `splice_deficit_blocks` is the window-1 gauge — blocks the policy
+    # wanted to rank and the per-tick cap could not take, which are therefore
+    # left to be evicted by raw LRU age.
+    splice_deficit_blocks: int = 0
+    splice_staged_blocks: int = 0
 
     evictions_total: int = 0
     evictions_by_score_total: int = 0
@@ -100,6 +107,9 @@ class EvictionCounters:
             "ticks_skipped_unchanged": self.ticks_skipped_unchanged,
             "splices_total": self.splices_total,
             "blocks_spliced_total": self.blocks_spliced_total,
+            "splice_restages_total": self.splice_restages_total,
+            "splice_deficit_blocks": self.splice_deficit_blocks,
+            "splice_staged_blocks": self.splice_staged_blocks,
             "evictions_total": self.evictions_total,
             "evictions_by_score_total": self.evictions_by_score_total,
             "unscored_evictions_total": self.unscored_evictions_total,
@@ -240,17 +250,29 @@ class CacheMovementTracker:
         self.blocks_cached = 0
         self.hit_tokens = 0
         self.query_tokens = 0
+        # First-scheduling queries only, excluding preempted re-queries. This
+        # is the subset vLLM's own "Prefix cache hit rate" counts, so it is
+        # what reconciles this line against the engine's log. Without it the
+        # two numbers disagree by a factor that grows with preemption rate
+        # and nobody can tell which is broken.
+        self.hit_tokens_fresh = 0
+        self.query_tokens_fresh = 0
         # Reset when a summary line is emitted, so the line can show the
         # rate *now* next to the rate since boot. A cumulative hit rate over
         # a long run is dominated by whatever the workload did first.
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
 
-    def on_cache_query(self, num_tokens: int, num_hits: int) -> None:
+    def on_cache_query(
+        self, num_tokens: int, num_hits: int, preempted: bool = False
+    ) -> None:
         self.query_tokens += num_tokens
         self.hit_tokens += num_hits
         self.window_query_tokens += num_tokens
         self.window_hit_tokens += num_hits
+        if not preempted:
+            self.query_tokens_fresh += num_tokens
+            self.hit_tokens_fresh += num_hits
 
     def on_block_cached(self, block_hash) -> None:
         self.blocks_cached += 1
@@ -293,6 +315,24 @@ class CacheMovementTracker:
         return self.hit_tokens / self.query_tokens
 
     @property
+    def hit_rate_fresh(self) -> float:
+        """Comparable to vLLM's `Prefix cache hit rate` log line.
+
+        A preempted request re-queries with a `num_tokens` that has grown to
+        include what it already generated, so counting those re-queries
+        inflates the denominator with work no cache was ever going to serve.
+        `PrefixCacheStats` routes them to its `preempted_*` fields and
+        `CachingMetrics.observe` ignores those entirely; this mirrors that.
+
+        Still not identical: vLLM's figure is a sliding window over the most
+        recent 1000 requests, this one is cumulative since boot. Expect the
+        same ballpark, not the same digits.
+        """
+        if self.query_tokens_fresh == 0:
+            return 0.0
+        return self.hit_tokens_fresh / self.query_tokens_fresh
+
+    @property
     def window_hit_rate(self) -> float:
         if self.window_query_tokens == 0:
             return 0.0
@@ -323,8 +363,11 @@ class CacheMovementTracker:
         return {
             "hit_rate": self.hit_rate,
             "hit_rate_window": self.window_hit_rate,
+            "hit_rate_fresh": self.hit_rate_fresh,
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
+            "hit_tokens_fresh": self.hit_tokens_fresh,
+            "query_tokens_fresh": self.query_tokens_fresh,
             "remat_blocks": self.remat_blocks,
             "remat_mb": self.remat_mb,
             "remat_ratio": self.remat_ratio,

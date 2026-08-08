@@ -56,22 +56,15 @@ class NodeEvictionConfig:
 
     # --- Speculative floor (02 §5) ----------------------------------------
     speculative_floor_high: float = 1e9
-    """Starting height of the decaying floor on prefetched (speculative)
-    entries. Must sit above the top of the normal score range so a freshly
-    prefetched prefix is protected against everything."""
+    """Height of the floor on prefetched (speculative) entries. Must sit
+    above the top of the normal score range so a prefetched prefix is
+    protected against everything.
 
-    speculative_floor_low: float = -1.0
-    """Where the floor lands after TTL. Below every real score, so a
-    falsified prediction becomes the *preferred* victim rather than merely
-    losing its protection."""
-
-    speculative_default_ttl_ms: float = 30_000.0
-    """TTL used when the forecast carries no `time_to_next_call` for the
-    predicted node."""
-
-    speculative_hard_drop_ttl_multiple: float = 4.0
-    """Speculative entries are dropped from the index entirely at
-    TTL x this, which bounds index growth on the speculative side."""
+    Constant and non-expiring. `speculative_floor_low`,
+    `speculative_default_ttl_ms` and `speculative_hard_drop_ttl_multiple`
+    are gone with the decay — see `scoring.speculative_floor` for why. A
+    speculative entry now holds this score until a real prefix hit confirms
+    it, or until `index_hard_drop_age_ms` drops the entry."""
 
     # --- Prefetch origination (02 §4, step 6) -----------------------------
     prefetch_wants_enabled: bool = False
@@ -81,32 +74,91 @@ class NodeEvictionConfig:
     `VLLM_NODE_EVICTION_PREFETCH_DRAIN`, the same switch the front-end
     drainer reads, so the two halves cannot be turned on independently."""
 
-    prefetch_min_prob: float = 0.5
+    prefetch_min_prob: float = 0.0
     """Only forecast rows at least this likely become wants. The diagram's
     "admit/prefetch if the need for the cache is imminent" has two axes; this
-    is the *will it happen* one."""
+    is the *will it happen* one.
 
-    prefetch_horizon_ms: float = 60_000.0
+    **Defaults to 0.0 — off.** At 0.5 the gate admitted only the saturated
+    `prob=1.0` class (12 §2: ~58% of rows sit at the 0.01 floor and ~22% at
+    1.0, with almost nothing between), so it was not selecting likely rows,
+    it was selecting *one arm of a broken binary signal*. Until
+    `reach_probabilities()` produces gradation (12 §4) a probability gate
+    cannot rank anything, and gating on it only suppresses want volume. Set
+    it back above 0 once the forecast is fractional."""
+
+    prefetch_horizon_ms: float = 0.0
     """...and this is the *when* axis. A node predicted 10 minutes out is
     real but not imminent, and warming it now just evicts something that is
-    needed sooner."""
+    needed sooner.
 
-    prefetch_max_outstanding: int = 8
+    **0 disables the gate**, which is the default for the same reason as
+    `prefetch_min_prob`: `time_to_next_call_ms` is currently 60s or 3600s
+    and nothing else, so the gate is a proxy for the same binary split."""
+
+    prefetch_min_coverage: float = 1.0
+    """Fraction of a key's prefix run that must be resident for it to count
+    as "in HBM" and therefore *not* worth prefetching.
+
+    The original admission test was `index.get_entry(key) is not None`, and
+    `remove_block` only deletes an entry when its **last** block goes
+    (`index.py:133`). A key whose prefix had been 99% evicted therefore still
+    read as resident and was never wanted — with `index_keys` at 8–11 across
+    a 9-node graph this gated out nearly every want, which is why the first
+    run produced 96 wants in 74 minutes.
+
+    Coverage is `num_blocks / run_len`, and `run_len` is derived from
+    `max_position`, which only ever grows — so partial eviction genuinely
+    drives it down. At the default 1.0, anything short of fully resident is
+    wanted."""
+
+    prefetch_ignore_staleness: bool = True
+    """Offer wants for keys whose forecast row is older than
+    `staleness_cutoff_ms`.
+
+    The eviction half must degrade to LRU on a stale row because it is about
+    to *destroy* a block on that row's say-so. A want only warms a prefix the
+    registry has already seen this process serve, so a stale row costs at
+    worst one redundant prefill. Defaulting this on keeps a quiet forecast
+    from silently switching prefetching off."""
+
+    prefetch_max_outstanding: int = 64
     """Ceiling on wants pending + in flight. This is the actual bound on how
-    much prefill work speculation can create, so it is deliberately small."""
+    much prefill work speculation can create.
 
-    prefetch_max_per_drain: int = 4
-    """Ceiling on how many wants one front-end poll may take. Each want
-    fans out to *every* prefix the registry holds for its agent, so this is
-    not the phantom count."""
+    Raised from 8 with the gates removed: 8 was sized for a want-list that
+    also had a probability gate and a horizon gate in front of it, and it
+    becomes the binding constraint once those are off. Note this counts
+    *wants*, not phantoms — see `prefetch_top_k_per_want` for the fan-out."""
+
+    prefetch_max_per_drain: int = 32
+    """Ceiling on how many wants one front-end poll may take. Each want fans
+    out to up to `prefetch_top_k_per_want` prefixes, so this is not the
+    phantom count."""
+
+    prefetch_top_k_per_want: int = 1
+    """How many registered prefixes one want may warm, most-recent first.
+
+    Read by the front-end drainer, which previously used `get_all()` — every
+    prefix the registry ever recorded for the agent. That was safe only while
+    the gates kept want volume near zero; with them off it is the difference
+    between one phantom per want and one per recorded turn. 1 means "warm the
+    newest prefix for that node", which is the one a repeat call is most
+    likely to match. 0 or below restores the unbounded fan-out."""
 
     prefetch_want_ttl_ms: float = 30_000.0
     """A want nobody drained within this window is dropped as stale intent
     rather than acted on late."""
 
-    prefetch_resubmit_backoff_ms: float = 60_000.0
+    prefetch_resubmit_backoff_ms: float = 10_000.0
     """How long a drained want blocks a re-offer for the same key. Bounds
-    the retry rate when a phantom is dropped or its prefix never lands."""
+    the retry rate when a phantom is dropped or its prefix never lands.
+
+    Lowered from 60s: this is the one dedup that must stay — without it the
+    250ms tick re-offers a key the 1s drain is still working on — but at 60s
+    a key evicted right after its phantom landed could not be re-warmed for a
+    full minute, which is long relative to how fast the splice turns the pool
+    over."""
 
     prefetch_summary_period_ms: float = 30_000.0
     """How often the tick may log one INFO line of prefetch state. Rate
@@ -129,10 +181,47 @@ class NodeEvictionConfig:
     """Wall-clock cadence of the re-score. Step count is not used because
     step duration varies too much."""
 
-    splice_max_blocks: int = 256
-    """K: how many blocks may be moved to the head per tick. The policy
-    converges over several ticks; approximate order is fine for a
-    heuristic."""
+    splice_max_blocks: int = 4096
+    """Cap on blocks relocated per tick — a **catch-up rate limit**, not a
+    per-tick workload.
+
+    This used to be K, the fixed number moved every tick, and it was the
+    whole of window 1. The splice only reorders the free queue;
+    `get_new_blocks` stays a plain `popleft_n`. So the policy governs exactly
+    the prefix of the queue it has managed to order, and everything past that
+    is evicted in raw LRU order with the scores having no say. At K=32
+    against ~30 evictions per tick (measured), the ordered region was two
+    blocks deep, and a single request needing thousands of blocks — up to
+    `max_model_len / block_size`, 7,500 on the reference deployment — popped
+    through it instantly and took the rest by age.
+
+    The reason K was small is `splice_max_blocks=256` producing 2,054,400
+    relocations for 73,134 evictions (12 §2). But that was the tick fighting
+    itself: without the already-spliced skip (12 §3.2) every tick re-moved
+    the same blocks, 43 times each. With the skip, a block is relocated at
+    most once per re-stage, the candidate set is only the blocks that are
+    free, scored and *not yet staged*, and steady-state work is therefore
+    bounded by the number of newly-freed blocks (~30/tick), not by this cap.
+    The cap binds only when there is a genuine deficit — i.e. right after a
+    burst, which is exactly when catching up quickly is the point.
+
+    Watch `splice_deficit_blocks`: sustained non-zero means the ordered
+    region is not keeping up and window 1 is still open."""
+
+    splice_restage_period_ms: float = 5_000.0
+    """How often to re-rank the whole staged region from scratch.
+
+    Necessary once the region is deep. `appendleft_n` puts each tick's batch
+    *in front of* the previous one, so the head is a stack of batches —
+    newest first, each internally sorted, globally unsorted. At two blocks
+    deep that is invisible; at thousands it inverts the policy, because a
+    block freed this tick lands ahead of a genuinely worthless block staged a
+    minute ago. Clearing the staging record lets one pass re-sort everything
+    by current score, which also picks up forecast changes since a block was
+    staged.
+
+    Costs one full relink of the staged region per period. 0 disables
+    re-staging, which restores the batch-stack behaviour."""
 
     fresh_skip_threshold: int = 0
     """Skip the splice while more than this many *fresh* (unhashed) blocks sit
@@ -321,6 +410,8 @@ class NodeEvictionConfig:
             raise ValueError("tau_ms must be > 0")
         if self.splice_max_blocks < 0:
             raise ValueError("splice_max_blocks must be >= 0")
+        if self.splice_restage_period_ms < 0:
+            raise ValueError("splice_restage_period_ms must be >= 0")
         if self.tick_period_ms < 0:
             raise ValueError("tick_period_ms must be >= 0")
         if self.delta_cold_ms < self.delta_l1_ms:
@@ -335,14 +426,20 @@ class NodeEvictionConfig:
                 "speculative_floor_high must exceed delta_cold_ms so the "
                 "floor sits above the whole score range"
             )
-        if self.speculative_floor_low >= self.speculative_floor_high:
-            raise ValueError("speculative floor must decay downwards")
         if not 0.0 <= self.prefetch_min_prob <= 1.0:
             raise ValueError("prefetch_min_prob must be a probability in [0, 1]")
         if self.prefetch_max_outstanding < 0:
             raise ValueError("prefetch_max_outstanding must be >= 0")
         if self.prefetch_max_per_drain < 0:
             raise ValueError("prefetch_max_per_drain must be >= 0")
+        if not 0.0 <= self.prefetch_min_coverage <= 1.0:
+            # Above 1.0 no key could ever reach the threshold, so every key
+            # would be wanted forever including the ones already fully
+            # resident — a permanent phantom storm rather than a quiet
+            # misconfiguration.
+            raise ValueError(
+                "prefetch_min_coverage must be a fraction in [0, 1]"
+            )
         if self.hbm_summary_top_keys < 0:
             raise ValueError("hbm_summary_top_keys must be >= 0")
         if self.remat_window_blocks < 0:

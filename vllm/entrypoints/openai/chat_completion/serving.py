@@ -76,6 +76,7 @@ from vllm.tool_parsers.streaming import (
 )
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
+from vllm.v1.agent_prefetch.auto_register import maybe_record_chat_prefix
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -274,6 +275,21 @@ class OpenAIServingChat(OpenAIServing):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
+
+            # Record this prefix for node-aware prefetch origination. No-op
+            # unless the drainer created a registry at startup and the
+            # request carries `langgraph_node` in `vllm_xargs` — the same
+            # identity engine core keys the eviction policy on. Without it
+            # the want-list drains to zero phantoms forever, because the
+            # registry is otherwise only written by /v1/agents/*.
+            if raw_request is not None:
+                maybe_record_chat_prefix(
+                    raw_request.app.state,
+                    extra_args=request.vllm_xargs,
+                    model_name=self.model_config.model,
+                    prompt_token_ids=prompt_token_ids,
+                    cache_salt=getattr(request, "cache_salt", None),
+                )
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.

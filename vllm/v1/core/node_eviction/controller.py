@@ -149,6 +149,7 @@ class NodeEvictionController:
         self._last_snapshot: ImportanceSnapshot = EMPTY_SNAPSHOT
         self._last_tick_monotonic = 0.0
         self._last_gc_monotonic = 0.0
+        self._last_restage_monotonic = 0.0
         self._evictions_since_tick = 0
 
         # Step 6. None when origination is off, which is the default: the
@@ -329,7 +330,9 @@ class NodeEvictionController:
             return None
         return blocks[block_id].block_hash
 
-    def on_cache_query(self, num_tokens: int, num_hits: int) -> None:
+    def on_cache_query(
+        self, num_tokens: int, num_hits: int, preempted: bool = False
+    ) -> None:
         """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
 
         Counted here rather than read off `PrefixCacheStats` because that
@@ -339,7 +342,7 @@ class NodeEvictionController:
         """
         if not self.enabled:
             return
-        self.movement.on_cache_query(num_tokens, num_hits)
+        self.movement.on_cache_query(num_tokens, num_hits, preempted)
 
     def on_reset_prefix_cache(self) -> None:
         if not self.enabled:
@@ -491,7 +494,7 @@ class NodeEvictionController:
             return
 
         self._rebuild_value_table(snapshot, now, now_ms)
-        self._splice()
+        self._splice(now)
 
     def _head_fresh_run(self, limit: int) -> int:
         """How many blocks at the head of the free queue are fresh, capped.
@@ -513,6 +516,37 @@ class NodeEvictionController:
             seen += 1
             block = block.next_free_block
         return seen
+
+    def _is_resident(self, key: NodeKey) -> bool:
+        """Is this key's prefix in HBM to the degree that warming it would
+        buy nothing?
+
+        Not `get_entry(key) is not None`. An entry survives on a single
+        surviving block (`index.py:133` only deletes it when `positions`
+        empties), so mere existence says "at least one block of this prefix
+        is left", which is not the question. A prefix is worth anything only
+        as a contiguous run from position 0, so a key holding 40 of its 900
+        blocks is, for hit-rate purposes, absent.
+
+        `run_len` comes from `max_position`, the highest position *ever*
+        recorded, which never decreases — so the ratio falls as blocks are
+        evicted rather than tracking the survivors.
+        """
+        entry = self.index.get_entry(key)
+        if entry is None:
+            return False
+        threshold = self.config.prefetch_min_coverage
+        if threshold <= 0.0:
+            # Any surviving block counts: the original behaviour, kept
+            # reachable for an A/B against it.
+            return True
+        run_len = entry.run_len
+        if run_len <= 0:
+            # Nothing was ever positioned, so there is no run to be a
+            # fraction of. Treat presence as residency rather than dividing
+            # by zero.
+            return True
+        return (entry.num_blocks / run_len) >= threshold
 
     def _rebuild_want_list(
         self, snapshot: ImportanceSnapshot, now: float, now_ms: float
@@ -544,7 +578,7 @@ class NodeEvictionController:
 
         cfg = self.config
         for key, row in snapshot.rows.items():
-            if self.index.get_entry(key) is not None:
+            if self._is_resident(key):
                 # Already resident. Retiring the want here rather than on the
                 # phantom's completion means it works no matter who put the
                 # prefix there — the phantom, a real request, or a co-owning
@@ -554,14 +588,24 @@ class NodeEvictionController:
                 continue
             if wants.is_tracked(key):
                 continue
-            if is_stale(row, now_ms, cfg.staleness_cutoff_ms):
+            if not cfg.prefetch_ignore_staleness and is_stale(
+                row, now_ms, cfg.staleness_cutoff_ms
+            ):
                 # A stale row must not buy prefill work. The eviction half
                 # degrades to LRU on staleness; this half degrades to doing
-                # nothing, which is the same conservative direction.
+                # nothing, which is the same conservative direction. Off by
+                # default — see `prefetch_ignore_staleness`.
                 continue
-            if row.prob < cfg.prefetch_min_prob:
+            # Both gates below are disabled by default (0.0 admits every row,
+            # since prob >= 0 and ttnc >= 0 always). They are kept as knobs
+            # rather than deleted so a fractional forecast can switch them
+            # back on without a code change.
+            if cfg.prefetch_min_prob > 0.0 and row.prob < cfg.prefetch_min_prob:
                 continue
-            if row.time_to_next_call_ms > cfg.prefetch_horizon_ms:
+            if (
+                cfg.prefetch_horizon_ms > 0.0
+                and row.time_to_next_call_ms > cfg.prefetch_horizon_ms
+            ):
                 continue
 
             # `num_blocks=1` makes this `prob * decay * E_miss`: expected ms
@@ -682,13 +726,21 @@ class NodeEvictionController:
             f"queue={pool.free_block_queue.num_free_blocks} "
             f"splices={c.splices_total} "
             f"spliced_blocks={c.blocks_spliced_total} "
+            # `staged` is how deep the policy's authority reaches into the
+            # free queue; `deficit` is what it wanted to rank and could not.
+            # Everything past `staged` is evicted by raw LRU age, so these
+            # two say whether the scores are governing evictions at all.
+            f"staged={c.splice_staged_blocks} "
+            f"deficit={c.splice_deficit_blocks} "
             f"evicted={c.evictions_total} "
             f"evicted_by_score={c.evictions_by_score_total} "
             f"regret={c.regret_rate:.3f} "
             f"hit_rate={m.hit_rate:.4f} "
+            f"hit_rate_fresh={m.hit_rate_fresh:.4f} "
             f"hit_rate_win={m.window_hit_rate:.4f} "
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
+            f"query_tokens_fresh={m.query_tokens_fresh} "
             f"remat_blocks={m.remat_blocks} "
             f"remat_mb={m.remat_mb:.1f} "
             f"remat_ratio={m.remat_ratio:.4f} "
@@ -767,17 +819,14 @@ class NodeEvictionController:
         if (now - self._last_gc_monotonic) * 1000.0 < self.config.index_gc_period_ms:
             return
         self._last_gc_monotonic = now
-        ttls = {
-            key: row.time_to_next_call_ms
-            for key, row in self._last_snapshot.rows.items()
-        }
+        # Speculative entries used to additionally drop at `TTL x multiple`.
+        # That was the same `time_to_next_call_ms` clock the floor decay ran
+        # on, so removing one and keeping the other would have left a
+        # prefetched prefix protected by the floor right up until the GC
+        # silently deleted its entry. Speculative and confirmed entries now
+        # age out on one clock: `index_hard_drop_age_ms`.
         self.index.gc(
-            now,
-            hard_drop_age=self.config.index_hard_drop_age_ms / 1000.0,
-            speculative_ttls={k: v / 1000.0 for k, v in ttls.items()},
-            speculative_ttl_multiple=(
-                self.config.speculative_hard_drop_ttl_multiple
-            ),
+            now, hard_drop_age=self.config.index_hard_drop_age_ms / 1000.0
         )
 
     def _rebuild_value_table(
@@ -799,34 +848,30 @@ class NodeEvictionController:
         for entry in self.index.entries():
             if not entry.speculative:
                 continue
-            row = snapshot.get(entry.key)
-            ttl_ms = (
-                row.time_to_next_call_ms
-                if row is not None
-                else self.config.speculative_default_ttl_ms
-            )
-            age_ms = (now - entry.created_at) * 1000.0
             base = table.get(entry.key)
             if base is None:
                 # No forecast for a predicted node: the floor alone drives
-                # it, which is what makes a falsified prediction the
-                # preferred victim once the floor has decayed past zero.
+                # it. The score here is irrelevant to the ranking — the floor
+                # is a `max` and always wins — so it is 0.0 rather than a
+                # sentinel, and the row exists only to carry `blocks` and the
+                # forecast terms into the decision log.
+                row = snapshot.get(entry.key)
                 base = ScoreBreakdown(
-                    score=self.config.speculative_floor_low,
+                    score=0.0,
                     prob=0.0,
-                    ttnc_ms=ttl_ms,
+                    ttnc_ms=(
+                        row.time_to_next_call_ms if row is not None else 0.0
+                    ),
                     decay=0.0,
                     e_miss_ms=0.0,
                     blocks=entry.num_blocks,
                 )
-            table[entry.key] = apply_speculative_floor(
-                base, age_ms, ttl_ms, self.config
-            )
+            table[entry.key] = apply_speculative_floor(base, self.config)
 
         self._value_table = table
 
-    def _splice(self) -> None:
-        """Move the worst-scoring K free blocks to the head of the queue.
+    def _splice(self, now: float) -> None:
+        """Stage the worst-scoring free blocks at the head of the queue.
 
         Candidates come from the **index**, not from `get_all_free_blocks()`.
         That scan is O(F) — roughly 24k iterations of interpreted pointer
@@ -834,10 +879,31 @@ class NodeEvictionController:
         magnitude, so K would bound only the relink and not the tick. The
         index already holds every scored block and `ref_cnt == 0` tests
         freeness in O(1) (01 §6.4).
+
+        The policy governs exactly the prefix of the free queue it has
+        staged; past that, `popleft_n` evicts by raw LRU age and the scores
+        have no say. So the goal is a staged region deep enough to cover a
+        burst, which is what `splice_max_blocks` now allows for and
+        `splice_deficit_blocks` measures.
         """
         k = self.config.splice_max_blocks
         if k <= 0 or not self._value_table:
             return
+
+        # Re-stage: drop the record so every staged block is a candidate
+        # again and one pass re-sorts the whole region by current score.
+        # Without it the head is a stack of per-tick batches, newest in
+        # front, and a block freed this tick outranks a worthless one staged
+        # a minute ago — an inversion that only becomes visible once the
+        # region is more than a batch deep.
+        period_ms = self.config.splice_restage_period_ms
+        if period_ms > 0 and (now - self._last_restage_monotonic) * 1000.0 >= (
+            period_ms
+        ):
+            self._last_restage_monotonic = now
+            self._spliced_scores.clear()
+            self._spliced_ranks.clear()
+            self.observer.counters.splice_restages_total += 1
 
         blocks = self.block_pool.blocks
         free_queue = self.block_pool.free_block_queue
@@ -897,6 +963,13 @@ class NodeEvictionController:
             scored_blocks[block_id] = best
 
         if not candidates:
+            # Nothing left to stage — the steady state once the region is
+            # deep enough. The gauges are still written, because a stale
+            # deficit reading from an earlier tick is worse than none.
+            self.observer.counters.splice_deficit_blocks = 0
+            self.observer.counters.splice_staged_blocks = len(
+                self._spliced_scores
+            )
             return
 
         worst = heapq.nsmallest(k, candidates)
@@ -918,6 +991,12 @@ class NodeEvictionController:
         counters = self.observer.counters
         counters.splices_total += 1
         counters.blocks_spliced_total += len(ordered)
+        # The window-1 gauge. Candidates the cap could not take this tick are
+        # blocks the policy wanted to rank and left in raw LRU order, so a
+        # sustained non-zero deficit means evictions are still being decided
+        # by age past the staged region.
+        counters.splice_deficit_blocks = len(candidates) - len(ordered)
+        counters.splice_staged_blocks = len(self._spliced_scores)
 
     # -- reporting ---------------------------------------------------------
 
