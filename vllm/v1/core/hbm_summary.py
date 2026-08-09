@@ -103,18 +103,40 @@ class HBMSummaryLogger:
         self._evicted_hashes: deque = deque()
         self._evicted_hash_set: set = set()
 
+        # Not reset by `reset_prefix_cache`, matching the policy branch, where
+        # the eviction counters live on `EvictionObserver` and survive it.
         self.evictions_total = 0
+
+        self._reset_totals()
+
+        self._last_log_monotonic = 0.0
+        self._last_fingerprint: tuple[int, ...] | None = None
+
+    def _reset_totals(self) -> None:
+        """Zero everything the prefix cache's contents can invalidate.
+
+        Shared by `__init__` and `on_reset_prefix_cache` so a counter added to
+        one cannot go missing from the other. Mirrors
+        `node_eviction/metrics.py::CacheMovementTracker._reset_totals` on the
+        policy branch — if the two diverge here, the first run after a reset
+        compares one branch's fresh numbers against the other's carried-over
+        ones, which looks exactly like a policy effect.
+        """
         self.blocks_cached_total = 0
         self.remat_blocks = 0
         self.hit_tokens = 0
         self.query_tokens = 0
+        # First-scheduling queries only. This is the subset vLLM's own
+        # "Prefix cache hit rate" counts, so it is what reconciles this line
+        # against the engine's log; without it the two disagree by a factor
+        # that grows with the preemption rate and nobody can tell which is
+        # broken.
+        self.hit_tokens_fresh = 0
+        self.query_tokens_fresh = 0
         # Reset when a line is emitted: a cumulative hit rate over a long run
         # is dominated by whatever the workload did first.
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
-
-        self._last_log_monotonic = 0.0
-        self._last_fingerprint: tuple[int, ...] | None = None
 
     def configure(self, block_size_bytes: int) -> None:
         """Told the KV page size after construction.
@@ -178,7 +200,9 @@ class HBMSummaryLogger:
         # *before* `reset_hash()`, so the hash is still there.
         self._note_evicted(self._hash_of(block_id))
 
-    def on_cache_query(self, num_tokens: int, num_hits: int) -> None:
+    def on_cache_query(
+        self, num_tokens: int, num_hits: int, preempted: bool = False
+    ) -> None:
         """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
 
         Counted here rather than read off `PrefixCacheStats` because that
@@ -190,6 +214,9 @@ class HBMSummaryLogger:
         self.hit_tokens += num_hits
         self.window_query_tokens += num_tokens
         self.window_hit_tokens += num_hits
+        if not preempted:
+            self.query_tokens_fresh += num_tokens
+            self.hit_tokens_fresh += num_hits
 
     def on_reset_prefix_cache(self) -> None:
         # Every hash in the pool was just invalidated, so every claim here is
@@ -200,6 +227,12 @@ class HBMSummaryLogger:
         # the same prefix is new work, not redone work.
         self._evicted_hashes.clear()
         self._evicted_hash_set.clear()
+        # And the rates go with it: those tokens described a cache that no
+        # longer exists. `reset_prefix_cache` is only ever invoked explicitly,
+        # which in practice means "start a clean measurement". Upstream agrees
+        # — `CachingMetrics.observe` resets its own aggregation on
+        # `stats.reset` (`v1/metrics/stats.py`).
+        self._reset_totals()
 
     # -- rematerialisation --------------------------------------------------
     #
@@ -251,6 +284,28 @@ class HBMSummaryLogger:
         return self.hit_tokens / self.query_tokens
 
     @property
+    def hit_rate_fresh(self) -> float:
+        """Demand-side hit rate: first scheduling of each request only.
+
+        A preempted request re-queries with a `num_tokens` grown to include
+        what it already generated, so counting those inflates the denominator
+        with work no cache was going to serve. `PrefixCacheStats` routes them
+        to `preempted_*` and `CachingMetrics.observe` ignores those; this
+        mirrors it.
+
+        **Deliberately no longer comparable to vLLM's `Prefix cache hit rate`
+        line.** That one counts every call to `get_computed_blocks`, and the
+        scheduler makes one per step for as long as a request sits in the
+        waiting queue, so its denominator is weighted by queueing delay. The
+        caller now counts each request once (`Request.cache_query_counted`);
+        upstream's counter is left alone so it stays comparable to stock
+        vLLM. The policy branch applies the identical guard.
+        """
+        if self.query_tokens_fresh == 0:
+            return 0.0
+        return self.hit_tokens_fresh / self.query_tokens_fresh
+
+    @property
     def window_hit_rate(self) -> float:
         if self.window_query_tokens == 0:
             return 0.0
@@ -286,13 +341,27 @@ class HBMSummaryLogger:
             f"queue={pool.free_block_queue.num_free_blocks} "
             f"splices=0 "
             f"spliced_blocks=0 "
+            # LRU stages nothing and can therefore never fall short of what it
+            # wanted to stage. Emitted as zeros rather than omitted so the
+            # field-by-field diff still lines up.
+            f"staged=0 "
+            f"deficit=0 "
             f"evicted={self.evictions_total} "
             f"evicted_by_score=0 "
             f"regret=0.000 "
             f"hit_rate={self.hit_rate:.4f} "
+            f"hit_rate_fresh={self.hit_rate_fresh:.4f} "
             f"hit_rate_win={self.window_hit_rate:.4f} "
             f"hit_tokens={self.hit_tokens} "
             f"query_tokens={self.query_tokens} "
+            f"query_tokens_fresh={self.query_tokens_fresh} "
+            # This branch originates no prefetch, so there is no phantom
+            # traffic to separate out. Emitted as zeros for the same reason as
+            # `staged`/`deficit`: on the policy branch these carry the prefill
+            # that origination bought, and a missing field there reads as a
+            # parse failure rather than an absence.
+            f"phantom_hit_rate=0.0000 "
+            f"phantom_query_tokens=0 "
             f"remat_blocks={self.remat_blocks} "
             f"remat_mb={self.remat_mb:.1f} "
             f"remat_ratio={self.remat_ratio:.4f} "
@@ -351,11 +420,19 @@ class HBMSummaryLogger:
             "free_queue_len": pool.free_block_queue.num_free_blocks,
             "splices_total": 0,
             "blocks_spliced_total": 0,
+            "splice_staged_blocks": 0,
+            "splice_deficit_blocks": 0,
             "evictions_total": self.evictions_total,
             "hit_rate": self.hit_rate,
             "hit_rate_window": self.window_hit_rate,
+            "hit_rate_fresh": self.hit_rate_fresh,
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
+            "hit_tokens_fresh": self.hit_tokens_fresh,
+            "query_tokens_fresh": self.query_tokens_fresh,
+            "phantom_hit_rate": 0.0,
+            "phantom_hit_tokens": 0,
+            "phantom_query_tokens": 0,
             "remat_blocks": self.remat_blocks,
             "remat_mb": self.remat_mb,
             "remat_ratio": self.remat_ratio,

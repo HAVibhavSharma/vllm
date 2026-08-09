@@ -2622,3 +2622,34 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
 
     assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
+
+
+def test_a_waiting_requery_is_counted_once():
+    """The scheduler calls `get_computed_blocks` on every step a request
+    spends in the waiting queue, guarded only by `num_computed_tokens == 0`.
+
+    Counting each call makes the hit rate weighted by queueing delay, which
+    eviction pressure itself sets. Must stay identical to the policy branch's
+    guard or the two arms weight their denominators differently and the
+    comparison is void. `prefix_cache_stats` deliberately keeps counting every
+    call, because it is upstream's and has to stay comparable to stock vLLM.
+    """
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 11),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        log_stats=True,
+    )
+    summary = manager.block_pool.hbm_summary
+    assert summary is not None, "the summary logger must be on for this test"
+
+    req = make_request("requeried", [7] * (3 * block_size), block_size, sha256)
+    for _ in range(5):
+        manager.get_computed_blocks(req)
+
+    assert summary.query_tokens == req.num_tokens
+    assert summary.query_tokens_fresh == req.num_tokens
+    # Upstream's counter is intentionally left alone.
+    assert manager.prefix_cache_stats.queries == 5 * req.num_tokens

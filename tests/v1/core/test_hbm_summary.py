@@ -24,13 +24,19 @@ EXPECTED_FIELDS = [
     "queue",
     "splices",
     "spliced_blocks",
+    "staged",
+    "deficit",
     "evicted",
     "evicted_by_score",
     "regret",
     "hit_rate",
+    "hit_rate_fresh",
     "hit_rate_win",
     "hit_tokens",
     "query_tokens",
+    "query_tokens_fresh",
+    "phantom_hit_rate",
+    "phantom_query_tokens",
     "remat_blocks",
     "remat_mb",
     "remat_ratio",
@@ -82,12 +88,35 @@ def test_line_has_the_same_fields_as_the_policy_branch():
 
 
 def test_policy_only_fields_are_zero_not_missing():
-    """LRU never reorders the queue, but the fields still have to be there
-    or a naive field-by-field diff misaligns."""
+    """LRU never reorders the queue and originates no prefetch, but the fields
+    still have to be there or a naive field-by-field diff misaligns."""
     fields = parse(make_logger(FakePool()).summary())
     assert fields["variant"] == "baseline"
     assert fields["splices"] == "0"
     assert fields["spliced_blocks"] == "0"
+    assert fields["staged"] == "0"
+    assert fields["deficit"] == "0"
+    assert fields["phantom_query_tokens"] == "0"
+    assert float(fields["phantom_hit_rate"]) == 0.0
+
+
+def test_reset_prefix_cache_clears_the_hit_rate():
+    """The tokens described a cache that no longer exists.
+
+    Must stay in step with the policy branch: if one clears and the other
+    does not, the first run after a reset compares fresh numbers against
+    carried-over ones and the gap reads as a policy effect.
+    """
+    logger = make_logger(FakePool())
+    logger.on_cache_query(num_tokens=1_000, num_hits=1_000)
+    assert logger.hit_rate == 1.0
+
+    logger.on_reset_prefix_cache()
+    assert logger.query_tokens == 0
+    assert logger.hit_rate == 0.0
+
+    logger.on_cache_query(num_tokens=100, num_hits=0)
+    assert logger.hit_rate == 0.0, "the old tokens must not carry"
 
 
 def test_summary_reports_the_pool_split():
@@ -365,3 +394,21 @@ def test_remat_ratio_is_over_all_caching_work():
     cache_block(logger, pool, 1, "h1")
     # 4 blocks cached, 1 of them a rebuild.
     assert logger.remat_ratio == 0.25
+
+
+def test_preempted_requeries_are_excluded_from_hit_rate_fresh():
+    """vLLM's own "Prefix cache hit rate" drops preempted re-queries, so a
+    line that keeps them reads far lower than the engine's log and the two
+    cannot be reconciled. A preempted request re-queries with a num_tokens
+    grown to include what it already generated — denominator no cache was
+    ever going to serve."""
+    logger = make_logger(FakePool())
+    logger.on_cache_query(num_tokens=100, num_hits=50)
+    logger.on_cache_query(num_tokens=900, num_hits=0, preempted=True)
+
+    assert logger.hit_rate == 50 / 1000          # everything
+    assert logger.hit_rate_fresh == 0.5          # first-scheduling only
+    fields = parse(logger.summary())
+    assert float(fields["hit_rate_fresh"]) == 0.5
+    assert int(fields["query_tokens_fresh"]) == 100
+    assert int(fields["query_tokens"]) == 1000
