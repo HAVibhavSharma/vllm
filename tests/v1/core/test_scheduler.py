@@ -32,7 +32,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -4288,3 +4293,88 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+# -- phantom prefetch: LMCache miss must not become a real prefill ---------
+
+
+def _make_phantom(block_size: int, num_tokens: int) -> Request:
+    """A prefetch_only request, the shape `PhantomPrefetchSubmitter` sends."""
+    request = create_requests(
+        num_requests=1, num_tokens=num_tokens, max_tokens=1, block_size=block_size
+    )[0]
+    request.kv_transfer_params = {"prefetch_only": True, "cache_salt": "agent::x"}
+    return request
+
+
+def test_phantom_prefetch_missing_in_lmcache_is_not_prefilled():
+    """A phantom exists to promote KV from LMCache into HBM. When the
+    connector reports nothing, there is nothing to promote — falling through
+    would spend a full prefill on a prefix no client has asked for yet, which
+    at low `--max-num-seqs` is serialized ahead of real traffic.
+    """
+    BLOCK_SIZE = 16
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=BLOCK_SIZE,
+    )
+    request = _make_phantom(BLOCK_SIZE, num_tokens=BLOCK_SIZE * 4)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {}, "the phantom must not prefill"
+    assert request.request_id not in output.num_scheduled_tokens
+
+    ecos = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+
+    assert scheduler._prefetch_only_misses_total == 1
+    assert not scheduler._prefetch_only_misses, "the deferral list must drain"
+    assert request.status == RequestStatus.FINISHED_STOPPED
+
+    # The submitter's `async for` only exits on a terminal output; without one
+    # the generator hangs and the agent's in-flight slot leaks.
+    finished = [
+        out
+        for engine_outputs in ecos.values()
+        for out in engine_outputs.outputs
+        if out.request_id == request.request_id
+    ]
+    assert len(finished) == 1
+    assert finished[0].finish_reason == FinishReason.STOP
+
+
+def test_phantom_prefetch_with_an_lmcache_hit_still_runs():
+    """The abort is gated on a *miss*. A phantom the connector can serve must
+    still go through the normal load path, or prefetch does nothing at all."""
+    BLOCK_SIZE = 16
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=BLOCK_SIZE * 2, is_async=False),
+        block_size=BLOCK_SIZE,
+    )
+    request = _make_phantom(BLOCK_SIZE, num_tokens=BLOCK_SIZE * 4)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert request.request_id in output.num_scheduled_tokens
+    assert scheduler._prefetch_only_misses_total == 0
+
+
+def test_a_real_request_missing_in_lmcache_is_unaffected():
+    """The abort must key on `prefetch_only`. A real request that misses
+    LMCache has to prefill — that is just an ordinary cache miss."""
+    BLOCK_SIZE = 16
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=BLOCK_SIZE,
+    )
+    request = create_requests(
+        num_requests=1, num_tokens=BLOCK_SIZE * 4, block_size=BLOCK_SIZE
+    )[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert request.request_id in output.num_scheduled_tokens
+    assert scheduler._prefetch_only_misses_total == 0

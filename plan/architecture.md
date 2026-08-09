@@ -406,11 +406,9 @@ survives the request's death.
 stateDiagram-v2
     [*] --> WAITING: submitter.submit()
     WAITING --> WAITING_FOR_REMOTE_KVS: scheduler admits<br/>load_kv_async=True<br/>(LMCache hit)
-    WAITING --> RUNNING: scheduler admits<br/>load_kv_async=False<br/>(LMCache miss)
+    WAITING --> FINISHED_STOPPED: ext_tokens == 0<br/>(LMCache miss)<br/>→ _finish_prefetch_only_misses<br/>never scheduled
 
     WAITING_FOR_REMOTE_KVS --> FINISHED_STOPPED: connector finished_recving<br/>→ _finalize_prefetch_only_request<br/>cache_blocks → APC entry created
-
-    RUNNING --> FINISHED_STOPPED: normal prefill + sample 1 token
 
     FINISHED_STOPPED --> [*]: next step's finished_sending<br/>→ _free_blocks
     note right of WAITING_FOR_REMOTE_KVS
@@ -419,13 +417,38 @@ stateDiagram-v2
         no prefill ran. Cost: 1 retrieve.
     end note
 
-    note right of RUNNING
-        Fallback path:
-        Full prefill of phantom prompt,
-        STOREs to LMCache,
-        samples 1 token. Wasteful.
+    note right of FINISHED_STOPPED
+        Miss path (2026-08-10):
+        the phantom is finished without
+        ever being scheduled. It used to
+        transition to RUNNING and pay a
+        full prefill + STORE — see below.
     end note
 ```
+
+**The RUNNING fallback is gone (2026-08-10).** A phantom that missed in
+LMCache used to be admitted like any other request: full prefill of the
+phantom prompt, STORE back to LMCache, sample one token. A phantom exists to
+*promote* KV from L1 into HBM; if L1 has nothing there is nothing to promote,
+and the prefill was ~`delta_cold` (11.4s) spent on a prefix no client had
+asked for — serialized ahead of real traffic at low `--max-num-seqs`. The
+real request that eventually wants that prefix pays the same prefill anyway,
+and pays it only when the prediction was right.
+
+`Scheduler.schedule()` now aborts on `ext_tokens == 0` for a `prefetch_only`
+request and defers it to `_finish_prefetch_only_misses()`, which finishes it
+as `FINISHED_STOPPED` / `FinishReason.STOP` — the same shape the happy path
+emits, so `output_processor` still records it under `prefetch_only=True` and
+the submitter's `async for` terminates instead of stranding an
+`max_inflight_per_agent` slot. The check sits *below* the `ext_tokens is
+None` branch: `None` means "the connector needs another poll", not "miss".
+
+Counted as `Scheduler._prefetch_only_misses_total`, with a `warning_once` on
+first occurrence. A high count against a low `speculative_confirmed` means
+the forecast is naming prefixes LMCache never stored.
+
+Set `LMCACHE_MP_FULL_HIT_ONLY=1` to extend the abort to *partial* hits — the
+connector then reports them as 0 matched tokens.
 
 ---
 

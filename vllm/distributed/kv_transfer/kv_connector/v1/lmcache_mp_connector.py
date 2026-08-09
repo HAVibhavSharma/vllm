@@ -1029,12 +1029,18 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         self.scheduler_adapter.end_session(request.request_id)
 
         # Always delay block free until the worker reports finished_sending.
-        # For prefetch_only requests that *did* store (LMCache miss → normal
-        # prefill path) this is required for correctness. For prefetch_only
-        # requests that did NOT store (async-load early-finalize path) the
-        # LMCache MP adapter's _process_finished_stores still emits a
-        # synthesized finished_sending for the req_id once the engine reports
-        # it as finished, so blocks free naturally then.
+        # For requests that *did* store this is required for correctness. For
+        # requests that did NOT store — the prefetch_only async-load
+        # early-finalize path, and now also the prefetch_only miss path where
+        # the scheduler finishes the phantom instead of prefilling it
+        # (`Scheduler._finish_prefetch_only_misses`) — the LMCache MP
+        # adapter's _process_finished_stores still emits a synthesized
+        # finished_sending for the req_id once the engine reports it as
+        # finished, so blocks free naturally then.
+        #
+        # A prefetch_only request no longer reaches the normal prefill path
+        # on an LMCache miss, so it can no longer store as a side effect of
+        # being warmed.
         return True, return_params
 
     def take_events(self) -> Iterable["KVCacheEvent"]:

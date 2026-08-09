@@ -490,6 +490,15 @@ The protection floor on prefetched prefixes is **off by default** as of
 2026-08-09 (12 §6); set `speculative_floor_high` above `delta_cold_ms` to
 turn it back on.
 
+**A phantom that misses in LMCache no longer runs a prefill** (2026-08-10,
+12 §7). It is finished as `FINISHED_STOPPED` without ever being scheduled,
+so prefetch is now strictly an L1→HBM promotion: a prefix LMCache does not
+hold cannot be warmed at all, and the real request pays that prefill when it
+arrives. Watch `Scheduler._prefetch_only_misses_total` against
+`speculative_confirmed` — a high ratio means the forecast is naming prefixes
+LMCache never stored. `LMCACHE_MP_FULL_HIT_ONLY=1` extends the abort to
+partial hits.
+
 **Does not:**
 
 - **Originate prefetches — unless `VLLM_NODE_EVICTION_PREFETCH_DRAIN=1`.**

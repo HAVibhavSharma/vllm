@@ -329,6 +329,10 @@ LMCache is a full prefill serialized ahead of real traffic. Read it against
 `staged`/`deficit` — a good forecast that governs 2 blocks of queue and a bad
 forecast that governs 9,000 look identical in `hit_rate` alone.
 
+**That last sentence stopped being true on 2026-08-10 — see §7.** A phantom
+that misses in LMCache is no longer a prefill at all; it is finished without
+being scheduled.
+
 ---
 
 ## 6. The speculative floor is off by default (2026-08-09)
@@ -444,3 +448,103 @@ binary signal cannot *rank*. It cannot — but it can *admit*, and the arm it
 admits (`prob=1.0`, ~22% of rows) is the one the forecast is confident about.
 On the 3600s arm the discount is `30_000/3_630_000 ≈ 0.008`, so those wants
 are warming prefixes due in an hour by evicting blocks due in a minute.
+
+---
+
+## 7. A phantom that misses LMCache is no longer prefilled (2026-08-10)
+
+§5.6 named the cost and §6.1 measured it: prompt tokens roughly doubled
+against the LRU baseline, and a large share of that is phantom traffic.
+§6.1 also said the split by the `prefetch_only` column had not been taken —
+this change removes the largest term without needing it.
+
+### 7.1 What the fallback was
+
+`get_num_new_matched_tokens` returns `(0, False)` when LMCache holds nothing
+for the prefix. Nothing downstream distinguished a phantom from a real
+request at that point, so the phantom was admitted like any other: full
+prefill of the phantom prompt, STORE back to LMCache, sample one token,
+finish. `lmcache_mp_connector.py` documented it as the "LMCache miss →
+normal prefill path".
+
+**Why that is the wrong trade.** A phantom is a *promotion* of KV from L1
+into HBM, priced at `delta_l1_ms = 180`. If L1 does not have the prefix there
+is nothing to promote, and what actually ran was `delta_cold_ms = 11_400` of
+prefill on a prefix no client had asked for — 63x the cost the mechanism was
+designed around, and at `--max-num-seqs 1` serialized *ahead* of real
+traffic. The real request that eventually wants that prefix pays the same
+prefill anyway, and pays it only if the prediction was right. The fallback
+converted a wrong prediction from "no benefit" into "a full prefill of
+latency charged to whoever was queued behind it".
+
+### 7.2 The change
+
+`Scheduler.schedule()`, immediately after `num_external_computed_tokens =
+ext_tokens`: if the request is `prefetch_only` and `ext_tokens == 0`, pop it
+from the queue and defer it to `self._prefetch_only_misses`.
+
+Three details that are load-bearing:
+
+- **Below the `ext_tokens is None` branch, not above it.** `None` means "the
+  connector cannot say yet, ask again", not "miss". Aborting there would kill
+  every phantom whose LMCache lookup had not resolved on its first poll —
+  i.e. most of them.
+- **Deferred, not finished in place.** `schedule()` has no `outputs` dict.
+  `_finish_prefetch_only_misses()` drains the list from
+  `update_from_output()`, the same deferral `failed_kv_load_req_ids` already
+  uses.
+- **Finished as `FINISHED_STOPPED` with `FinishReason.STOP`** — the identical
+  shape `_finalize_prefetch_only_request` emits on the happy path. That
+  matters twice over: `output_processor` records the row under
+  `prefetch_only=True` like any other phantom, and the submitter's `async
+  for` in `_run_one` only exits on a terminal output. Omitting it strands the
+  generator and leaks the agent's `max_inflight_per_agent` slot (64), which
+  would silently throttle prefetch for that agent for the rest of the run.
+
+`finish_requests` → `_free_request` fires the connector's `request_finished`
+hook, so the LMCache request tracker and session are torn down rather than
+leaked. No blocks were ever allocated; `single_type_kv_cache_manager.free`
+already handles that (`req_to_blocks.pop(request_id, [])`, commented "in case
+a request is freed (aborted) before alloc").
+
+### 7.3 What it trades away
+
+**A prefix LMCache does not hold can no longer be warmed at all.** Prefetch
+becomes strictly an L1→HBM promotion. Where the forecast is right *and* the
+prefix is cold in LMCache, the real request now eats the prefill it would
+previously have found already done — a TTFT regression on that subset,
+bought against not paying for every wrong prediction.
+
+This is the right side of the trade only while forecast precision is low.
+If `speculative_waste` drops far enough that most phantoms are confirmed,
+warming cold prefixes becomes worth paying for again and this should be
+revisited — as an explicit opt-in, not a silent fallback.
+
+### 7.4 Visibility
+
+The path was silent, which is why it survived so long. Now:
+
+- `Scheduler._prefetch_only_misses_total` — cumulative count.
+- `warning_once` on the first occurrence, per-request `debug` after.
+
+Read it against `speculative_confirmed`. A high miss count with low
+confirmation means the forecast is naming prefixes LMCache never stored —
+a prefetch-side problem, not an eviction-side one, and no amount of scoring
+work will fix it.
+
+`LMCACHE_MP_FULL_HIT_ONLY=1` composes: the connector then reports partial
+prefix hits as 0 matched tokens, so partial hits abort too instead of
+prefilling the remainder. No new knob was added for that.
+
+### 7.5 Tests
+
+`tests/v1/core/test_scheduler.py`, using the existing
+`mock_kv(matched_tokens=…)` harness:
+
+- `test_phantom_prefetch_missing_in_lmcache_is_not_prefilled`
+- `test_phantom_prefetch_with_an_lmcache_hit_still_runs`
+- `test_a_real_request_missing_in_lmcache_is_unaffected` — the abort keys on
+  `prefetch_only`; an ordinary request that misses must still prefill.
+
+These are the first tests of any kind on the scheduler's `prefetch_only`
+path.

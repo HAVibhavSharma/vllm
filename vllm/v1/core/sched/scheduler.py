@@ -152,6 +152,15 @@ class Scheduler(SchedulerInterface):
         # position 0 (if any) corresponds to num_external_computed_tokens
         # — included here too so the per-step run advance is symmetric.
         self._external_runs: dict[str, list[tuple[int, int]]] = {}
+        # Phantom prefetches whose prefix LMCache could not serve. Collected
+        # in `schedule()` — which has no `outputs` dict — and drained in
+        # `update_from_output()`, the same deferral `failed_kv_load_req_ids`
+        # uses. A phantom exists to promote KV from L1 into HBM; if L1 does
+        # not have it there is nothing to promote, and letting it fall
+        # through would spend a full prefill on a prefix no client has asked
+        # for yet.
+        self._prefetch_only_misses: list[Request] = []
+        self._prefetch_only_misses_total = 0
         self.ec_connector = None
         if self.vllm_config.ec_transfer_config is not None:
             self.ec_connector = ECConnectorFactory.create_connector(
@@ -742,6 +751,36 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+
+                        if (
+                            ext_tokens == 0
+                            and self._is_prefetch_only_request(request)
+                        ):
+                            # LMCache had nothing for this prefix. A phantom
+                            # is a promotion from L1 into HBM, not a
+                            # speculative prefill: falling through here would
+                            # run the full prompt through the model — ~11.4s
+                            # of delta_cold — for a prefix no client has
+                            # asked for, serialized ahead of real traffic at
+                            # low `--max-num-seqs`. The real request that
+                            # eventually wants it pays the same prefill
+                            # anyway, and pays it only if the prediction was
+                            # right.
+                            #
+                            # Deliberately below the `ext_tokens is None`
+                            # branch above: None means "ask me again", not
+                            # "miss", and aborting on it would kill every
+                            # phantom whose lookup had not resolved yet.
+                            #
+                            # `ext_tokens == 0` also covers the case where
+                            # APC already holds the whole prefix — nothing to
+                            # promote there either. Set
+                            # LMCACHE_MP_FULL_HIT_ONLY=1 to extend this to
+                            # partial hits, which the connector then reports
+                            # as 0.
+                            request_queue.pop_request()
+                            self._prefetch_only_misses.append(request)
+                            continue
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1677,6 +1716,9 @@ class Scheduler(SchedulerInterface):
                     )
                 )
 
+        if self._prefetch_only_misses:
+            self._finish_prefetch_only_misses(outputs)
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output, outputs)
@@ -2322,6 +2364,63 @@ class Scheduler(SchedulerInterface):
     def _is_prefetch_only_request(request: Request) -> bool:
         params = request.kv_transfer_params
         return bool(params and params.get("prefetch_only"))
+
+    def _finish_prefetch_only_misses(
+        self,
+        outputs: dict[int, list[EngineCoreOutput]],
+    ) -> None:
+        """Finish phantoms LMCache could not serve, without prefilling them.
+
+        Terminated as `FINISHED_STOPPED` with a `STOP` finish reason — the
+        same shape `_finalize_prefetch_only_request` produces on the success
+        path, so `output_processor` records them under `prefetch_only=True`
+        like any other phantom and the submitter's `async for` in
+        `_run_one` completes. Skipping the output would strand the generator
+        and leak the agent's `max_inflight_per_agent` slot.
+
+        `finish_requests` does the queue removal and calls `_free_request`,
+        which fires the connector's `request_finished` hook — needed here so
+        the LMCache request tracker and session are torn down rather than
+        leaked.
+        """
+        misses = self._prefetch_only_misses
+        self._prefetch_only_misses = []
+
+        self._prefetch_only_misses_total += len(misses)
+        # `warning_once`, not per-request: at any real want volume a line per
+        # phantom would bury the log. The fact worth surfacing is that the
+        # path is being taken at all — a high count against a low
+        # `speculative_confirmed` means the forecast is naming prefixes
+        # LMCache never stored, which is a prefetch problem, not an eviction
+        # one.
+        logger.warning_once(
+            "agent_prefetch: phantom prefetch found no KV in LMCache; "
+            "finishing it instead of running a real prefill. Further "
+            "occurrences are logged at debug (see "
+            "prefetch_only_misses_total)."
+        )
+
+        for request in misses:
+            if request.is_finished():
+                continue
+            logger.debug(
+                "agent_prefetch: no LMCache KV for phantom %s (%d prompt "
+                "tokens) -- skipping prefill",
+                request.request_id,
+                request.num_tokens,
+            )
+            self.finish_requests(
+                request.request_id, RequestStatus.FINISHED_STOPPED
+            )
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.STOP,
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
 
     def _finalize_prefetch_only_request(
         self,
