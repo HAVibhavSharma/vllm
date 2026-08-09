@@ -164,10 +164,17 @@
  * token — splitting on all of them silently truncates the attribution.
  * ==================================================================== */
 
+// A whitelist, so anything absent here silently stays a *string* and any
+// arithmetic on it yields NaN. Every field the engine emits has to be listed,
+// including ones no panel reads yet — that is the cheap half of adding one.
 const NUMERIC_FIELDS = new Set([
-  "total","used","free","usage","queue","splices","spliced_blocks","evicted",
-  "evicted_by_score","regret","hit_rate","hit_rate_win","hit_tokens",
-  "query_tokens","remat_blocks","remat_mb","remat_ratio","blocks_cached",
+  "total","used","free","usage","queue","splices","spliced_blocks",
+  "staged","deficit","evicted",
+  "evicted_by_score","regret","hit_rate","hit_rate_fresh","hit_rate_win",
+  "ttft_ms","ttft_win_ms","ttft_p95_ms","ttft_n",
+  "hit_tokens","query_tokens","query_tokens_fresh",
+  "phantom_hit_rate","phantom_query_tokens",
+  "remat_blocks","remat_mb","remat_ratio","blocks_cached",
   "index_keys","index_blocks",
 ]);
 
@@ -241,7 +248,8 @@ function parseRun(text) {
   });
 
   const variant = rows[0].variant;
-  const missing = ["remat_mb", "hit_rate"].filter(k => rows[0][k] === undefined);
+  const missing = ["remat_mb", "hit_rate", "ttft_ms"]
+    .filter(k => rows[0][k] === undefined);
   return { variant, rows, syntheticTime: !haveStamps, missingFields: missing };
 }
 
@@ -342,6 +350,10 @@ function fmtPct(v) { return Number.isFinite(v) ? (v * 100).toFixed(1) + "%" : "�
 function fmtMB(v) {
   if (!Number.isFinite(v)) return "–";
   return v >= 1024 ? (v / 1024).toFixed(2) + " GB" : v.toFixed(1) + " MB";
+}
+function fmtMs(v) {
+  if (!Number.isFinite(v)) return "–";
+  return Math.abs(v) >= 1000 ? (v / 1000).toFixed(2) + " s" : v.toFixed(0) + " ms";
 }
 function fmtTime(sec) {
   const s = Math.max(0, Math.round(sec));
@@ -698,6 +710,15 @@ function buildSummary() {
       get: r => num(last(r).remat_ratio), fmt: fmtPct },
     { key: "Hit rate (cumulative)", lowerBetter: false,
       get: r => num(last(r).hit_rate), fmt: fmtPct },
+    // Engine-side TTFT: scheduler queueing + prefill, which is the part a
+    // cache miss actually pays for. If hit rate moved and this did not, the
+    // hit rate moved on blocks that were cheap to rebuild.
+    { key: "TTFT mean (engine-side)", headline: true, lowerBetter: true,
+      get: r => num(last(r).ttft_ms), fmt: fmtMs },
+    { key: "TTFT p95", lowerBetter: true,
+      get: r => num(last(r).ttft_p95_ms), fmt: fmtMs },
+    { key: "Requests measured (ttft_n)", lowerBetter: null,
+      get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
     { key: "Evictions", lowerBetter: true,
       get: r => num(last(r).evicted), fmt: v => fmtNum(v, 0) },
     { key: "Mean occupancy", lowerBetter: null,
@@ -791,6 +812,24 @@ function buildBanners() {
     }
   }
 
+  // TTFT means over different request counts are not a comparison. This is
+  // the one number on the page that is per-request rather than per-block, so
+  // it is the one an unmatched workload silently corrupts.
+  const nb = num(last(b).ttft_n), np = num(last(p).ttft_n);
+  if (nb > 0 && np > 0) {
+    const d = Math.abs(np - nb) / Math.max(nb, np);
+    if (d > 0.10) {
+      add(`<b>TTFT was measured over different request counts</b> — ` +
+          `${fmtNum(nb, 0)} vs ${fmtNum(np, 0)} (${(d * 100).toFixed(0)}% apart). ` +
+          `The means describe different populations; pair per request before ` +
+          `quoting a TTFT delta.`);
+    }
+  } else if (nb === 0 && np === 0) {
+    add(`<b>No TTFT samples in either run</b> — <code>ttft_n=0</code>. Either ` +
+        `no request produced a token, or the log predates the field. ` +
+        `Panels 4 and 5 will be flat.`);
+  }
+
   if (num(last(p).splices) === 0) {
     add(`<b>The policy never spliced</b> — <code>splices=0</code> for the ` +
         `whole run. The tick never reached the splice, so this is a bug in ` +
@@ -857,8 +896,23 @@ function panelDefs() {
     series: run => [{ points: levelSeries(run.rows, "hit_rate_win") }],
     readout: s => fmtPct(num(s.hit_rate_win)) + " (cum " + fmtPct(num(s.hit_rate)) + ")",
   },
+  { id: "ttft",
+    title: "4 · Time to first token, engine-side (this window)",
+    why: "What the misses cost. Read against panel 3: hit rate says how often the cache worked, this says whether it mattered. Scheduler queueing plus prefill only — it excludes front-end queueing and detokenization, so it reads lower than the client's TTFT and is not the same quantity.",
+    kind: "line", yMin: 0, fmtY: fmtMs,
+    series: run => [{ points: levelSeries(run.rows, "ttft_win_ms") }],
+    readout: s => fmtMs(num(s.ttft_win_ms)) + "  (cum " + fmtMs(num(s.ttft_ms)) +
+                  ", n=" + fmtNum(num(s.ttft_n), 0) + ")",
+  },
+  { id: "ttftP95",
+    title: "5 · TTFT p95 (last 4096 requests)",
+    why: "The tail, which the mean hides. A policy that destroys one large prefix can hold the mean flat and still make a minority of requests much worse.",
+    kind: "line", yMin: 0, fmtY: fmtMs,
+    series: run => [{ points: levelSeries(run.rows, "ttft_p95_ms") }],
+    readout: s => fmtMs(num(s.ttft_p95_ms)),
+  },
   { id: "redo",
-    title: "4 · Redo share — rebuilt / cached (this window)",
+    title: "6 · Redo share — rebuilt / cached (this window)",
     why: "Normalises panel 2 for throughput, so a quiet run cannot fake an improvement.",
     kind: "line", yMin: 0, fmtY: fmtPct,
     series: run => [{ points: ratioSeries(run.rows, "remat_blocks", "blocks_cached") }],
@@ -871,21 +925,21 @@ function panelDefs() {
     },
   },
   { id: "occupancy",
-    title: "5 · HBM occupancy",
+    title: "7 · HBM occupancy",
     why: "used / total. Fixed 0–100% axis so the two runs are directly comparable.",
     kind: "line", yMin: 0, yMax: 100, fmtY: v => v.toFixed(0) + "%",
     series: run => [{ points: levelSeries(run.rows, "usage") }],
     readout: s => num(s.usage).toFixed(1) + "%  (" + fmtNum(s.used, 0) + " / " + fmtNum(s.total, 0) + ")",
   },
   { id: "queue",
-    title: "6 · Free queue depth (eviction candidates)",
+    title: "8 · Free queue depth (eviction candidates)",
     why: "A policy that keeps this deeper is holding more evictable-but-cached blocks.",
     kind: "line", yMin: 0, fmtY: v => fmtNum(v, 0),
     series: run => [{ points: levelSeries(run.rows, "queue") }],
     readout: s => fmtNum(num(s.queue), 0) + " blocks",
   },
   { id: "evictRate",
-    title: "7 · Eviction rate (blocks/s)",
+    title: "9 · Eviction rate (blocks/s)",
     why: "Churn volume, for context on panels 1 and 2.",
     kind: "line", yMin: 0, fmtY: v => fmtNum(v, 1),
     series: run => [{ points: rateSeries(run.rows, "evicted") }],
@@ -897,29 +951,29 @@ function panelDefs() {
     },
   },
   { id: "splice",
-    title: "8 · Splice activity (blocks/s)",
+    title: "10 · Splice activity (blocks/s)",
     why: "Policy only — LRU never reorders the queue. A flat zero here is a bug in the run, not a result.",
     kind: "line", yMin: 0, fmtY: v => fmtNum(v, 1), policyOnly: true,
     series: run => [{ points: rateSeries(run.rows, "spliced_blocks") }],
     readout: s => fmtNum(num(s.spliced_blocks), 0) + " cumulative",
   },
   { id: "attrPolicy",  kind: "stack", variant: "node_eviction",
-    title: "9 · Evictions by job:node — policy",
+    title: "11 · Evictions by job:node — policy",
     why: "Per window. Bands do not sum to the eviction total, so the remainder is drawn explicitly.",
   },
   { id: "attrBaseline", kind: "stack", variant: "baseline",
-    title: "10 · Evictions by job:node — baseline",
-    why: "Same colours and the same y-scale as panel 9. Locking the scale is what makes them comparable at a glance.",
+    title: "12 · Evictions by job:node — baseline",
+    why: "Same colours and the same y-scale as panel 11. Locking the scale is what makes them comparable at a glance.",
   },
   { id: "regret",
-    title: "11 · Regret",
+    title: "13 · Regret",
     why: "Policy only. The baseline emits a constant 0.000 — plotting it would read as 'no regret' rather than 'not measured'.",
     kind: "line", yMin: 0, yMax: 1, fmtY: v => v.toFixed(2), policyOnly: true,
     series: run => [{ points: levelSeries(run.rows, "regret") }],
     readout: s => num(s.regret).toFixed(3),
   },
   { id: "scored",
-    title: "12 · Scored coverage — evicted_by_score / evicted",
+    title: "14 · Scored coverage — evicted_by_score / evicted",
     why: "Policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so.",
     kind: "line", yMin: 0, yMax: 1, fmtY: fmtPct, policyOnly: true,
     series: run => [{ points: run.rows.map(r => [r.t, num(r.evicted) > 0 ? num(r.evicted_by_score) / num(r.evicted) : 0]) }],
@@ -1130,10 +1184,12 @@ document.getElementById("demo").addEventListener("click", () => {
   const mk = (variant, seed) => {
     const lines = [];
     let evicted = 0, remat = 0, cached = 0, spliced = 0, splices = 0;
-    let hitT = 0, qT = 0;
+    let hitT = 0, qT = 0, ttftN = 0, ttftSum = 0;
     const total = 24000;
     const rematRate = variant === "baseline" ? 1.0 : 0.55;
     const hit = variant === "baseline" ? 0.62 : 0.71;
+    // Higher hit rate, lower prefill cost — the shape a working policy has.
+    const ttftBase = variant === "baseline" ? 640 : 470;
     for (let i = 0; i < 60; i++) {
       const t = new Date(Date.UTC(2026, 7, 7, 12, 0, 0) + i * 30000);
       const load = 0.6 + 0.4 * Math.sin(i / 7 + seed);
@@ -1144,6 +1200,9 @@ document.getElementById("demo").addEventListener("click", () => {
       const q = Math.round(52000 * load); qT += q;
       const hw = hit + 0.06 * Math.sin(i / 4 + seed);
       hitT += Math.round(q * hw);
+      const ttftWin = ttftBase * (0.85 + 0.5 * load);
+      const nWin = Math.round(14 * load);
+      ttftN += nWin; ttftSum += ttftWin * nWin;
       const used = Math.round(total * (0.72 + 0.2 * load * 0.5));
       const stamp = `INFO 08-07 ${String(t.getUTCHours()).padStart(2,"0")}:` +
                     `${String(t.getUTCMinutes()).padStart(2,"0")}:` +
@@ -1156,6 +1215,9 @@ document.getElementById("demo").addEventListener("click", () => {
         `evicted_by_score=${variant==="baseline"?0:Math.round(evicted*0.72)} ` +
         `regret=${variant==="baseline"?"0.000":(0.09+0.02*Math.sin(i/5)).toFixed(3)} ` +
         `hit_rate=${(hitT/qT).toFixed(4)} hit_rate_win=${hw.toFixed(4)} ` +
+        `ttft_ms=${(ttftSum/Math.max(ttftN,1)).toFixed(1)} ` +
+        `ttft_win_ms=${ttftWin.toFixed(1)} ` +
+        `ttft_p95_ms=${(ttftWin*1.9).toFixed(1)} ttft_n=${ttftN} ` +
         `hit_tokens=${hitT} query_tokens=${qT} remat_blocks=${remat} ` +
         `remat_mb=${(remat*2).toFixed(1)} remat_ratio=${(remat/cached).toFixed(4)} ` +
         `blocks_cached=${cached} index_keys=112 index_blocks=9130 ` +

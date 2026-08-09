@@ -192,3 +192,45 @@ def test_counters_serialise():
         "policy_enabled",
     ):
         assert field in payload
+
+
+def test_ttft_mean_is_exact_and_p95_is_over_the_ring():
+    """The mean answers "did latency move"; p95 answers "for whom". A policy
+    can hold the mean flat and wreck the tail by evicting one large prefix."""
+    from vllm.v1.core.node_eviction.metrics import TTFTTracker
+
+    t = TTFTTracker()
+    for ms in list(range(1, 101)):
+        t.record(float(ms))
+
+    assert t.count == 100
+    assert t.mean_ms == 50.5
+    # Nearest-rank: the smallest sample at or above the 95th percentile.
+    assert t.p95_ms == 95.0
+
+
+def test_ttft_window_resets_but_cumulative_does_not():
+    """Same split as the hit rate: a cumulative mean over a long run is
+    dominated by whatever the workload did first."""
+    from vllm.v1.core.node_eviction.metrics import TTFTTracker
+
+    t = TTFTTracker()
+    t.record(100.0)
+    t.reset_window()
+    t.record(200.0)
+
+    assert t.window_mean_ms == 200.0
+    assert t.mean_ms == 150.0
+    assert t.count == 2
+
+
+def test_a_negative_ttft_is_dropped_not_averaged_in():
+    """A non-monotonic wall clock must not put a negative latency in the
+    mean — a missing sample is the lesser corruption."""
+    from vllm.v1.core.node_eviction.metrics import TTFTTracker
+
+    t = TTFTTracker()
+    t.record(-5.0)
+    t.record(10.0)
+    assert t.count == 1
+    assert t.mean_ms == 10.0

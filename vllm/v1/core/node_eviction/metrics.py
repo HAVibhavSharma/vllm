@@ -22,6 +22,7 @@ Two artifacts, per §6:
 """
 
 import json
+import math
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -439,6 +440,81 @@ class CacheMovementTracker:
             "remat_ratio": self.remat_ratio,
             "blocks_cached_total": self.blocks_cached,
             "block_size_bytes": self.block_size_bytes,
+        }
+
+
+class TTFTTracker:
+    """Engine-side time to first token, in ms.
+
+    `Request.first_token_ts - Request.arrival_time`, both stamped inside
+    engine core. This is deliberately *not* the front end's TTFT: that one
+    also carries front-end queueing and detokenization, neither of which an
+    eviction policy can move, which dilutes exactly the effect being
+    measured. What is left here — scheduler queueing plus prefill — is the
+    part a cache miss actually pays for.
+
+    It belongs on the `kv_hbm` line because hit rate alone cannot settle the
+    question. A policy can raise hit rate and still lose on latency if the
+    blocks it kept were cheap to rebuild and the ones it dropped were not;
+    `remat_mb` says how much KV was rebuilt, this says what it cost.
+
+    The mean is cumulative and exact. Percentiles come from a bounded ring of
+    recent samples, because retaining every sample for an exact percentile is
+    unbounded under load and the tail is what matters anyway.
+    """
+
+    def __init__(self, ring_size: int = 4096) -> None:
+        self.ring_size = max(int(ring_size), 0)
+        self._recent: deque = deque(maxlen=self.ring_size or 1)
+        self.count = 0
+        self.total_ms = 0.0
+        self.window_count = 0
+        self.window_total_ms = 0.0
+
+    def record(self, ttft_ms: float) -> None:
+        if ttft_ms < 0.0:
+            # A non-monotonic wall clock can produce this. Dropping is right:
+            # a negative latency in the mean is worse than a missing sample.
+            return
+        self.count += 1
+        self.total_ms += ttft_ms
+        self.window_count += 1
+        self.window_total_ms += ttft_ms
+        if self.ring_size:
+            self._recent.append(ttft_ms)
+
+    @property
+    def mean_ms(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total_ms / self.count
+
+    @property
+    def window_mean_ms(self) -> float:
+        if self.window_count == 0:
+            return 0.0
+        return self.window_total_ms / self.window_count
+
+    @property
+    def p95_ms(self) -> float:
+        """Over the retained ring, not the whole run."""
+        if not self._recent:
+            return 0.0
+        ordered = sorted(self._recent)
+        # Nearest-rank: the smallest sample at or above the 95th percentile.
+        idx = min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)
+        return ordered[max(idx, 0)]
+
+    def reset_window(self) -> None:
+        self.window_count = 0
+        self.window_total_ms = 0.0
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "ttft_ms": self.mean_ms,
+            "ttft_window_ms": self.window_mean_ms,
+            "ttft_p95_ms": self.p95_ms,
+            "ttft_n": self.count,
         }
 
 

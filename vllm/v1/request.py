@@ -176,6 +176,17 @@ class Request:
         # needs no cleanup: it dies with the request.
         self.cache_query_counted = False
 
+        # Wall clock at which this request produced its first output token,
+        # i.e. the instant prefill finished. Engine-core side on purpose: the
+        # front end's TTFT also carries front-end queueing and detokenization,
+        # neither of which eviction can move, while this covers exactly what
+        # it can — scheduler queueing and prefill work. Paired with
+        # `arrival_time` above.
+        self.first_token_ts: float | None = None
+        # Set once the TTFT sample has been handed to the HBM instrumentation,
+        # so a preemption (which frees and re-allocates) cannot double-count.
+        self.ttft_recorded = False
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
@@ -222,6 +233,15 @@ class Request:
         self,
         token_ids: int | list[int],
     ) -> None:
+        if self.first_token_ts is None and (
+            isinstance(token_ids, int) or token_ids
+        ):
+            # First output token: prefill is done. Stamped here rather than in
+            # the scheduler because this is the single point every path
+            # appends through, so no code path can produce a token without
+            # timing it.
+            self.first_token_ts = time.time()
+
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)

@@ -1159,3 +1159,43 @@ def test_a_newly_worse_key_still_reaches_the_head():
     index_prefix(controller, pool, SUPERVISOR, [4, 5])
     force_tick(controller)
     assert pool.queue_ids()[0] in (4, 5), "the worse key must overtake"
+
+
+def _ttft_request(arrival: float, first_token: float | None):
+    req = make_request()
+    req.arrival_time = arrival
+    req.first_token_ts = first_token
+    req.ttft_recorded = False
+    return req
+
+
+def test_ttft_is_recorded_once_per_request():
+    """`KVCacheManager.free` also runs on preemption, and a preempted request
+    keeps its original `first_token_ts`. Counting it twice would weight slow
+    requests by how often they were preempted."""
+    controller = make_controller(FakePool())
+    req = _ttft_request(arrival=1000.0, first_token=1000.25)
+
+    controller.on_request_finished(req)
+    controller.on_request_finished(req)
+
+    assert controller.ttft.count == 1
+    assert controller.ttft.mean_ms == 250.0
+
+
+def test_a_request_with_no_first_token_contributes_nothing():
+    """Aborted before prefill finished — there is no prefill latency to
+    attribute, and a zero would drag the mean down."""
+    controller = make_controller(FakePool())
+    controller.on_request_finished(_ttft_request(1000.0, None))
+    assert controller.ttft.count == 0
+
+
+def test_the_summary_line_carries_ttft():
+    controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
+    controller.on_request_finished(_ttft_request(1000.0, 1000.5))
+    line = controller._maybe_log_hbm_summary(1_000_000.0)
+    fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
+    assert float(fields["ttft_ms"]) == 500.0
+    assert float(fields["ttft_win_ms"]) == 500.0
+    assert fields["ttft_n"] == "1"

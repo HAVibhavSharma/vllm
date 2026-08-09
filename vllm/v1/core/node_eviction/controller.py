@@ -33,6 +33,7 @@ from vllm.v1.core.node_eviction.index import BlockOwnershipIndex
 from vllm.v1.core.node_eviction.metrics import (
     CacheMovementTracker,
     EvictionObserver,
+    TTFTTracker,
 )
 from vllm.v1.core.node_eviction.scoring import (
     apply_speculative_floor,
@@ -177,6 +178,8 @@ class NodeEvictionController:
             ),
             block_size_bytes=block_size_bytes,
         )
+        # What a miss actually costs, next to how often it happened.
+        self.ttft = TTFTTracker()
         if config.prefetch_wants_enabled and self.enabled:
             self._wants = PrefetchWantList(
                 max_outstanding=config.prefetch_max_outstanding,
@@ -353,6 +356,24 @@ class NodeEvictionController:
             return
         phantom = request is not None and _is_prefetch_only(request)
         self.movement.on_cache_query(num_tokens, num_hits, preempted, phantom)
+
+    def on_request_finished(self, request) -> None:
+        """`KVCacheManager.free` — the request is done with its blocks.
+
+        Called on preemption too, which is why the sample is gated on
+        `ttft_recorded`: a preempted request keeps its original
+        `first_token_ts`, so counting it twice would weight slow requests by
+        how often they were preempted.
+        """
+        if not self.enabled or request.ttft_recorded:
+            return
+        first = getattr(request, "first_token_ts", None)
+        if first is None:
+            # Finished before producing a token — aborted, or a phantom with
+            # nothing to emit. No prefill latency to attribute.
+            return
+        request.ttft_recorded = True
+        self.ttft.record((first - request.arrival_time) * 1000.0)
 
     def on_reset_prefix_cache(self) -> None:
         if not self.enabled:
@@ -748,6 +769,13 @@ class NodeEvictionController:
             f"hit_rate={m.hit_rate:.4f} "
             f"hit_rate_fresh={m.hit_rate_fresh:.4f} "
             f"hit_rate_win={m.window_hit_rate:.4f} "
+            # Engine-side TTFT — what a miss cost, next to how often it
+            # happened. Hit rate alone cannot separate a policy that kept
+            # cheap-to-rebuild blocks from one that kept expensive ones.
+            f"ttft_ms={self.ttft.mean_ms:.1f} "
+            f"ttft_win_ms={self.ttft.window_mean_ms:.1f} "
+            f"ttft_p95_ms={self.ttft.p95_ms:.1f} "
+            f"ttft_n={self.ttft.count} "
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
             f"query_tokens_fresh={m.query_tokens_fresh} "
@@ -794,6 +822,8 @@ class NodeEvictionController:
             # the most work.
             self.movement.phantom_query_tokens,
             self.movement.remat_blocks,
+            # A window where only latency moved is still worth a line.
+            self.ttft.count,
         )
         if fingerprint == self._last_hbm_fingerprint:
             return None
@@ -806,6 +836,7 @@ class NodeEvictionController:
         # workload happened to do first.
         self._evictions_by_key.clear()
         self.movement.reset_window()
+        self.ttft.reset_window()
         return summary
 
     def drain_prefetch_wants(self, max_items: int) -> list[dict[str, str | float]]:
@@ -1036,6 +1067,7 @@ class NodeEvictionController:
         out["hbm_usage"] = (total - free) / total if total else 0.0
         out["free_queue_len"] = self.block_pool.free_block_queue.num_free_blocks
         out.update(self.movement.as_dict())
+        out.update(self.ttft.as_dict())
         out["index_keys"] = self.index.num_keys
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys

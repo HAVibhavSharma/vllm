@@ -210,15 +210,17 @@ separate columns — the eye cannot align two columns across a scroll.
 | 1 | **KV rebuilt (cumulative)** | `rematMb`, two lines, MB. **The headline.** The gap between the two curves at the right edge *is* the result. Shade it and label the final delta in the panel. |
 | 2 | **Rebuild rate** | `ΔrematBlocks / Δt`, blocks/s, two lines. Shows *when* the policy helped — a gap that opens only under pressure is a different story from a constant offset. |
 | 3 | **Hit rate** | `hitRateWin`, two lines, 0–1. Read against panel 1: movement down with hit rate flat or up is the win. Movement down *and* hit rate down means it served less, not better. |
-| 4 | **Redo share** | Windowed `ΔrematBlocks / Δblocks_cached`, two lines, 0–1. Normalises panel 2 for throughput, so a quiet run cannot fake an improvement. |
-| 5 | **Occupancy** | `used`/`total` as a percentage. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
-| 6 | **Free queue depth** | `queue`, two lines. The eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
-| 7 | **Eviction rate** | `Δevicted / Δt`, blocks/s, two lines. |
-| 8 | **Splice activity** | `ΔsplicedBlocks / Δt`, policy only, filled area. Annotate `splices=0 for the whole run` in red if the policy series is flat zero — that is a bug, not a result. |
-| 9 | **Attribution — policy** | Stacked area, one band per `job:node`, plus `<untracked>` and `other`. Y is blocks evicted per window. |
-| 10 | **Attribution — baseline** | Same, same colours, same y-scale as panel 9. Locking the y-scale across the two is what makes them comparable at a glance. |
-| 11 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
-| 12 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
+| 4 | **TTFT** | `ttft_win_ms`, two lines, ms. Engine-side: scheduler queueing plus prefill, excluding front-end queueing and detokenization. Read against panel 3 — hit rate says how often the cache worked, this says whether it mattered. A hit-rate gain with TTFT flat means the hits landed on blocks that were cheap to rebuild. |
+| 5 | **TTFT p95** | `ttft_p95_ms`, two lines, ms. The tail the mean hides: destroying one large prefix can leave the mean flat and still make a minority of requests much worse. |
+| 6 | **Redo share** | Windowed `ΔrematBlocks / Δblocks_cached`, two lines, 0–1. Normalises panel 2 for throughput, so a quiet run cannot fake an improvement. |
+| 7 | **Occupancy** | `used`/`total` as a percentage. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
+| 8 | **Free queue depth** | `queue`, two lines. The eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
+| 9 | **Eviction rate** | `Δevicted / Δt`, blocks/s, two lines. |
+| 10 | **Splice activity** | `ΔsplicedBlocks / Δt`, policy only, filled area. Annotate `splices=0 for the whole run` in red if the policy series is flat zero — that is a bug, not a result. |
+| 11 | **Attribution — policy** | Stacked area, one band per `job:node`, plus `<untracked>` and `other`. Y is blocks evicted per window. |
+| 12 | **Attribution — baseline** | Same, same colours, same y-scale as panel 11. Locking the y-scale across the two is what makes them comparable at a glance. |
+| 13 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
+| 14 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
 
 ### Summary header
 
@@ -226,6 +228,10 @@ Above the panels, a compact row of paired numbers — baseline vs policy, with
 the delta. Movement first, because that is the claim:
 
 - **KV rebuilt (`remat_mb`), and the delta as a percentage** — the headline
+- **TTFT mean (`ttft_ms`)** — the second headline, because it is the only
+  figure that says the movement mattered
+- TTFT p95 (`ttft_p95_ms`), and `ttft_n` beside it: means over different
+  request counts are not a comparison
 - redo share (`remat_ratio`)
 - hit rate (cumulative)
 - total evictions
@@ -242,6 +248,11 @@ absolute `remat_mb` delta is not a fair number. Detect it and print a warning
 banner: *"runs differ in served tokens by N% — compare `remat_ratio`, not
 `remat_mb`."* A visualisation that lets someone quote a win they did not earn
 is worse than no visualisation.
+
+The same guard applies to TTFT, for a different reason: it is the one
+per-*request* number on a page of per-*block* numbers, so an unmatched
+workload corrupts it silently. Warn when `ttft_n` differs by more than ~10%
+between the runs.
 
 ---
 

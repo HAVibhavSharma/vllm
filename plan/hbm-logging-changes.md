@@ -72,6 +72,10 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
 | `regret` | Evictions whose key was requested again within the horizon | always `0.000` |
 | `hit_rate` | Prefix-cache hit rate **in tokens**, since boot | same |
 | `hit_rate_win` | Same, this window only | same |
+| `ttft_ms` | Engine-side time to first token, mean since boot | same |
+| `ttft_win_ms` | Same, this window only | same |
+| `ttft_p95_ms` | 95th percentile over the last 4096 samples | same |
+| `ttft_n` | Samples taken, i.e. requests that produced a token | same |
 | `hit_tokens` / `query_tokens` | The raw numerator and denominator | same |
 | `phantom_hit_rate` | Hit rate of prefetch phantoms only, excluded from every rate above | always `0.0000` |
 | `phantom_query_tokens` | Tokens looked up by phantoms — the prefill origination bought | always `0` |
@@ -119,6 +123,35 @@ two to disagree, and by a wide margin under queueing.
 `hit_rate_win` exists because a cumulative rate over a multi-hour run is
 dominated by whatever the workload did in its first ten minutes. When the
 question is "is it better *now*", the cumulative figure cannot answer it.
+
+### 2.1.0 `ttft_*` — what the miss cost
+
+Hit rate says how often the cache worked. It cannot say whether that
+mattered: a policy can raise hit rate and still lose on latency if the blocks
+it kept were cheap to rebuild and the ones it dropped were not. `remat_mb`
+says how much KV was rebuilt; `ttft_*` says what it cost.
+
+**Engine-side, deliberately.** `Request.first_token_ts - Request.arrival_time`,
+both stamped inside engine core — `first_token_ts` in
+`Request.append_output_token_ids`, the one point every path appends through.
+The front end's TTFT additionally carries front-end queueing and
+detokenization, neither of which an eviction policy can move, so including
+them only dilutes the effect being measured. What is left is scheduler
+queueing plus prefill, which is exactly what a cache miss pays for. Expect
+this to read *lower* than the front end's number; they are not the same
+quantity.
+
+Sampled from `KVCacheManager.free`, the only layer still holding the
+`Request` at teardown. That path also runs on **preemption**, and a preempted
+request keeps its original `first_token_ts`, so the sample is gated on
+`Request.ttft_recorded` — otherwise slow requests would be weighted by how
+often they were preempted. A request that never produced a token contributes
+nothing rather than a zero.
+
+The mean is exact and cumulative; `ttft_p95_ms` comes from a bounded ring of
+the last 4096 samples, because retaining every sample for an exact percentile
+is unbounded under load. Read the p95 alongside the mean: a policy that
+evicts one large prefix can hold the mean flat and wreck the tail.
 
 ### 2.1.1 Phantoms are excluded, not discarded
 
