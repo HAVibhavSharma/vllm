@@ -40,6 +40,7 @@ from vllm.v1.core.node_eviction.scoring import (
     build_value_table,
     is_stale,
     score_key,
+    speculative_floor,
 )
 from vllm.v1.core.node_eviction.snapshot import SnapshotSource
 from vllm.v1.core.node_eviction.types import (
@@ -596,8 +597,13 @@ class NodeEvictionController:
         HBM due to it being full: evict others in order of least value except
         this"* — needs no separate mechanism here. The splice has already
         moved the least valuable blocks to the head, so `get_new_blocks` pops
-        those first; and "except this" is the speculative floor, which puts a
-        freshly prefetched prefix above the whole score range (02 §5 part 3).
+        those first.
+
+        The "except this" clause used to be the speculative floor, which put
+        a freshly prefetched prefix above the whole score range. That is off
+        by default now (`config.speculative_floor_high`): a prefetch is
+        ranked on the same row that justified fetching it, so a prefix worth
+        warming is protected by its own score or not at all.
         """
         wants = self._wants
         if wants is None:
@@ -891,11 +897,21 @@ class NodeEvictionController:
         )
 
         # The speculative floor, applied after the base score so it can only
-        # ever protect (max, not +). It ships with the splice, not later: the
-        # splice is precisely what removes LRU's accidental protection of a
-        # prefetched prefix (freed blocks go to the tail, and the tail is
-        # evicted last), so without the floor this step can evict a prefix it
-        # just paid ~11.4s to fetch (02 §5, build ordering constraint).
+        # ever protect (max, not +). Off by default now — see
+        # `config.speculative_floor_high` for why. With it off a prefetched
+        # entry is simply absent from this loop and scored like any other
+        # key: from its row if it has one, and not at all if it does not, in
+        # which case it keeps its LRU position (Rule 2) rather than becoming
+        # a first-out victim.
+        #
+        # The gate is on the height rather than on a separate bool because
+        # `apply_speculative_floor` is a `max`: at 0 it would already be a
+        # no-op for every scored key, and skipping the loop only additionally
+        # stops it manufacturing table rows for unscored keys.
+        if speculative_floor(self.config) <= 0.0:
+            self._value_table = table
+            return
+
         for entry in self.index.entries():
             if not entry.speculative:
                 continue

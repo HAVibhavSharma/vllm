@@ -256,7 +256,7 @@ flag-off would no longer reproduce upstream behaviour (01 §6.5).
 | Request with no metadata | normal | invisible to policy, silent LRU | unscored → keeps LRU position |
 | Block ownership | none | one agent per block, `RETAG` thrash | multi-owner, score = `max` |
 | Trigger | none | estimated `fresh_free_estimate` | exact `num_free_fresh` counter |
-| Prefetched blocks | protected by accident (tail) | same accident | explicit decaying floor (02 §5) |
+| Prefetched blocks | protected by accident (tail) | same accident | scored from their own forecast row; opt-in floor, off by default (02 §5, 12 §6) |
 | Change to core structures | — | patched `get_new_blocks` | `appendleft`, additive only |
 | Off switch | — | env ratio | flag; off is byte-identical to upstream |
 

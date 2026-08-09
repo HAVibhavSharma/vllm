@@ -97,8 +97,8 @@ Applied in this order:
 ```
 1.  base        = score(key)                     as above
 2.  block_score = max(base over owning keys)      multi-owner   01 §4
-3.  if speculative:
-        block_score = max(block_score, floor(age))              02 §5
+3.  if speculative and the floor is switched on:  02 §5, 12 §6
+        block_score = max(block_score, floor)     off by default
 4.  unscored blocks are never selected — they keep LRU position 01 §6 Rule 2
 5.  splice moves the worst K, ascending           01 §6 Rule 4
 ```
@@ -126,7 +126,7 @@ exists. Several encode failures the previous attempt actually shipped.
 | 3 | strictly decreasing in `blocks` | it is a density |
 | 4 | increasing in `p_cold` | expensive misses are worth avoiding |
 | 5 | **never 0** for a scored block | 0 makes freshly built prefixes the top victims and destroys them before first reuse — strictly worse than LRU (00 Part 5 item 6) |
-| 6 | bounded above by `Δ_cold` | so the speculative floor can be placed above the whole range (02 §5) |
+| 6 | bounded above by `Δ_cold` | so the speculative floor *can* be placed above the whole range (02 §5). Still the invariant the validator enforces, though the floor now defaults to off — 12 §6 |
 | 7 | deterministic — no clock reads inside, no randomness | the same inputs must replay identically, or §7 proves nothing |
 | 8 | a running node's blocks are never scored | `ref_cnt > 0` keeps them out of the free queue entirely |
 

@@ -158,6 +158,17 @@ another — the forecast marking its own homework.
 
 ### Part 3 — One decaying floor is the soft pin
 
+> **Superseded — read 12 §5.5 and 12 §6 before this subsection.** The decay
+> was removed (its TTL was `time_to_next_call`, a two-valued signal, so on
+> the 60s arm it counted a prefetch down to *first-out* just as its predicted
+> call came due), and the resulting constant floor was then switched off by
+> default: at 1e9 against a range topping out at `Δ_cold = 11,400` it put
+> every prediction above every observation, and the `max`-over-owners rule
+> spread that protection to every shared preamble a phantom touched. A
+> prefetched entry is now scored from its own forecast row like any other
+> key. What follows is the original design, still reachable by setting
+> `speculative_floor_high` above `Δ_cold`.
+
 ```
 score = max(base_importance, floor(age))    # speculative entries only
 floor: starts above the top of the normal score range,

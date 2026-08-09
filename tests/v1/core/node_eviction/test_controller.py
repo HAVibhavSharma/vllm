@@ -321,11 +321,15 @@ def test_score_threshold_leaves_valuable_blocks_alone():
 # -- the speculative floor ----------------------------------------------
 
 
-def test_a_fresh_prefetch_is_protected_from_its_own_policy():
-    """The regression this policy is most capable of producing: the splice
-    removes LRU's accidental tail protection, so without the floor a prefix
-    the policy just paid ~11.4s to fetch can be evicted immediately
-    (02 §5)."""
+def test_the_floor_is_off_by_default_and_a_prefetch_is_scored_honestly():
+    """The shipped default. A prefetched key is ranked on its own row, so a
+    low-probability prediction sorts below a real, imminent one instead of
+    above every key in the table.
+
+    This is the trade the floor was making: protecting the prediction meant
+    the splice chose *real* blocks instead, and via the `max` over owners one
+    phantom sharing a system preamble lifted that preamble out of the
+    candidate set for every node sharing it."""
     pool = FakePool(num_blocks=16)
     rows = fresh_rows(
         {
@@ -334,6 +338,35 @@ def test_a_fresh_prefetch_is_protected_from_its_own_policy():
         }
     )
     controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1], speculative=True)
+    index_prefix(controller, pool, SUPERVISOR, [2])
+
+    controller.maybe_tick()
+
+    assert controller.get_value(RESEARCH) < controller.get_value(SUPERVISOR)
+    assert pool.queue_ids()[0] == 1, "the weaker forecast goes first"
+    # Provenance survives the floor's removal: the waste ratio is how you
+    # tell whether the prefetch half is worth running at all.
+    assert controller.observer.counters.speculative_created == 1
+    assert controller.index.get_entry(RESEARCH).speculative
+
+
+def test_a_fresh_prefetch_is_protected_from_its_own_policy():
+    """The regression this policy is most capable of producing: the splice
+    removes LRU's accidental tail protection, so without the floor a prefix
+    the policy just paid ~11.4s to fetch can be evicted immediately
+    (02 §5).
+
+    Opt-in now — `speculative_floor_high` defaults to 0. Kept so the
+    protected behaviour stays A/B-able against the default."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.01, time_to_next_call_ms=30_000.0),
+            SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=1_000.0),
+        }
+    )
+    controller = make_controller(pool, rows, speculative_floor_high=1e9)
     # research arrives as a phantom prefetch: low base score, but freshly
     # predicted.
     index_prefix(controller, pool, RESEARCH, [1], speculative=True)
@@ -353,6 +386,8 @@ def test_an_old_prefetch_is_still_protected():
 
     `time_to_next_call_ms` is deliberately 60s here, the arm that used to run
     the countdown to first-out.
+
+    Opt-in now, like `test_a_fresh_prefetch_is_protected_from_its_own_policy`.
     """
     pool = FakePool(num_blocks=16)
     rows = fresh_rows(
@@ -361,7 +396,7 @@ def test_an_old_prefetch_is_still_protected():
             SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=1_000.0),
         }
     )
-    controller = make_controller(pool, rows)
+    controller = make_controller(pool, rows, speculative_floor_high=1e9)
     index_prefix(controller, pool, RESEARCH, [1], speculative=True)
     index_prefix(controller, pool, SUPERVISOR, [2])
 
@@ -374,9 +409,7 @@ def test_an_old_prefetch_is_still_protected():
     controller.maybe_tick()
 
     assert pool.queue_ids()[0] == 2, "the aged prefetch must still not go first"
-    assert controller.get_value(RESEARCH).score > controller.get_value(
-        SUPERVISOR
-    ).score
+    assert controller.get_value(RESEARCH) > controller.get_value(SUPERVISOR)
 
 
 def test_confirm_on_touch_clears_the_stamp():
@@ -544,10 +577,21 @@ def test_tick_skips_when_nothing_changed():
 
 
 def test_config_rejects_a_floor_below_the_score_range():
+    """A floor between 0 and delta_cold protects some keys and not others —
+    a silent partial policy. 0 is exempt because it means "no floor"."""
     with pytest.raises(ValueError):
         NodeEvictionConfig(
             enabled=True, speculative_floor_high=1.0
         ).validate()
+    with pytest.raises(ValueError):
+        NodeEvictionConfig(
+            enabled=True, speculative_floor_high=-1.0
+        ).validate()
+
+
+def test_config_accepts_the_floor_switched_off():
+    NodeEvictionConfig(enabled=True, speculative_floor_high=0.0).validate()
+    assert NodeEvictionConfig().speculative_floor_high == 0.0
 
 
 def test_config_rejects_a_cold_miss_cheaper_than_l1():

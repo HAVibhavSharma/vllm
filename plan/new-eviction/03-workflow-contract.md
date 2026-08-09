@@ -144,7 +144,7 @@ Fetched once per job and cached; never re-read unless the job is new.
 | `node_name` | string | join |
 | `call_type` | string | join |
 | `prob` | float | P(this `(node, call_type)` fires again **at all** this job). **Time-free** — must not encode "soon". The engine applies its own time discount to `time_to_next_call`; encoding timing here applies it twice (05 §5.2). |
-| `time_to_next_call` | duration | *When*, given that it fires. Second importance term, and the **TTL of the speculative protection floor** for prefetched blocks (02 §5). |
+| `time_to_next_call` | duration | *When*, given that it fires. Second importance term. It was also the TTL of the speculative protection floor; that decay is gone (12 §5.5) and the floor itself is now off by default (12 §6), so this field only feeds the time discount. |
 | `update_ts` | timestamp | **Staleness gate.** Rows older than the cutoff are treated as unscored → neutral default → LRU behaviour. This is what makes a missed pub/sub message degrade instead of act on stale data. |
 
 One row per `(node, call_type)`. A node with several call types has several rows,

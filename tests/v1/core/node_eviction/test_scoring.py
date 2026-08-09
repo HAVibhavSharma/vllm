@@ -6,6 +6,8 @@ These are properties of the formula, checkable before any trace exists.
 Several of them encode failures the previous attempt actually shipped.
 """
 
+from dataclasses import replace
+
 import pytest
 
 from vllm.v1.core.node_eviction.config import NodeEvictionConfig
@@ -25,6 +27,10 @@ from vllm.v1.core.node_eviction.types import (
 )
 
 CONFIG = NodeEvictionConfig()
+# The floor is off in the shipped defaults, so every test that is about the
+# floor's *shape* has to opt back into it explicitly. 1e9 is the height it
+# used to default to.
+FLOOR_CONFIG = replace(CONFIG, speculative_floor_high=1e9)
 KEY = NodeKey("run-42", "research", "tavily:summary")
 
 
@@ -127,7 +133,7 @@ def test_bounded_above_by_delta_cold():
         CONFIG,
     )
     assert worst_case.score <= CONFIG.delta_cold_ms
-    assert CONFIG.speculative_floor_high > CONFIG.delta_cold_ms
+    assert FLOOR_CONFIG.speculative_floor_high > FLOOR_CONFIG.delta_cold_ms
 
 
 # -- invariant 7: deterministic, no clock reads -------------------------
@@ -185,10 +191,21 @@ def test_row_without_a_timestamp_is_stale():
 # -- the speculative floor (02 §5) --------------------------------------
 
 
+def test_the_floor_is_off_by_default():
+    """A prefetched prefix no longer outranks every real key. It is scored
+    from its own row like anything else, so a wrong prediction is demoted by
+    the ordinary decay instead of holding a sentinel until confirmation."""
+    assert CONFIG.speculative_floor_high == 0.0
+    assert speculative_floor(CONFIG) == 0.0
+
+    base = score_key(row(), 100, CONFIG)
+    assert apply_speculative_floor(base, CONFIG).score == base.score
+
+
 def test_floor_sits_above_the_whole_score_range():
-    assert speculative_floor(CONFIG) > CONFIG.delta_cold_ms
-    assert speculative_floor(CONFIG) == pytest.approx(
-        CONFIG.speculative_floor_high
+    assert speculative_floor(FLOOR_CONFIG) > FLOOR_CONFIG.delta_cold_ms
+    assert speculative_floor(FLOOR_CONFIG) == pytest.approx(
+        FLOOR_CONFIG.speculative_floor_high
     )
 
 
@@ -216,12 +233,12 @@ def test_the_floor_takes_no_clock():
 def test_floor_only_ever_protects():
     """`max`, not `+`: the floor never inflates a score, so a prefetch cannot
     contaminate the ranking it was supposed to serve."""
-    base = score_key(row(), 100, CONFIG)
-    protected = apply_speculative_floor(base, CONFIG)
+    base = score_key(row(), 100, FLOOR_CONFIG)
+    protected = apply_speculative_floor(base, FLOOR_CONFIG)
     assert protected.score > base.score
     assert protected.speculative
     assert protected.floor_applied == pytest.approx(
-        CONFIG.speculative_floor_high
+        FLOOR_CONFIG.speculative_floor_high
     )
 
 
@@ -229,8 +246,6 @@ def test_a_base_above_the_floor_wins():
     """The `max` has to be a real max, not an unconditional overwrite —
     otherwise a confirmed-then-re-prefetched key would be *demoted* to the
     floor."""
-    from dataclasses import replace
-
     config = replace(CONFIG, speculative_floor_high=1e-9)
     base = score_key(row(), 1, config)
     assert base.score > config.speculative_floor_high

@@ -161,6 +161,10 @@ def score_key(
 def speculative_floor(config: NodeEvictionConfig) -> float:
     """The soft pin on prefetched entries (02 §5 part 3).
 
+    **Returns 0 by default, i.e. no floor at all** — see
+    `config.speculative_floor_high`. The rest of this docstring describes the
+    behaviour when it is switched back on.
+
     Constant, and it does not expire. It sits above the top of the normal
     score range, so a prefetched prefix is never selected by the splice until
     a real prefix hit confirms it and the floor stops applying.

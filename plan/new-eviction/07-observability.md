@@ -69,7 +69,7 @@ a debug flag. This is the **decision** side.
   "score": 0.0141,
   "terms": {"prob": 0.85, "ttnc_ms": 60000, "decay": 0.33, "blocks": 1600},
   "speculative": false,
-  "floor_applied": null,        // 02 §5, when speculative
+  "floor_applied": null,        // 02 §5; null unless the floor is on, 12 §6
   "prefix_pos": 1487,           // position within the node's prefix
   "run_len": 1600,              // to check tail-first, Rule 3
   "rank_in_splice": 12,

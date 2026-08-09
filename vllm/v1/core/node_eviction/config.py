@@ -55,16 +55,31 @@ class NodeEvictionConfig:
     pub/sub message degrades to LRU rather than acting on stale data."""
 
     # --- Speculative floor (02 §5) ----------------------------------------
-    speculative_floor_high: float = 1e9
-    """Height of the floor on prefetched (speculative) entries. Must sit
-    above the top of the normal score range so a prefetched prefix is
-    protected against everything.
+    speculative_floor_high: float = 0.0
+    """Height of the floor on prefetched (speculative) entries, or **0 to
+    turn the floor off**, which is now the default.
 
-    Constant and non-expiring. `speculative_floor_low`,
-    `speculative_default_ttl_ms` and `speculative_hard_drop_ttl_multiple`
-    are gone with the decay — see `scoring.speculative_floor` for why. A
-    speculative entry now holds this score until a real prefix hit confirms
-    it, or until `index_hard_drop_age_ms` drops the entry."""
+    When on it must sit above `delta_cold_ms`, the top of the normal score
+    range, so a prefetched prefix is protected against everything.
+
+    **Off by default.** At 1e9 a prefetched key outranked every real key by
+    ~87,000x, and because `_splice` takes `max` over a block's owners, one
+    phantom whose prefix shared a system preamble lifted that preamble out
+    of the candidate set for every node sharing it. The policy's evictions
+    were then concentrated entirely on real, confirmed blocks — the floor
+    was buying protection for predictions by spending it on observations.
+    Nothing demoted a wrong prediction either (`scoring.speculative_floor`),
+    so with a bimodal forecast the waste compounded.
+
+    With the floor off a speculative entry is scored like any other: from
+    its forecast row if it has one, and not at all if it does not, in which
+    case it keeps its LRU position (Rule 2). Provenance is untouched —
+    `entry.speculative` is still stamped and `speculative_waste` still
+    measures whether the prefetch half is worth running, which is the number
+    to watch after this change.
+
+    Set back to a value above `delta_cold_ms` (1e9 was the old default) to
+    A/B against the protected behaviour."""
 
     # --- Prefetch origination (02 §4, step 6) -----------------------------
     prefetch_wants_enabled: bool = False
@@ -419,12 +434,18 @@ class NodeEvictionConfig:
                 "delta_cold_ms must be >= delta_l1_ms; a cold prefill cannot "
                 "be cheaper than an L1 reconstruct"
             )
-        if self.speculative_floor_high < self.delta_cold_ms:
+        if self.speculative_floor_high < 0.0:
+            raise ValueError("speculative_floor_high must be >= 0")
+        if 0.0 < self.speculative_floor_high < self.delta_cold_ms:
             # Invariant 6 in 08 §5: scores are bounded above by delta_cold,
-            # so a floor below it would not actually protect anything.
+            # so a floor below it would not actually protect anything. 0 is
+            # exempt because it means "no floor" rather than "a floor that
+            # does nothing" — the difference matters, since a floor between
+            # 0 and delta_cold protects some keys and not others, which is
+            # a silent partial policy rather than a switch.
             raise ValueError(
-                "speculative_floor_high must exceed delta_cold_ms so the "
-                "floor sits above the whole score range"
+                "speculative_floor_high must be 0 (off) or exceed "
+                "delta_cold_ms so the floor sits above the whole score range"
             )
         if not 0.0 <= self.prefetch_min_prob <= 1.0:
             raise ValueError("prefetch_min_prob must be a probability in [0, 1]")

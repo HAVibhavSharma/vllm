@@ -436,13 +436,13 @@ without a rebuild:
 ```json
 {
   "tau_ms": 30000,
-  "splice_max_blocks": 256,
+  "splice_max_blocks": 4096,
   "tick_period_ms": 250,
   "fresh_skip_threshold": 0,
   "staleness_cutoff_ms": 120000,
   "delta_l1_ms": 380,
   "delta_cold_ms": 11400,
-  "speculative_default_ttl_ms": 30000,
+  "speculative_floor_high": 0,
   "use_call_type": true
 }
 ```
@@ -482,8 +482,13 @@ question answered before the engine work, not after.
 ## 10. What this does and does not do at this state
 
 **Does:** reorders the free-block queue so low-value prefixes are evicted
-first, protects prefetched prefixes with a decaying floor, and degrades to
-plain LRU when Redis is down, the forecast is stale, or a key is unscored.
+first, scores prefetched prefixes from their own forecast row like any other
+key, and degrades to plain LRU when Redis is down, the forecast is stale, or
+a key is unscored.
+
+The protection floor on prefetched prefixes is **off by default** as of
+2026-08-09 (12 §6); set `speculative_floor_high` above `delta_cold_ms` to
+turn it back on.
 
 **Does not:**
 
@@ -499,17 +504,19 @@ plain LRU when Redis is down, the forecast is stale, or a key is unscored.
   `BackgroundVLLMAgentWorker` → `warm_agent_prefixes()`, gated on
   `vllm_agent_enabled()`. **Those phantoms carry no `job_id`, so they are
   invisible to the policy** — `node_key_for_request` returns None and nothing
-  is stamped speculative. So with prefetch left off, the decaying floor,
-  `speculative_floor_high` / `_low`, `speculative_default_ttl_ms` and
-  `speculative_hard_drop_ttl_multiple` are all inert and
-  `index_speculative_keys` / `speculative_waste` stay 0. The drainer's
-  phantoms *do* carry identity, which is what makes the floor reachable at
-  all — turning the drain on is the only way to exercise it.
+  is stamped speculative. So with prefetch left off, `speculative_floor_high`
+  is inert and `index_speculative_keys` / `speculative_waste` stay 0. The
+  drainer's phantoms *do* carry identity, which is what makes the speculative
+  path reachable at all — turning the drain on is the only way to exercise
+  it. (`speculative_floor_low`, `speculative_default_ttl_ms` and
+  `speculative_hard_drop_ttl_multiple` no longer exist — 12 §5.5.)
 - **Consult the value table per request.** `get_node_value` is implemented and
   has zero callers, so the O(1) read path from 02 §2 is dead code today. Note
   step 6 did **not** need it: the want-list reads the forecast directly, and
-  the diagram's "evict others in order of least value except this" is served
-  by the splice plus the speculative floor (09 §5.4).
+  the diagram's "evict others in order of least value" is served by the
+  splice (09 §5.4). The "except this" clause was the speculative floor and is
+  gone with it — a prefetched prefix is now protected by its own score or not
+  at all (12 §6).
 - **Demote to L1 instead of destroying.** Step 7 is unbuilt and gated on
   measuring `p_cold` first.
 - **Export Prometheus metrics.** Counters exist behind

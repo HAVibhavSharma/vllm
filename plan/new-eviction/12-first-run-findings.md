@@ -279,6 +279,10 @@ this cannot strand a block the way a `ref_cnt` pin with a lost release would.
 If the forecast is wrong often, the cost now shows up as real blocks evicted
 to protect useless ones, and `waste=` is where it will be visible.
 
+**That trade came due — see §6.** The floor is off by default as of
+2026-08-09; the rest of this section describes the behaviour you get by
+setting `speculative_floor_high` back above `delta_cold_ms`.
+
 ### 5.6 The staged region was two blocks deep
 
 The splice never blocks an eviction — `get_new_blocks` stays an unmodified
@@ -324,3 +328,119 @@ on the prefetch line: with `--max-num-seqs 1` a phantom that misses in
 LMCache is a full prefill serialized ahead of real traffic. Read it against
 `staged`/`deficit` — a good forecast that governs 2 blocks of queue and a bad
 forecast that governs 9,000 look identical in `hit_rate` alone.
+
+---
+
+## 6. The speculative floor is off by default (2026-08-09)
+
+`speculative_floor_high` now defaults to **0.0**, which means no floor at
+all. §5.5 removed the floor's decay and named what that traded away —
+"nothing demotes a wrong prediction any more" — and the next run showed the
+bill.
+
+### 6.1 What was observed
+
+| Metric | baseline (LRU) | policy |
+|---|---|---|
+| Total prompt (prefill) tokens | ~275,700 | ~440,100 |
+
+Regret was high on the same run. **Both numbers need qualifying before they
+are used as evidence**, and neither qualification changes the decision:
+
+- The prefill figure is `num_prompt_tokens`, which counts cached tokens too
+  (`stats.py`, `PrefillStats.set`). It is a sum over *requests*, and the
+  policy arm submits phantom prefetches as additional requests, so a large
+  part of the delta is phantom prompt length rather than extra compute. The
+  number that settles it is `num_computed_tokens` split by the
+  `prefetch_only` column in the `FileStatLogger` CSV. That split had not been
+  taken when this change was made.
+- The regret figure is inflated by a **measurement loop that is still open**
+  (§6.4).
+
+The decision rests on the mechanism below rather than on either figure.
+
+### 6.2 Why the floor was the wrong shape
+
+Two properties compounded:
+
+**Magnitude.** `1e9` against a score range bounded above by
+`delta_cold_ms = 11_400` (invariant 6) is ~87,000x the top of the honest
+range. That is not a tie-break in favour of predictions; it is a total order
+with every prediction above every observation.
+
+**Reach.** `_splice` takes `max` over a block's owning keys (01 §4), so a
+block co-owned by a speculative key and a real one inherits the floor. A
+phantom whose prefix starts with the shared system preamble therefore floors
+that preamble for *every* node that shares it. The protected set is much
+larger than the prefetched set, and grows with exactly the prefix sharing the
+policy exists to exploit.
+
+Together: the policy's evictions concentrate on real, confirmed blocks —
+protection for predictions, paid for out of observations. With the forecast
+still bimodal (~58% of rows at the `prob=0.01` floor, §2) and nothing
+demoting a wrong prediction, the waste compounds instead of self-correcting.
+
+### 6.3 What replaces it
+
+Nothing. A speculative key is scored like any other key:
+
+- It has a forecast row → normal `score = prob · decay · E_miss / blocks`.
+  Guaranteed to exist for anything the want-list originated, since
+  `_rebuild_want_list` iterates the snapshot's own rows.
+- It has no row → absent from the value table, unscored, keeps its LRU
+  position (Rule 2). Identical to how a *real* rowless key is treated. This
+  is a change: the floor path used to manufacture a table row with a
+  synthetic `score=0.0` base for these.
+
+Worked example, both at 1 block: a phantom at `prob=0.01, ttnc=30s` scores
+**0.9**; a real key at `prob=0.9, ttnc=1s` scores **156.8**. The phantom is
+the first victim where before it was the last.
+
+**Provenance is untouched.** `entry.speculative` is still stamped at insert,
+`on_prefix_hit` still confirms, and `on_block_evicted` reads provenance from
+the index rather than from the score breakdown — so `speculative_waste`
+survives the floor's removal and is the number to watch, exactly as §5.5
+said.
+
+**A/B.** Set `speculative_floor_high` above `delta_cold_ms` (1e9 was the old
+default) to restore the protected behaviour. The validator rejects a value
+strictly between 0 and `delta_cold_ms`: such a floor protects some keys and
+not others, which is a silent partial policy rather than a switch.
+
+### 6.4 Still open — the regret counter measures its own prefetches
+
+`on_prefix_hit` calls `observer.record_admission(key)` **above** the
+`_is_prefetch_only` early return, so a phantom prefetch registers as demand
+for its own key. The prefetcher only wants keys that are not resident — i.e.
+keys we just evicted from — which closes a loop:
+
+```
+evict a block of K  →  coverage drops below prefetch_min_coverage
+                    →  want K  →  phantom for K  →  partial prefix hit
+                    →  record_admission(K)  →  that eviction is regret
+```
+
+Moving the `record_admission` call below the phantom gate is a one-line fix.
+It is *not* in this change, so any regret figure measured before it lands is
+an upper bound. `prefetch_min_coverage=1.0` makes the loop maximally tight:
+the splice is deliberately tail-first (Rule 3), and shaving one block off a
+900-block prefix is enough to drop coverage below 1.0.
+
+### 6.5 What to watch next
+
+A fresh prefetch is now the **largest denominator** in the density
+`score = … / num_blocks`, so a just-landed 900-block prefix ranks low even
+when the forecast that fetched it was strong. If prefetched prefixes start
+being evicted before their predicted call, the fix is to score *unconfirmed*
+entries with `num_blocks = 1` — the undivided `prob · decay · E_miss` form
+that `_rebuild_want_list` already uses for the fetch decision, on the
+reasoning that a big prefix is more worth holding, not less — rather than
+reinstating a sentinel.
+
+Two gates that would cut phantom volume at the source remain off and are
+worth trying before anything else here: `prefetch_min_prob` (0.0) and
+`prefetch_horizon_ms` (0.0), both disabled in §5.3 on the grounds that a
+binary signal cannot *rank*. It cannot — but it can *admit*, and the arm it
+admits (`prob=1.0`, ~22% of rows) is the one the forecast is confident about.
+On the 3600s arm the discount is `30_000/3_630_000 ≈ 0.008`, so those wants
+are warming prefixes due in an hour by evicting blocks due in a minute.
