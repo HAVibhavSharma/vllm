@@ -73,6 +73,8 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
 | `hit_rate` | Prefix-cache hit rate **in tokens**, since boot | same |
 | `hit_rate_win` | Same, this window only | same |
 | `hit_tokens` / `query_tokens` | The raw numerator and denominator | same |
+| `phantom_hit_rate` | Hit rate of prefetch phantoms only, excluded from every rate above | always `0.0000` |
+| `phantom_query_tokens` | Tokens looked up by phantoms — the prefill origination bought | always `0` |
 | `remat_blocks` | **Movement.** Blocks cached again after being evicted | same |
 | `remat_mb` | The same in MB of KV rebuilt | same |
 | `remat_ratio` | `remat_blocks / blocks_cached` | same |
@@ -93,9 +95,62 @@ Counted independently of `PrefixCacheStats`, deliberately. That object is
 make the line's hit rate depend on whether something else was scraping — and
 on `log_stats` being on at all.
 
+**And counted once per request, not once per scheduling attempt.** The
+scheduler calls `get_computed_blocks` on every step a request spends in the
+waiting queue — `sched/scheduler.py`, guarded only by
+`num_computed_tokens == 0` — so counting per call yields a hit rate weighted
+by queueing delay, which is set by the very eviction pressure the line exists
+to measure. It biases against whichever arm queues more. On the 2026-08-09
+run this produced **779,478,224 query tokens against ~440,000 real prompt
+tokens**, a factor of ~1771, with one 33-second window contributing 87.9M.
+`Request.cache_query_counted` now gates it, identically on both branches.
+
+The `preempted` split is unaffected: it covers genuine re-queries after
+preemption, where `num_computed_tokens > 0`, and those still deserve
+exclusion. Note that the 2026-08-09 run had `query_tokens_fresh ==
+query_tokens` exactly — the re-queries were *not* preemptions, which is why
+that filter never caught them.
+
+One consequence: `hit_rate_fresh` no longer reconciles with vLLM's own
+`Prefix cache hit rate` line. Upstream's counter is left counting every call
+so it stays comparable to stock vLLM; ours is the corrected one. Expect the
+two to disagree, and by a wide margin under queueing.
+
 `hit_rate_win` exists because a cumulative rate over a multi-hour run is
 dominated by whatever the workload did in its first ten minutes. When the
 question is "is it better *now*", the cumulative figure cannot answer it.
+
+### 2.1.1 Phantoms are excluded, not discarded
+
+A phantom prefetch queries the prefix cache like anything else, so until this
+was fixed it landed in both numerator and denominator. That is worse than
+noise, because the sign is not consistent: a phantom's first prefill is a
+near-total miss that *deflates* the rate, while a phantom for an
+already-resident prefix is a large hit no user ever experienced and it
+*inflates* it. The baseline this line exists to be diffed against originates
+no phantoms at all, so either direction shows up as a policy difference that
+never happened.
+
+`KVCacheManager.get_computed_blocks` now passes the `Request` through to
+`on_cache_query`, which routes it with the same `_is_prefetch_only` test
+`on_blocks_cached` and `on_prefix_hit` already use. Phantom tokens go to
+`phantom_hit_rate` / `phantom_query_tokens` and touch nothing else.
+
+Read `phantom_hit_rate` as a *cost* line, not a success line. High means the
+residency test admitted a want for a prefix HBM still held and the phantom
+bought nothing; low with a large `phantom_query_tokens` means real prefills
+the policy chose to run — which with `--max-num-seqs 1` are serialized ahead
+of real traffic (`new-eviction/12-first-run-findings.md` §5.6).
+
+### 2.1.2 `reset_prefix_cache` zeroes the rates
+
+It used to clear only the rematerialisation ring, so token counts survived a
+cache wipe and went on describing a cache that no longer existed — visible as
+a first post-reset run whose hit rate was really the previous run's. All
+counters now reset together. This also matches upstream, where
+`CachingMetrics.observe` resets its own aggregation on `stats.reset`
+(`vllm/v1/metrics/stats.py:68`); without it the two figures were permanently
+out of step after the first reset.
 
 ### 2.2 `remat_*` is the movement number — read this before quoting it
 

@@ -234,6 +234,17 @@ class CacheMovementTracker:
     The evicted-hash ring is what bounds the memory. A block evicted more
     than one full pool turnover ago is not something the policy is still
     responsible for, so the window defaults to the pool size.
+
+    **Phantom prefetches are counted separately, never in the headline
+    rates.** A phantom queries the prefix cache like any other request, so
+    left alone it lands in both numerator and denominator — and not with a
+    consistent sign: its first prefill is a near-total miss that deflates the
+    rate, while a phantom for an already-resident prefix is a large hit no
+    user ever experienced. Since the whole point of the line is a field-by-
+    field diff against an LRU baseline that originates no phantoms, mixing
+    them breaks the comparison it exists to serve. `phantom_hit_rate` keeps
+    the number visible, because a phantom that misses is a full prefill
+    serialized ahead of real traffic (12 §5.6).
     """
 
     def __init__(self, window_blocks: int, block_size_bytes: int = 0) -> None:
@@ -246,6 +257,16 @@ class CacheMovementTracker:
         self._evicted: deque = deque()
         self._evicted_set: set = set()
 
+        self._reset_totals()
+
+    def _reset_totals(self) -> None:
+        """Zero everything measured, leaving the configuration alone.
+
+        Shared by `__init__` and `on_reset` so a counter added to one cannot
+        silently go missing from the other — the failure mode there is a
+        number that survives a cache wipe and quietly describes a cache that
+        no longer exists.
+        """
         self.remat_blocks = 0
         self.blocks_cached = 0
         self.hit_tokens = 0
@@ -262,10 +283,23 @@ class CacheMovementTracker:
         # a long run is dominated by whatever the workload did first.
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
+        # Phantom prefetch traffic, kept out of every rate above.
+        self.phantom_hit_tokens = 0
+        self.phantom_query_tokens = 0
 
     def on_cache_query(
-        self, num_tokens: int, num_hits: int, preempted: bool = False
+        self,
+        num_tokens: int,
+        num_hits: int,
+        preempted: bool = False,
+        phantom: bool = False,
     ) -> None:
+        if phantom:
+            # Deliberately the only bucket a phantom touches: it is warming
+            # work the policy originated, not demand the cache served.
+            self.phantom_query_tokens += num_tokens
+            self.phantom_hit_tokens += num_hits
+            return
         self.query_tokens += num_tokens
         self.hit_tokens += num_hits
         self.window_query_tokens += num_tokens
@@ -307,6 +341,14 @@ class CacheMovementTracker:
         # work, not redone work.
         self._evicted.clear()
         self._evicted_set.clear()
+        # And the rates go with it. `reset_prefix_cache` is only ever invoked
+        # explicitly, which in practice means "start a clean measurement", so
+        # tokens counted against the old cache must not carry into the new
+        # one. This mirrors upstream: `CachingMetrics.observe` calls its own
+        # `reset()` on `stats.reset` (`v1/metrics/stats.py:68`), so leaving
+        # these standing would also put the two numbers permanently out of
+        # step after the first reset.
+        self._reset_totals()
 
     @property
     def hit_rate(self) -> float:
@@ -316,7 +358,7 @@ class CacheMovementTracker:
 
     @property
     def hit_rate_fresh(self) -> float:
-        """Comparable to vLLM's `Prefix cache hit rate` log line.
+        """Demand-side hit rate: first scheduling of each request only.
 
         A preempted request re-queries with a `num_tokens` that has grown to
         include what it already generated, so counting those re-queries
@@ -324,9 +366,16 @@ class CacheMovementTracker:
         `PrefixCacheStats` routes them to its `preempted_*` fields and
         `CachingMetrics.observe` ignores those entirely; this mirrors that.
 
-        Still not identical: vLLM's figure is a sliding window over the most
-        recent 1000 requests, this one is cumulative since boot. Expect the
-        same ballpark, not the same digits.
+        **Deliberately no longer comparable to vLLM's `Prefix cache hit rate`
+        line.** That one counts every call to `get_computed_blocks`, and the
+        scheduler makes one per step for as long as a request sits in the
+        waiting queue — so its denominator is weighted by queueing delay,
+        which eviction pressure itself sets. Measured on the 2026-08-09 run
+        that came to 779M query tokens against ~440k real prompt tokens, a
+        factor of ~1771. The caller now counts each request once
+        (`Request.cache_query_counted`); upstream's counter is left alone so
+        it stays comparable to stock vLLM. Expect the two numbers to differ,
+        and expect this one to be the meaningful one.
         """
         if self.query_tokens_fresh == 0:
             return 0.0
@@ -337,6 +386,20 @@ class CacheMovementTracker:
         if self.window_query_tokens == 0:
             return 0.0
         return self.window_hit_tokens / self.window_query_tokens
+
+    @property
+    def phantom_hit_rate(self) -> float:
+        """How often origination fetched something already there.
+
+        High is not good here: it means the residency test admitted a want
+        for a prefix HBM still held, and the phantom bought nothing. Low with
+        a large `phantom_query_tokens` is the expensive case — real prefills
+        the policy chose to run. Either way it belongs next to the real rate,
+        not inside it.
+        """
+        if self.phantom_query_tokens == 0:
+            return 0.0
+        return self.phantom_hit_tokens / self.phantom_query_tokens
 
     @property
     def remat_mb(self) -> float:
@@ -368,6 +431,9 @@ class CacheMovementTracker:
             "query_tokens": self.query_tokens,
             "hit_tokens_fresh": self.hit_tokens_fresh,
             "query_tokens_fresh": self.query_tokens_fresh,
+            "phantom_hit_rate": self.phantom_hit_rate,
+            "phantom_hit_tokens": self.phantom_hit_tokens,
+            "phantom_query_tokens": self.phantom_query_tokens,
             "remat_blocks": self.remat_blocks,
             "remat_mb": self.remat_mb,
             "remat_ratio": self.remat_ratio,

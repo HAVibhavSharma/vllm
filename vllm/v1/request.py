@@ -166,6 +166,16 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Whether this request's prefix-cache lookup has already been counted
+        # by the HBM instrumentation. The scheduler calls
+        # `get_computed_blocks` on every step a request spends in the waiting
+        # queue (`sched/scheduler.py`, guarded only by
+        # `num_computed_tokens == 0`), so counting per call makes the hit rate
+        # weighted by queueing delay — which eviction pressure itself
+        # determines. Carried on the request rather than in a side table so it
+        # needs no cleanup: it dies with the request.
+        self.cache_query_counted = False
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []

@@ -331,7 +331,11 @@ class NodeEvictionController:
         return blocks[block_id].block_hash
 
     def on_cache_query(
-        self, num_tokens: int, num_hits: int, preempted: bool = False
+        self,
+        num_tokens: int,
+        num_hits: int,
+        preempted: bool = False,
+        request=None,
     ) -> None:
         """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
 
@@ -339,10 +343,16 @@ class NodeEvictionController:
         object is drained by whoever polls the metrics loggers — reading it
         would make these numbers depend on whether anything else was
         scraping, and on `log_stats` being on at all.
+
+        `request` is optional and used only to tell a phantom prefetch from
+        real demand, the same discrimination `on_blocks_cached` and
+        `on_prefix_hit` already make. Deriving it here rather than at the
+        call site keeps the notion of a phantom inside this package.
         """
         if not self.enabled:
             return
-        self.movement.on_cache_query(num_tokens, num_hits, preempted)
+        phantom = request is not None and _is_prefetch_only(request)
+        self.movement.on_cache_query(num_tokens, num_hits, preempted, phantom)
 
     def on_reset_prefix_cache(self) -> None:
         if not self.enabled:
@@ -741,6 +751,11 @@ class NodeEvictionController:
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
             f"query_tokens_fresh={m.query_tokens_fresh} "
+            # Phantom traffic, excluded from every rate above. Reported so
+            # the prefill origination bought is visible next to the hit rate
+            # it was meant to raise, rather than hidden inside it.
+            f"phantom_hit_rate={m.phantom_hit_rate:.4f} "
+            f"phantom_query_tokens={m.phantom_query_tokens} "
             f"remat_blocks={m.remat_blocks} "
             f"remat_mb={m.remat_mb:.1f} "
             f"remat_ratio={m.remat_ratio:.4f} "
@@ -773,6 +788,11 @@ class NodeEvictionController:
             c.evictions_total,
             c.evictions_by_score_total,
             self.movement.query_tokens,
+            # Phantom queries no longer move `query_tokens`, so without this
+            # a window of pure origination activity would compare equal and
+            # print nothing — origination invisible exactly when it is doing
+            # the most work.
+            self.movement.phantom_query_tokens,
             self.movement.remat_blocks,
         )
         if fingerprint == self._last_hbm_fingerprint:

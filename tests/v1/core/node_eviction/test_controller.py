@@ -697,6 +697,96 @@ def test_windowed_hit_rate_resets_but_cumulative_does_not():
     assert float(fields["hit_rate"]) == 0.5
 
 
+def test_a_phantom_lookup_is_not_counted_as_demand():
+    """A phantom is work the policy originated, not work the cache served.
+
+    Counting it does not merely add noise, it adds noise with no consistent
+    sign: the miss below would drag the rate to 0.5 while a phantom for an
+    already-resident prefix would push it to 1.0. The baseline this line is
+    diffed against originates nothing, so either direction is a false
+    difference attributed to the policy.
+    """
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=100, num_hits=100)
+    controller.on_cache_query(
+        num_tokens=100, num_hits=0, request=make_request(prefetch_only=True)
+    )
+
+    m = controller.movement
+    assert m.hit_rate == 1.0
+    assert m.hit_rate_fresh == 1.0
+    assert m.window_hit_rate == 1.0
+    assert m.query_tokens == 100
+
+
+def test_phantom_traffic_is_reported_rather_than_discarded():
+    """Dropping it would hide the prefill origination bought. With
+    `--max-num-seqs 1` a phantom that misses is a full prefill serialized
+    ahead of real traffic (12 §5.6), so it has to stay visible — just not
+    inside the number it was meant to improve."""
+    controller = make_controller(FakePool())
+    phantom = make_request(prefetch_only=True)
+    controller.on_cache_query(num_tokens=100, num_hits=25, request=phantom)
+
+    m = controller.movement
+    assert m.phantom_query_tokens == 100
+    assert m.phantom_hit_rate == 0.25
+    # No demand was ever observed, so the real rate has nothing to report.
+    assert m.query_tokens == 0
+    assert m.hit_rate == 0.0
+
+
+def test_a_request_with_no_transfer_params_is_demand():
+    """The overwhelmingly common path: `request` is passed on every query, so
+    the phantom test must not misfire on an ordinary request."""
+    controller = make_controller(FakePool())
+    controller.on_cache_query(
+        num_tokens=100, num_hits=50, request=make_request()
+    )
+    assert controller.movement.query_tokens == 100
+    assert controller.movement.phantom_query_tokens == 0
+
+
+def test_reset_prefix_cache_clears_the_hit_rate():
+    """The tokens described a cache that no longer exists.
+
+    `reset_prefix_cache` is only ever invoked explicitly, which in practice
+    means "start a clean measurement". Upstream agrees: `CachingMetrics`
+    resets its own aggregation on the same signal, so keeping these would
+    also put the two numbers permanently out of step after the first reset.
+    """
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=1_000, num_hits=1_000)
+    assert controller.movement.hit_rate == 1.0
+
+    controller.on_reset_prefix_cache()
+    assert controller.movement.query_tokens == 0
+    assert controller.movement.hit_rate == 0.0
+
+    controller.on_cache_query(num_tokens=100, num_hits=0)
+    assert controller.movement.hit_rate == 0.0, "the old tokens must not carry"
+
+
+def test_the_summary_line_prints_when_only_phantoms_ran():
+    """Phantom queries no longer move `query_tokens`, so the change gate has
+    to watch them too — otherwise origination goes silent exactly in the
+    window where it is doing all the work."""
+    controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
+    controller.on_cache_query(num_tokens=100, num_hits=100)
+    assert controller._maybe_log_hbm_summary(1_000_000.0) is not None
+
+    controller.on_cache_query(
+        num_tokens=500, num_hits=0, request=make_request(prefetch_only=True)
+    )
+    line = controller._maybe_log_hbm_summary(2_000_000.0)
+    assert line is not None
+    fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
+    assert fields["phantom_query_tokens"] == "500"
+    assert float(fields["phantom_hit_rate"]) == 0.0
+    # The real rate is untouched by the phantom.
+    assert float(fields["hit_rate"]) == 1.0
+
+
 def test_a_first_time_prefix_is_not_movement():
     """The number must credit the policy only for work it made us redo. A
     prefix the server has never seen is not that."""

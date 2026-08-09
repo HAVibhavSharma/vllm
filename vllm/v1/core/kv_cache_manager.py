@@ -240,7 +240,16 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
-        if self.node_eviction is not None:
+        if self.node_eviction is not None and not request.cache_query_counted:
+            # Once per request, not once per scheduling attempt. The block
+            # above runs on every step this request spends in the waiting
+            # queue, so counting each call makes the rate weighted by
+            # queueing delay rather than by tokens — and queueing delay is
+            # set by the eviction pressure this line exists to measure.
+            # `prefix_cache_stats` above is deliberately left counting every
+            # call: it is upstream's, and diverging would make the fork's
+            # figure incomparable to stock vLLM's.
+            request.cache_query_counted = True
             # Tracked separately from `prefix_cache_stats`, which whoever
             # polls the metrics loggers drains on read — sharing it would
             # make the summary line's hit rate depend on whether anything
@@ -249,6 +258,9 @@ class KVCacheManager:
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
+                # Lets the tracker route a phantom prefetch's own lookup out
+                # of the headline hit rate.
+                request=request,
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
