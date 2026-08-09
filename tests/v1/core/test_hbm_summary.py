@@ -9,6 +9,8 @@ and the attribution of each eviction to a `job_id:node`.
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.v1.core.hbm_summary import HBMSummaryLogger, node_label_for_request
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
@@ -32,6 +34,10 @@ EXPECTED_FIELDS = [
     "hit_rate",
     "hit_rate_fresh",
     "hit_rate_win",
+    "ttft_ms",
+    "ttft_win_ms",
+    "ttft_p95_ms",
+    "ttft_n",
     "hit_tokens",
     "query_tokens",
     "query_tokens_fresh",
@@ -412,3 +418,51 @@ def test_preempted_requeries_are_excluded_from_hit_rate_fresh():
     assert float(fields["hit_rate_fresh"]) == 0.5
     assert int(fields["query_tokens_fresh"]) == 100
     assert int(fields["query_tokens"]) == 1000
+
+
+def _ttft_request(arrival: float, first_token: float | None):
+    req = make_request()
+    req.arrival_time = arrival
+    req.first_token_ts = first_token
+    req.ttft_recorded = False
+    return req
+
+
+def test_ttft_is_recorded_once_per_request():
+    """`KVCacheManager.free` also runs on preemption, and a preempted request
+    keeps its original `first_token_ts`. Counting it twice would weight slow
+    requests by how often they were preempted. Must match the policy branch."""
+    logger = make_logger(FakePool())
+    req = _ttft_request(arrival=1000.0, first_token=1000.25)
+
+    logger.on_request_finished(req)
+    logger.on_request_finished(req)
+
+    assert logger.ttft_count == 1
+    assert logger.ttft_mean_ms == 250.0
+
+
+def test_a_request_with_no_first_token_contributes_nothing():
+    """Aborted before prefill finished — no prefill latency to attribute, and
+    a zero would drag the mean down."""
+    logger = make_logger(FakePool())
+    logger.on_request_finished(_ttft_request(1000.0, None))
+    assert logger.ttft_count == 0
+
+
+def test_ttft_p95_is_over_the_ring():
+    logger = make_logger(FakePool())
+    for ms in range(1, 101):
+        logger.on_request_finished(_ttft_request(0.0, ms / 1000.0))
+    assert logger.ttft_count == 100
+    assert logger.ttft_mean_ms == pytest.approx(50.5)
+    assert logger.ttft_p95_ms == pytest.approx(95.0)
+
+
+def test_the_summary_line_carries_ttft():
+    logger = make_logger(FakePool(), period_ms=10_000.0)
+    logger.on_request_finished(_ttft_request(1000.0, 1000.5))
+    fields = parse(logger.summary())
+    assert float(fields["ttft_ms"]) == 500.0
+    assert float(fields["ttft_win_ms"]) == 500.0
+    assert fields["ttft_n"] == "1"

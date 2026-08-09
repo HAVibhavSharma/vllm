@@ -463,6 +463,10 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if self.block_pool.hbm_summary is not None:
+            # The only layer holding the Request at teardown, so the only one
+            # that can read `first_token_ts`/`arrival_time` off it.
+            self.block_pool.hbm_summary.on_request_finished(request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

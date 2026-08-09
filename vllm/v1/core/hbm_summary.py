@@ -25,6 +25,7 @@ blocks" is not actionable; "9k of them belonged to job7:research" says the
 pressure has a source.
 """
 
+import math
 import os
 import time
 from collections import deque
@@ -106,6 +107,19 @@ class HBMSummaryLogger:
         # Not reset by `reset_prefix_cache`, matching the policy branch, where
         # the eviction counters live on `EvictionObserver` and survive it.
         self.evictions_total = 0
+
+        # Engine-side TTFT, in ms: `first_token_ts - arrival_time`, both
+        # stamped inside engine core. Deliberately not the front end's TTFT —
+        # that also carries front-end queueing and detokenization, neither of
+        # which an eviction policy can move, which dilutes the effect being
+        # measured. Mirrors `node_eviction/metrics.py::TTFTTracker`; the mean
+        # is exact and cumulative, the percentile comes from a bounded ring
+        # because retaining every sample is unbounded under load.
+        self._ttft_recent: deque = deque(maxlen=4096)
+        self.ttft_count = 0
+        self.ttft_total_ms = 0.0
+        self.ttft_window_count = 0
+        self.ttft_window_total_ms = 0.0
 
         self._reset_totals()
 
@@ -217,6 +231,55 @@ class HBMSummaryLogger:
         if not preempted:
             self.query_tokens_fresh += num_tokens
             self.hit_tokens_fresh += num_hits
+
+    def on_request_finished(self, request) -> None:
+        """`KVCacheManager.free` — the request is done with its blocks.
+
+        Called on preemption too, which is why the sample is gated on
+        `ttft_recorded`: a preempted request keeps its original
+        `first_token_ts`, so counting it twice would weight slow requests by
+        how often they were preempted.
+        """
+        if request.ttft_recorded:
+            return
+        first = getattr(request, "first_token_ts", None)
+        if first is None:
+            # Finished before producing a token — aborted. No prefill latency
+            # to attribute.
+            return
+        request.ttft_recorded = True
+        ttft_ms = (first - request.arrival_time) * 1000.0
+        if ttft_ms < 0.0:
+            # A non-monotonic wall clock can produce this. Dropping is right:
+            # a negative latency in the mean is worse than a missing sample.
+            return
+        self.ttft_count += 1
+        self.ttft_total_ms += ttft_ms
+        self.ttft_window_count += 1
+        self.ttft_window_total_ms += ttft_ms
+        self._ttft_recent.append(ttft_ms)
+
+    @property
+    def ttft_mean_ms(self) -> float:
+        if self.ttft_count == 0:
+            return 0.0
+        return self.ttft_total_ms / self.ttft_count
+
+    @property
+    def ttft_window_mean_ms(self) -> float:
+        if self.ttft_window_count == 0:
+            return 0.0
+        return self.ttft_window_total_ms / self.ttft_window_count
+
+    @property
+    def ttft_p95_ms(self) -> float:
+        """Over the retained ring, not the whole run."""
+        if not self._ttft_recent:
+            return 0.0
+        ordered = sorted(self._ttft_recent)
+        # Nearest-rank: the smallest sample at or above the 95th percentile.
+        idx = min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)
+        return ordered[max(idx, 0)]
 
     def on_reset_prefix_cache(self) -> None:
         # Every hash in the pool was just invalidated, so every claim here is
@@ -352,6 +415,13 @@ class HBMSummaryLogger:
             f"hit_rate={self.hit_rate:.4f} "
             f"hit_rate_fresh={self.hit_rate_fresh:.4f} "
             f"hit_rate_win={self.window_hit_rate:.4f} "
+            # Engine-side TTFT — what a miss cost, next to how often it
+            # happened. Hit rate alone cannot separate a policy that kept
+            # cheap-to-rebuild blocks from one that kept expensive ones.
+            f"ttft_ms={self.ttft_mean_ms:.1f} "
+            f"ttft_win_ms={self.ttft_window_mean_ms:.1f} "
+            f"ttft_p95_ms={self.ttft_p95_ms:.1f} "
+            f"ttft_n={self.ttft_count} "
             f"hit_tokens={self.hit_tokens} "
             f"query_tokens={self.query_tokens} "
             f"query_tokens_fresh={self.query_tokens_fresh} "
@@ -394,6 +464,8 @@ class HBMSummaryLogger:
             self.blocks_cached_total,
             self.query_tokens,
             self.remat_blocks,
+            # A window where only latency moved is still worth a line.
+            self.ttft_count,
         )
         if fingerprint == self._last_fingerprint:
             return None
@@ -406,6 +478,8 @@ class HBMSummaryLogger:
         self._evictions_by_key.clear()
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
+        self.ttft_window_count = 0
+        self.ttft_window_total_ms = 0.0
         return line
 
     def stats(self) -> dict[str, float | int]:
@@ -426,6 +500,10 @@ class HBMSummaryLogger:
             "hit_rate": self.hit_rate,
             "hit_rate_window": self.window_hit_rate,
             "hit_rate_fresh": self.hit_rate_fresh,
+            "ttft_ms": self.ttft_mean_ms,
+            "ttft_window_ms": self.ttft_window_mean_ms,
+            "ttft_p95_ms": self.ttft_p95_ms,
+            "ttft_n": self.ttft_count,
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
             "hit_tokens_fresh": self.hit_tokens_fresh,
