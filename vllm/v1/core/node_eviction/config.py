@@ -27,6 +27,29 @@ class NodeEvictionConfig:
     """Master switch. When False literally nothing in this package runs and
     the free queue behaves exactly as upstream."""
 
+    observe_only: bool = False
+    """Run the bookkeeping and the reporting, but never reorder the queue.
+
+    The A/B baseline arm. `VLLM_NODE_EVICTION_POLICY=0` gives *upstream*, not
+    a measurable baseline: with no controller there is no `kv_hbm` line, no
+    hit-rate or remat tracking, and nothing to diff the policy arm against
+    field by field — which is what that line exists for.
+
+    Set by `VLLM_NODE_EVICTION_OBSERVE=1`, which forces `enabled` on (so the
+    hooks fire), `splice_max_blocks` to 0 (so `_splice` returns on its first
+    line and eviction stays pure LRU `popleft`) and `prefetch_wants_enabled`
+    off (a baseline that originates prefills is not a baseline).
+
+    The value table is still rebuilt each tick, so the decision log records
+    what the policy *would* have done without it doing anything — the
+    counterfactual, on the same trace.
+
+    Not the same as `enabled=False`: observing costs real work in the hot
+    path (index maintenance per cached block, the evicted-hash ring, the
+    fresh-block counter on the free queue). That is why it is opt-in rather
+    than what flag-off does — "off" has to stay byte-identical to upstream or
+    the baseline measures the wrong thing."""
+
     # --- Identity (03 §1) -------------------------------------------------
     use_call_type: bool = True
     """Key the index at `(job_id, node, call_type)`. Set False if the
@@ -89,18 +112,32 @@ class NodeEvictionConfig:
     `VLLM_NODE_EVICTION_PREFETCH_DRAIN`, the same switch the front-end
     drainer reads, so the two halves cannot be turned on independently."""
 
-    prefetch_min_prob: float = 0.0
+    prefetch_min_prob: float = 0.5
     """Only forecast rows at least this likely become wants. The diagram's
     "admit/prefetch if the need for the cache is imminent" has two axes; this
     is the *will it happen* one.
 
-    **Defaults to 0.0 — off.** At 0.5 the gate admitted only the saturated
-    `prob=1.0` class (12 §2: ~58% of rows sit at the 0.01 floor and ~22% at
-    1.0, with almost nothing between), so it was not selecting likely rows,
-    it was selecting *one arm of a broken binary signal*. Until
-    `reach_probabilities()` produces gradation (12 §4) a probability gate
-    cannot rank anything, and gating on it only suppresses want volume. Set
-    it back above 0 once the forecast is fractional."""
+    **Defaults to 0.5 — on, as of 2026-08-10.** It was 0.0 (off) on the
+    argument that with ~58% of rows at the `prob=0.01` floor and ~22% at 1.0
+    and almost nothing between (12 §2), a probability gate is not selecting
+    likely rows, it is selecting one arm of a broken binary signal — so it
+    "cannot rank anything and only suppresses want volume".
+
+    Both halves of that turned out to be the wrong way round:
+
+    - A binary signal cannot **rank**, but this gate does not rank; it
+      **admits**. Admission is exactly the job a binary classifier can do,
+      and 12 §1 measured which arm to keep: the saturated `prob=1.0` class
+      comes back 54.7% of the time against 24.3% for the floored class. The
+      arm this gate selects is the valuable one.
+    - "Only suppresses want volume" was the goal, not the objection. With
+      the gate off a real run produced **13,464 wants and 41 satisfied**
+      (0.3%), because every floored row became a want on every tick.
+
+    Anything in `(0.01, 1.0]` gives the same partition while the forecast
+    stays bimodal; 0.5 is the natural line and leaves room if
+    `reach_probabilities()` is ever made fractional (12 §4). Set to 0.0 to
+    restore the unfiltered behaviour."""
 
     prefetch_horizon_ms: float = 0.0
     """...and this is the *when* axis. A node predicted 10 minutes out is
@@ -401,6 +438,17 @@ class NodeEvictionConfig:
         # the engine half on by itself would accumulate wants nobody submits
         # — which reads as a broken forecast, not a config mistake.
         cfg.prefetch_wants_enabled = bool(envs.VLLM_NODE_EVICTION_PREFETCH_DRAIN)
+
+        if envs.VLLM_NODE_EVICTION_OBSERVE:
+            # Last, so it wins over both the JSON file and the switches
+            # above. Observe mode is a claim about the *whole* run — "this
+            # arm changes nothing" — and a file that could re-enable the
+            # splice underneath it would produce a baseline that silently
+            # is not one.
+            cfg.observe_only = True
+            cfg.enabled = True
+            cfg.splice_max_blocks = 0
+            cfg.prefetch_wants_enabled = False
 
         return cfg
 

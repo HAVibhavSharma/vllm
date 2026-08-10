@@ -1243,3 +1243,81 @@ def test_the_summary_line_carries_ttft():
     assert float(fields["ttft_ms"]) == 500.0
     assert float(fields["ttft_win_ms"]) == 500.0
     assert fields["ttft_n"] == "1"
+
+
+# -- observe-only (the A/B baseline arm) ----------------------------------
+
+
+def test_observe_only_reports_itself_as_the_baseline_variant():
+    """`VLLM_NODE_EVICTION_POLICY=0` gives upstream, not a measurable
+    baseline: no controller means no `kv_hbm` line to diff against. Observe
+    mode keeps the line and labels it so the two arms are distinguishable in
+    the field the timeline tool keys on."""
+    controller = make_controller(FakePool(num_blocks=16), observe_only=True)
+    fields = dict(
+        part.split("=", 1)
+        for part in controller.hbm_summary().split()
+        if "=" in part
+    )
+    assert fields["variant"] == "baseline"
+    assert controller.stats()["observe_only"] is True
+
+
+def test_a_disabled_splice_is_labelled_baseline_too():
+    """`splice_max_blocks: 0` in the JSON is behaviourally the same arm, and
+    used to report itself as `node_eviction`."""
+    controller = make_controller(FakePool(num_blocks=16), splice_max_blocks=0)
+    assert "variant=baseline " in controller.hbm_summary()
+
+
+def test_observe_only_never_reorders_the_queue():
+    """The whole claim of the arm. Same rows that make the policy splice in
+    `test_the_worst_scoring_block_is_moved_to_the_head`, but nothing moves."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.01, time_to_next_call_ms=600_000.0),
+            SUPERVISOR: dict(prob=0.99, time_to_next_call_ms=100.0),
+        }
+    )
+    controller = make_controller(pool, rows, observe_only=True)
+    index_prefix(controller, pool, RESEARCH, [1])
+    index_prefix(controller, pool, SUPERVISOR, [2])
+
+    before = pool.queue_ids()
+    controller.maybe_tick()
+
+    assert pool.queue_ids() == before
+    assert controller.observer.counters.splices_total == 0
+    assert controller.observer.counters.blocks_spliced_total == 0
+    # The counterfactual is still recorded: the tick scored both keys, so the
+    # decision log says what the policy would have done.
+    assert controller.get_value(RESEARCH) is not None
+    assert controller.get_value(RESEARCH) < controller.get_value(SUPERVISOR)
+
+
+def test_observe_only_forces_the_switches_that_define_the_arm():
+    """Set from the env last on purpose: a JSON file that could re-enable the
+    splice underneath it would produce a baseline that silently is not one."""
+    import os
+    from unittest.mock import patch
+
+    from vllm.v1.core.node_eviction.config import NodeEvictionConfig
+
+    with patch.dict(
+        os.environ,
+        {
+            "VLLM_NODE_EVICTION_OBSERVE": "1",
+            "VLLM_NODE_EVICTION_POLICY": "0",
+            "VLLM_NODE_EVICTION_PREFETCH_DRAIN": "1",
+        },
+    ):
+        cfg = NodeEvictionConfig.from_env()
+
+    assert cfg.observe_only is True
+    # Forced on despite POLICY=0, or there would be no controller to observe.
+    assert cfg.enabled is True
+    assert cfg.splice_max_blocks == 0
+    # A baseline that originates prefills is not a baseline.
+    assert cfg.prefetch_wants_enabled is False
+    cfg.validate()

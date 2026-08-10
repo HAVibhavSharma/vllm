@@ -200,7 +200,9 @@ def test_an_arriving_prefix_retires_an_outstanding_want():
 
 
 def test_an_unlikely_call_is_not_worth_a_prefill():
-    """The gate still works — it is just switched off by default now."""
+    """An imminent call is still not worth warming if it probably won't
+    happen — the two axes are independent, and this one is now on by
+    default."""
     rows = fresh_rows({RESEARCH: dict(prob=0.1, time_to_next_call_ms=1_000.0)})
     controller = wants_controller(FakePool(), rows, prefetch_min_prob=0.5)
     controller.maybe_tick()
@@ -220,15 +222,32 @@ def test_a_distant_call_is_real_but_not_imminent():
     assert controller.drain_prefetch_wants(4) == []
 
 
-def test_neither_gate_fires_by_default():
-    """The reason the first real run produced 96 wants in 74 minutes. With a
-    forecast that is 0.01 or 1.0 and nothing in between, a `prob >= 0.5` gate
-    is not selecting likely rows — it is selecting one arm of a binary
-    signal, and the other arm is where the come-back rate is highest."""
-    rows = fresh_rows(
+def test_the_prob_gate_fires_by_default_and_the_horizon_gate_does_not():
+    """A floored row buys no prefill any more (2026-08-10).
+
+    The gate was off on the argument that a bimodal forecast cannot *rank*.
+    It cannot — but this gate *admits*, and 12 §1 measured which arm is worth
+    admitting: the saturated `prob=1.0` class comes back 54.7% of the time
+    against 24.3% for the floored class. With the gate off, a real run
+    produced 13,464 wants and satisfied 41 of them.
+
+    The horizon gate is still off: `time_to_next_call_ms` is 60s or 3600s and
+    nothing between, so it splits on the same binary rather than on
+    imminence, and it is the axis with no measured come-back split behind it.
+    """
+    floored = fresh_rows(
         {RESEARCH: dict(prob=0.01, time_to_next_call_ms=3_600_000.0)}
     )
-    controller = wants_controller(FakePool(), rows)
+    controller = wants_controller(FakePool(), floored)
+    controller.maybe_tick()
+    assert controller.drain_prefetch_wants(4) == []
+
+    # Same row, distant call, but a probability above the gate: admitted,
+    # which is what shows the horizon axis is still ungated.
+    saturated = fresh_rows(
+        {RESEARCH: dict(prob=1.0, time_to_next_call_ms=3_600_000.0)}
+    )
+    controller = wants_controller(FakePool(), saturated)
     controller.maybe_tick()
     assert len(controller.drain_prefetch_wants(4)) == 1
 

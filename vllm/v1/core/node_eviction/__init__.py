@@ -105,12 +105,23 @@ def maybe_build_controller(
         return None
 
     controller.start()
-    logger.info(
-        "Node-aware KV eviction enabled (tick=%.0fms, K=%d, tau=%.0fms, "
-        "redis=%s)",
-        config.tick_period_ms,
-        config.splice_max_blocks,
-        config.tau_ms,
-        config.redis_url or "none",
-    )
+    if config.observe_only:
+        logger.info(
+            "Node-aware KV eviction in OBSERVE-ONLY mode: the free queue is "
+            "never reordered and eviction stays LRU. Bookkeeping and the "
+            "kv_hbm line (variant=baseline) run so this arm can be diffed "
+            "against a policy run. (tick=%.0fms, tau=%.0fms, redis=%s)",
+            config.tick_period_ms,
+            config.tau_ms,
+            config.redis_url or "none",
+        )
+    else:
+        logger.info(
+            "Node-aware KV eviction enabled (tick=%.0fms, K=%d, tau=%.0fms, "
+            "redis=%s)",
+            config.tick_period_ms,
+            config.splice_max_blocks,
+            config.tau_ms,
+            config.redis_url or "none",
+        )
     return controller

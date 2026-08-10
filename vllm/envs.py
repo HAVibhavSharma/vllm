@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_NODE_EVICTION_REDIS_URL: str | None = None
     VLLM_NODE_EVICTION_DECISION_LOG: str | None = None
     VLLM_NODE_EVICTION_PREFETCH_DRAIN: bool = False
+    VLLM_NODE_EVICTION_OBSERVE: bool = False
     VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S: float = 1.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
@@ -753,6 +754,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reordering is free, origination adds prefill work.
     "VLLM_NODE_EVICTION_PREFETCH_DRAIN": lambda: bool(
         int(os.getenv("VLLM_NODE_EVICTION_PREFETCH_DRAIN", "0"))
+    ),
+    # Observe-only mode: build the policy's bookkeeping and emit the
+    # kv_hbm line, but never reorder the free queue. This is the A/B
+    # baseline arm you can actually diff against — VLLM_NODE_EVICTION_POLICY=0
+    # runs no policy code at all and therefore emits no line.
+    "VLLM_NODE_EVICTION_OBSERVE": lambda: bool(
+        int(os.getenv("VLLM_NODE_EVICTION_OBSERVE", "0"))
     ),
     "VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S": lambda: float(
         os.getenv("VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S", "1.0")
@@ -1950,6 +1958,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_NODE_EVICTION_DECISION_LOG",
         "VLLM_NODE_EVICTION_PREFETCH_DRAIN",
         "VLLM_NODE_EVICTION_PREFETCH_DRAIN_INTERVAL_S",
+        "VLLM_NODE_EVICTION_OBSERVE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

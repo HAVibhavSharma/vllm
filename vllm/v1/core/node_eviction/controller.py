@@ -181,7 +181,11 @@ class NodeEvictionController:
         )
         # What a miss actually costs, next to how often it happened.
         self.ttft = TTFTTracker()
-        if config.prefetch_wants_enabled and self.enabled:
+        if (
+            config.prefetch_wants_enabled
+            and self.enabled
+            and not config.observe_only
+        ):
             self._wants = PrefetchWantList(
                 max_outstanding=config.prefetch_max_outstanding,
                 want_ttl_ms=config.prefetch_want_ttl_ms,
@@ -756,8 +760,17 @@ class NodeEvictionController:
             self._evictions_by_key.items(), key=lambda kv: (-kv[1], kv[0])
         )[: self.config.hbm_summary_top_keys]
         top_str = ",".join(f"{label}={n}" for label, n in top) or "-"
+        # Keyed on whether the splice *can* run, not on the observe flag
+        # alone: `splice_max_blocks: 0` in the JSON is behaviourally the same
+        # arm and used to report itself as `node_eviction`, which made the
+        # two runs indistinguishable in the field the timeline tool keys on.
+        variant = (
+            "baseline"
+            if self.config.observe_only or self.config.splice_max_blocks <= 0
+            else "node_eviction"
+        )
         return (
-            "kv_hbm variant=node_eviction "
+            f"kv_hbm variant={variant} "
             f"total={total} used={used} free={free} "
             f"usage={(used / total * 100.0) if total else 0.0:.1f}% "
             f"queue={pool.free_block_queue.num_free_blocks} "
@@ -953,6 +966,13 @@ class NodeEvictionController:
         burst, which is what `splice_max_blocks` now allows for and
         `splice_deficit_blocks` measures.
         """
+        if self.config.observe_only:
+            # Enforced here rather than only by the `splice_max_blocks = 0`
+            # that `from_env` forces: the guarantee belongs at the one place
+            # that mutates the queue, or a config built any other way (a
+            # test, the replay harness) would claim to be a baseline while
+            # reordering.
+            return
         k = self.config.splice_max_blocks
         if k <= 0 or not self._value_table:
             return
@@ -1088,6 +1108,7 @@ class NodeEvictionController:
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys
         out["value_table_size"] = len(self._value_table)
+        out["observe_only"] = self.config.observe_only
         out["prefetch_origination_enabled"] = self._wants is not None
         if self._wants is not None:
             out["prefetch_wants_pending"] = self._wants.num_pending
