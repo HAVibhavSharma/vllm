@@ -32,27 +32,31 @@ every constant unfalsifiable.
 
 ```
 score(key) = prob(key)
-           × decay(time_to_next_call(key))
+           × time_discount(key)
            × E_miss(key)
            ÷ blocks(key)
 
-decay(t)   = τ / (τ + t)                       τ ≈ 30 s        [open]
+time_discount = 1                              if PROB.prob_horizon is set
+              = τ / (τ + time_to_next_call)    otherwise       τ ≈ 30 s  [open]
+
 E_miss     = p_l1 · Δ_l1  +  p_cold · Δ_cold   Δ_l1 ≈ 180 ms
                                                Δ_cold ≈ 11 400 ms
 ```
 
 | Term | Meaning | Source |
 |---|---|---|
-| `prob` | P(fires again **at all** this job) — time-free | `PROB`, 05 §5.2 |
-| `decay(ttnc)` | time discount — sooner is worth more | `PROB.time_to_next_call` |
+| `prob` | P(fires again, over the window the publisher declares) | `PROB`, 05 §5.2 |
+| `prob_horizon` | which window that is — absent = the whole job | `PROB.prob_horizon` |
+| `time_discount` | time preference, applied **once**, by whichever side owns it | `PROB.time_to_next_call` |
 | `E_miss` | expected cost if we drop it and it is needed | `HISTORY`, 04 §5.4 |
 | `blocks` | prefix length in blocks | the index, free at tick time |
 
 ### Why each term
 
-- **`prob`** — value only exists if the prefix is reused. Time-free by
-  construction so the discount is applied exactly once (05 §5.2); encoding
-  "soon" in both fields squares the preference for near-term nodes.
+- **`prob`** — value only exists if the prefix is reused. Its default form is
+  time-free by construction so the discount is applied exactly once (05 §5.2);
+  encoding "soon" in both fields squares the preference for near-term nodes.
+  See "Who owns the time preference" below for the other form.
 - **`decay`** — a block needed in 60 s occupies memory for 60 s that could
   serve other work. `τ/(τ+t)` is chosen over `exp(-t/τ)` for having a fatter
   tail: an 11.4 s prefix rebuild is still worth avoiding at t = 2 min, and an
@@ -62,6 +66,49 @@ E_miss     = p_l1 · Δ_l1  +  p_cold · Δ_cold   Δ_l1 ≈ 180 ms
   (§3), re-entering automatically once `p_cold` is measured (01 §5).
 - **`÷ blocks`** — freeing 1500 blocks and freeing 100 blocks are not the same
   action. This is what makes the score a density rather than a preference.
+
+### Who owns the time preference
+
+The split above — `prob` says *whether*, `decay` says *when* — holds only while
+`prob` is time-free. The forecast side can answer a different question:
+
+```
+PROB.prob_horizon absent   prob = P(fires again at all, this job)
+PROB.prob_horizon = N      prob = P(fires within the next N calls)
+```
+
+A horizon-bounded `prob` already contains the time preference: a key eight
+calls out sits near the floor **because** it is far. Multiplying it by
+`decay(ttnc)` discounts time twice, and worst where it helps least — a key just
+past the window is pushed down once by a small `prob` and again by a large
+`ttnc`, while keys inside the window are separated by `decay` on a scale `prob`
+has already priced in.
+
+So the discount is applied to a time-free `prob` and not to a horizon-bounded
+one. Nothing is lost by skipping it: the surviving `prob · E_miss / blocks` is
+still a value density in ms per block, over a bounded window instead of over
+the rest of the job.
+
+**The semantics travel with the number, on the row.** The publisher is the only
+component that knows what it computed. A flag set independently at each end is
+a convention, and a broken convention here yields a policy that indexes blocks,
+receives forecasts, scores them wrongly, and logs nothing unusual on either
+side — the failure class 03 §5 calls the hardest to detect. This is the same
+argument that puts `call_type` in one declaration rather than two.
+
+Two consequences worth stating because they are easy to get wrong:
+
+- **Absent must keep meaning time-free.** Any publisher predating the field
+  scores exactly as before; there is no migration.
+- **Dropping `decay` puts the whole ranking on `prob` being graded.** `E_miss`
+  is constant under §3, so `prob · E_miss / blocks` degenerates to `1/blocks`
+  if `prob` only ever takes two values. That is safe for a first-passage
+  probability, which is graded by construction, and *not* safe for an
+  accumulated reachability that clamps at 1 (05, `max_hops`) or for an exact
+  oracle that publishes only 1.0 and the floor. Invariant 9 guards it.
+
+`respect_prob_horizon=False` restores the multiply, so the double discount can
+be measured rather than assumed.
 
 ### Why dividing by `blocks` is legitimate
 
@@ -82,11 +129,15 @@ Under 01 §5's "assume L1 resident", `p_cold = 0` and `E_miss = Δ_l1`, a
 constant. Constants do not change a ranking, so **v1 collapses to:**
 
 ```
-score = prob × decay(time_to_next_call) ÷ blocks
+score = prob × time_discount ÷ blocks
 ```
 
 Implement the full form anyway, with `E_miss` read from `HISTORY` and defaulted
 to `Δ_l1`. Then measuring `p_cold` (04 §5.4) changes a data file, not the code.
+
+With a horizon-bounded `prob` the same collapse leaves `prob ÷ blocks`, which
+is why §2's "Who owns the time preference" insists `prob` be graded: two terms
+of that expression are then constant and the third is doing all the ranking.
 
 ---
 
@@ -122,13 +173,14 @@ exists. Several encode failures the previous attempt actually shipped.
 | # | Invariant | Why |
 |---|---|---|
 | 1 | strictly increasing in `prob` | — |
-| 2 | strictly decreasing in `time_to_next_call` | — |
+| 2 | strictly decreasing in `time_to_next_call` | — *for a time-free `prob`*. With `prob_horizon` set the discount is not applied, so `ttnc` no longer moves the score and this holds vacuously; the ordering it existed to guarantee is then carried by `prob` |
 | 3 | strictly decreasing in `blocks` | it is a density |
 | 4 | increasing in `p_cold` | expensive misses are worth avoiding |
 | 5 | **never 0** for a scored block | 0 makes freshly built prefixes the top victims and destroys them before first reuse — strictly worse than LRU (00 Part 5 item 6) |
 | 6 | bounded above by `Δ_cold` | so the speculative floor *can* be placed above the whole range (02 §5). Still the invariant the validator enforces, though the floor now defaults to off — 12 §6 |
 | 7 | deterministic — no clock reads inside, no randomness | the same inputs must replay identically, or §7 proves nothing |
 | 8 | a running node's blocks are never scored | `ref_cnt > 0` keeps them out of the free queue entirely |
+| 9 | the time preference is applied **once** | `decay` is skipped exactly when `PROB.prob_horizon` is set, and a graded `prob` must still produce a graded score — otherwise §3's collapse leaves `1/blocks` and the policy ranks by prefix length alone |
 
 Invariant 7 is the one that is easy to violate by accident: reading
 `time.monotonic()` inside the score rather than passing a tick timestamp in makes
@@ -140,11 +192,12 @@ replay non-reproducible and the harness useless.
 
 | Item | Notes |
 |---|---|
-| `τ` | 30 s is a guess. It sets how far ahead the policy plans, and it interacts with tick period and typical tool duration. |
+| `τ` | 30 s is a guess. It sets how far ahead the policy plans, and it interacts with tick period and typical tool duration. Only consulted for a time-free `prob`; with `prob_horizon` set, **N replaces τ** as the lever, and it lives on the publisher. Do not sweep both against each other. |
+| `N` (the horizon) | Which window `prob` should answer over, when the forecast side bounds it. Off by default, because it redefines a published field and both arms of an A/B must agree on what the number means. Measured on a 10-job open_deep_research trace, first passage + persisted transition counts scored Brier 0.137 at N=5 and N=10 against 0.150 / 0.205 for the accumulated form. **Not comparable across N**: a narrower window makes "yes" rarer (33% of positions at N=3, 43% at N=5, 75% unbounded) and the score falls with the base rate, no model improving. |
 | Δ_l1, Δ_cold | ≈180 ms / ≈11.4 s from one old benchmark on one model and one prompt size. Should come from `HISTORY` segmented means (04 §5.4), not constants. |
-| Whether `prob` carries signal | If a workflow has one dominant path, `p_reach` is near-uniform and `decay` does all the work (05 §5.2.1). |
+| Whether `prob` carries signal | If a workflow has one dominant path, `p_reach` is near-uniform and `decay` does all the work (05 §5.2.1). **Now load-bearing rather than merely undesirable**: with `prob_horizon` set there is no `decay` to fall back on, so a flat `prob` leaves `1/blocks`. Measured on open_deep_research, the unbounded accumulated form is exactly this failure — 4 of 9 keys clamped at 1.0, 4 at the floor, Brier 0.348, *worse than publishing a constant 0.5*. First passage over a window is the form that keeps the values graded. |
 | Splice selection | Unconditional worst-K, or only blocks below an absolute threshold? Unconditional always moves K blocks even when every candidate is valuable — which under a healthy cache is churn for nothing. **Unresolved.** |
-| Age term | 00 Part 5 item 7 wants age as a score term so silent jobs decay out. Partly subsumed by the `update_ts` staleness gate; needs deciding whether an explicit term is still required. |
+| Age term | 00 Part 5 item 7 wants age as a score term so silent jobs decay out. Partly subsumed by the `update_ts` staleness gate; needs deciding whether an explicit term is still required. **More pressing under a horizon**: `decay` was doing part of this incidentally, and it is not applied there, so the staleness gate is the only remaining mechanism. It is believed sufficient — a job that stops publishing trips `is_stale` (01 §2), and `end_job` publishes explicit floors — but this has not been measured with the discount switched off. |
 
 ---
 
@@ -189,7 +242,16 @@ Each of these has a specific failure attached; none is hypothetical.
 
 - **Scoring unscored blocks 0.** Destroys freshly built prefixes before first
   reuse. Worse than LRU.
-- **Encoding "soon" in `prob`.** Applies the time discount twice (05 §5.2).
+- **Encoding "soon" in `prob` without declaring it.** Applies the time discount
+  twice (05 §5.2). A bounded `prob` is legitimate — it just has to arrive with
+  `prob_horizon` set, so the scorer knows to stop discounting (§2).
+- **Deciding the semantics of `prob` with a vLLM-side flag.** Two flags that
+  can disagree, for one fact only the publisher knows. When they drift, the
+  policy is wrong and both logs look healthy (03 §5).
+- **Dropping `decay` to "fix" the double discount.** Right conclusion, wrong
+  mechanism: it also drops it for time-free publishers, and `E_miss` is
+  constant (§3), so the score becomes `1/blocks` — evict from whichever key
+  holds the most. Condition on `prob_horizon` instead.
 - **Summing over multi-owners.** Makes shared preambles permanently unevictable.
 - **Reading the clock inside the score.** Breaks replay reproducibility (§5,
   invariant 7).

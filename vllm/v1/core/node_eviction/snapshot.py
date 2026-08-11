@@ -239,6 +239,16 @@ def _decode_one(
         return fallback
 
     base = prev if prev is not None else ImportanceRow()
+
+    # Declared by the publisher; absent for a forecast that answers the
+    # time-free "fires again at all", which is every publisher predating the
+    # field. Absent therefore has to keep the old scoring exactly.
+    if "prob_horizon" in item:
+        horizon = _as_int(item["prob_horizon"])
+        prob_horizon = horizon if horizon and horizon > 0 else None
+    else:
+        prob_horizon = base.prob_horizon
+
     delta_l1 = item.get("time_taken_l1", item.get("delta_l1_ms"))
     delta_cold = item.get("time_taken_cold", item.get("delta_cold_ms"))
 
@@ -248,6 +258,7 @@ def _decode_one(
             "time_to_next_call", base.time_to_next_call_ms
         ),
         update_ts_ms=max(pick("update_ts", base.update_ts_ms), base.update_ts_ms),
+        prob_horizon=prob_horizon,
         p_l1=pick("p_l1", base.p_l1),
         p_cold=pick("p_cold", base.p_cold),
         delta_l1_ms=(

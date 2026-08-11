@@ -63,7 +63,19 @@ class NodeEvictionConfig:
     # --- Scoring (08 §2) --------------------------------------------------
     tau_ms: float = 30_000.0
     """Time constant of `decay(t) = tau / (tau + t)`. Sets how far ahead the
-    policy plans. 30s is a guess (08 §6)."""
+    policy plans. 30s is a guess (08 §6).
+
+    Only consulted for a time-free `prob`; see `respect_prob_horizon`."""
+
+    respect_prob_horizon: bool = True
+    """Skip `decay(ttnc)` for a row whose publisher declared `prob_horizon`.
+
+    Such a row carries `prob = P(fires within the next N calls)`, which
+    already encodes the time preference `decay` exists to supply, so applying
+    both discounts time twice. Set False to restore the multiply — the point
+    of the switch is that the double discount can be measured against this
+    rather than assumed. It has no effect on a publisher that does not send
+    `prob_horizon`, which is the default on the forecast side too."""
 
     delta_l1_ms: float = 180.0
     """Cost of a miss that LMCache L1 can still serve: GPU hit ~200ms vs L1

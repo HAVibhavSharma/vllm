@@ -143,7 +143,8 @@ Fetched once per job and cached; never re-read unless the job is new.
 |---|---|---|
 | `node_name` | string | join |
 | `call_type` | string | join |
-| `prob` | float | P(this `(node, call_type)` fires again **at all** this job). **Time-free** — must not encode "soon". The engine applies its own time discount to `time_to_next_call`; encoding timing here applies it twice (05 §5.2). |
+| `prob` | float | P(this `(node, call_type)` fires again. Over what window is set by `prob_horizon`: absent means **at all, this job**, and is then **time-free** — it must not encode "soon", because the engine applies its own time discount to `time_to_next_call` and encoding timing here would apply it twice (05 §5.2). |
+| `prob_horizon` | int, optional | Present ⇒ `prob = P(fires within the next N calls)`, N counted in model requests. The engine then skips its time discount, because `prob` already carries the time preference (08 §2). **Absent must keep meaning time-free**, so a publisher predating this field is unaffected. Sending a bounded `prob` *without* this field is the double discount, silently. |
 | `time_to_next_call` | duration | *When*, given that it fires. Second importance term. It was also the TTL of the speculative protection floor; that decay is gone (12 §5.5) and the floor itself is now off by default (12 §6), so this field only feeds the time discount. |
 | `update_ts` | timestamp | **Staleness gate.** Rows older than the cutoff are treated as unscored → neutral default → LRU behaviour. This is what makes a missed pub/sub message degrade instead of act on stale data. |
 
@@ -219,6 +220,7 @@ just saturates every score and makes the policy uniformly wrong.
 | Quantity | Engine assumption (change it if wrong) |
 |---|---|
 | `prob` | float in `[0, 1]` |
+| `prob_horizon` | integer ≥ 1 **calls**, or absent. Not milliseconds, and not graph hops |
 | `time_to_next_call` | **milliseconds** |
 | `time_taken`, `tool_execution_time`, `prediction_headroom` | **milliseconds** |
 | `update_ts` | epoch **milliseconds**, UTC |
@@ -247,6 +249,7 @@ mandatory rather than nice-to-have.
 | `call_type` unstable across turns | index fragments; each key too sparse to score | index cardinality growth |
 | `extra_args` absent entirely | request's blocks unscored → neutral default, LRU position kept | unscored-block ratio |
 | `prob` in wrong units | policy uniformly wrong, no error | nothing — only an A/B against LRU catches it |
+| Bounded `prob` sent without `prob_horizon` | time discounted twice; far keys pushed down twice over, near keys separated on a scale `prob` already priced | nothing — every row is well-formed and in range |
 
 The last row is the argument for shipping behind the A/B flag from step 3 and
 keeping the LRU arm one env var away.

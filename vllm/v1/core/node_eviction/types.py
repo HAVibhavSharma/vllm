@@ -46,6 +46,19 @@ class ImportanceRow:
     time_to_next_call_ms: float = 0.0
     update_ts_ms: float = 0.0
 
+    # What `prob` was asked. None (the default) means "will this fire again at
+    # all, this job" — time-free, leaving `decay(ttnc)` to supply the whole
+    # time preference. An integer N means `prob = P(fires within the next N
+    # calls)`, which already carries that preference, and applying the decay
+    # on top would discount time twice.
+    #
+    # It rides on the row rather than on a vLLM-side config flag on purpose.
+    # The publisher is the only component that knows what it computed, and two
+    # independently-set flags that disagree would produce a policy that is
+    # quietly wrong with a healthy-looking log on both sides — the failure mode
+    # this design is least able to detect (03 §5).
+    prob_horizon: int | None = None
+
     # From HISTORY. p_l1 / p_cold default to the "assume L1 resident"
     # position of 01 §5: every miss is recoverable from LMCache. Publishing a
     # measured p_cold changes the ranking without any code change here.

@@ -275,3 +275,70 @@ def test_value_table_skips_unscored_and_stale_keys():
     # position, which is what neutral means with no arithmetic (08 §4).
     assert other not in table
     assert stale not in table
+
+
+# -- the time discount is applied once (08 §2) ---------------------------
+#
+# `score = prob * decay(ttnc) * E_miss / blocks` splits whether from when.
+# That split holds only while `prob` is time-free. A publisher sending
+# `prob = P(fires within the next N calls)` declares `prob_horizon`, and the
+# discount must not then be applied on top of it.
+
+
+def test_a_time_free_prob_still_gets_the_discount():
+    """The default must not move. Absent `prob_horizon` is every publisher
+    that predates the field."""
+    row = ImportanceRow(prob=0.5, time_to_next_call_ms=30_000.0)
+    assert row.prob_horizon is None
+    breakdown = score_key(row, num_blocks=1, config=CONFIG)
+    assert breakdown.decay == pytest.approx(decay(30_000.0, CONFIG.tau_ms))
+    assert breakdown.decay < 1.0
+
+
+def test_a_horizon_bounded_prob_is_not_discounted_twice():
+    row = ImportanceRow(prob=0.5, time_to_next_call_ms=30_000.0, prob_horizon=5)
+    breakdown = score_key(row, num_blocks=1, config=CONFIG)
+    assert breakdown.decay == 1.0
+    # The score is then exactly prob * E_miss / blocks.
+    assert breakdown.score == pytest.approx(0.5 * expected_miss_cost(row, CONFIG))
+
+
+def test_the_double_discount_is_measurable_not_assumed():
+    """`respect_prob_horizon=False` restores the multiply, so an A/B can show
+    what the double discount costs rather than taking it on faith."""
+    row = ImportanceRow(prob=0.5, time_to_next_call_ms=30_000.0, prob_horizon=5)
+    config = replace(CONFIG, respect_prob_horizon=False)
+    breakdown = score_key(row, num_blocks=1, config=config)
+    assert breakdown.decay == pytest.approx(decay(30_000.0, CONFIG.tau_ms))
+
+
+def test_the_horizon_does_not_flatten_the_ranking():
+    """Dropping `decay` leaves `prob * E_miss / blocks`, and `E_miss` is a
+    constant under the current assumption. So the whole ranking now rests on
+    `prob` being graded — which a first-passage probability is and the
+    accumulated reachability it replaces is not. If a publisher ever sends a
+    horizon-bounded `prob` that is only ever 1.0 or the floor, the score
+    degenerates to `1/blocks`; this is the guard that says so.
+    """
+    rows = [
+        ImportanceRow(prob=p, time_to_next_call_ms=1_000.0, prob_horizon=5)
+        for p in (0.9, 0.6, 0.3, 0.01)
+    ]
+    scores = [score_key(r, num_blocks=4, config=CONFIG).score for r in rows]
+    assert scores == sorted(scores, reverse=True)
+    assert len(set(scores)) == len(scores), (
+        "a graded prob must produce a graded score once decay is gone"
+    )
+
+
+def test_a_silent_job_is_still_caught_without_the_discount():
+    """Removing `decay` does not re-open the silent-job hole: that is the
+    `update_ts` staleness gate's job (01 §2), not the time term's."""
+    stale = ImportanceRow(
+        prob=1.0,
+        time_to_next_call_ms=1_000.0,
+        prob_horizon=5,
+        update_ts_ms=1_000.0,
+    )
+    now_ms = 1_000.0 + CONFIG.staleness_cutoff_ms + 1.0
+    assert is_stale(stale, now_ms, CONFIG.staleness_cutoff_ms)

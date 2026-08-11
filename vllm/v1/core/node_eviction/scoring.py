@@ -45,6 +45,42 @@ def decay(ttnc_ms: float, tau_ms: float) -> float:
     return tau_ms / (tau_ms + ttnc_ms)
 
 
+def time_discount(row: ImportanceRow, config: NodeEvictionConfig) -> float:
+    """The time term, applied once.
+
+    `score = prob * decay(ttnc) * E_miss / blocks` splits the question in two:
+    `prob` says *whether* a key is needed again and `decay` says *how soon*.
+    That split holds only while `prob` is time-free, which is what
+    `PROB.prob = P(fires again at all, this job)` guarantees.
+
+    A publisher can instead send `prob = P(fires within the next N calls)` and
+    declare it as `prob_horizon`. That answer already contains the time
+    preference — a key eight calls out is near the floor *because* it is far —
+    so multiplying by `decay(ttnc)` would apply the discount a second time.
+    The penalty compounds worst exactly where the two disagree least usefully:
+    a key just past the window is pushed down by a small `prob` and again by a
+    large `ttnc`, while keys inside the window are separated by `decay` on a
+    scale `prob` has already accounted for.
+
+    So the discount is applied to a time-free `prob` and not to a
+    horizon-bounded one. Nothing is lost by skipping it: the surviving
+    `prob * E_miss / blocks` is still a value density in ms per block, over a
+    bounded window rather than over the rest of the job, and it stays graded
+    because a first-passage probability is graded (unlike the accumulated
+    reachability it replaces, which clamps).
+
+    Note this does **not** re-open the silent-job problem. A job that stops
+    publishing is caught by `is_stale` and the `update_ts` gate (01 §2), not
+    by the time discount.
+
+    `respect_prob_horizon=False` restores the multiply, for an A/B that wants
+    to measure the double discount rather than assume it.
+    """
+    if row.prob_horizon and config.respect_prob_horizon:
+        return 1.0
+    return decay(row.time_to_next_call_ms, config.tau_ms)
+
+
 def expected_miss_cost(row: ImportanceRow, config: NodeEvictionConfig) -> float:
     """`p_l1 * delta_l1 + p_cold * delta_cold`.
 
@@ -136,7 +172,7 @@ def score_key(
             blocks=0,
         )
 
-    d = decay(row.time_to_next_call_ms, config.tau_ms)
+    d = time_discount(row, config)
     e_miss = expected_miss_cost(row, config)
     prob = min(max(row.prob, 0.0), 1.0)
 
