@@ -110,7 +110,8 @@
 <div class="wrap">
   <h1>KV eviction — HBM timeline</h1>
   <p class="sub">
-    Drop the <code>kv_hbm</code> lines from both runs. Everything is computed in
+    Drop the <code>kv_hbm</code> lines from both runs. Three quantities only —
+    prefix cache hit rate, engine-side TTFT, regret. Everything is computed in
     the page; nothing leaves your machine.
   </p>
 
@@ -159,23 +160,22 @@
 /* ==================================================================== *
  * 1. Parsing
  *
- * The payload is flat key=value separated by single spaces. `top_evicted`
- * carries `=` inside its value, so every split is on the FIRST `=` of a
- * token — splitting on all of them silently truncates the attribution.
+ * The payload is flat key=value separated by single spaces. Splitting on the
+ * FIRST `=` of a token, because a value may itself contain one.
  * ==================================================================== */
 
 // A whitelist, so anything absent here silently stays a *string* and any
-// arithmetic on it yields NaN. Every field the engine emits has to be listed,
-// including ones no panel reads yet — that is the cheap half of adding one.
+// arithmetic on it yields NaN. Deliberately narrow: this page reports hit
+// rate, TTFT and regret, plus the two counters needed to qualify them
+// (`query_tokens` for the hit rate's denominator, `ttft_n` for the mean's
+// population). Every other field the engine emits is ignored.
+// `evicted_by_score` is here only as regret's denominator: regret prints
+// 0.000 when nothing scored has been evicted yet, and that zero is an absence
+// of data, not a policy with no regret.
 const NUMERIC_FIELDS = new Set([
-  "total","used","free","usage","queue","splices","spliced_blocks",
-  "staged","deficit","evicted",
-  "evicted_by_score","regret","hit_rate","hit_rate_fresh","hit_rate_win",
+  "regret","hit_rate",
   "ttft_ms","ttft_win_ms","ttft_p95_ms","ttft_n",
-  "hit_tokens","query_tokens","query_tokens_fresh",
-  "phantom_hit_rate","phantom_query_tokens",
-  "remat_blocks","remat_mb","remat_ratio","blocks_cached",
-  "index_keys","index_blocks",
+  "hit_tokens","query_tokens","evicted_by_score",
 ]);
 
 // vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
@@ -190,19 +190,6 @@ function parseStamp(prefix) {
   return Date.UTC(2000, mo - 1, d, h, mi, s) / 1000;
 }
 
-function parseTopEvicted(raw) {
-  const out = new Map();
-  if (!raw || raw === "-") return out;
-  for (const entry of raw.split(",")) {
-    const i = entry.lastIndexOf("=");   // labels contain `:` and may contain `=`
-    if (i < 0) continue;
-    const label = entry.slice(0, i);
-    const n = Number(entry.slice(i + 1));
-    if (label && Number.isFinite(n)) out.set(label, (out.get(label) || 0) + n);
-  }
-  return out;
-}
-
 function parseLine(line) {
   const at = line.indexOf("kv_hbm ");
   if (at < 0) return null;
@@ -212,13 +199,11 @@ function parseLine(line) {
     const i = tok.indexOf("=");
     if (i < 0) continue;
     const k = tok.slice(0, i);
-    let v = tok.slice(i + 1);
-    if (k === "usage") v = v.replace(/%$/, "");
+    const v = tok.slice(i + 1);
     fields[k] = NUMERIC_FIELDS.has(k) ? Number(v) : v;
   }
   if (!fields.variant) return null;
   fields._stamp = stamp;
-  fields._top = parseTopEvicted(fields.top_evicted);
   return fields;
 }
 
@@ -248,7 +233,7 @@ function parseRun(text) {
   });
 
   const variant = rows[0].variant;
-  const missing = ["remat_mb", "hit_rate", "ttft_ms"]
+  const missing = ["hit_rate", "ttft_ms", "regret"]
     .filter(k => rows[0][k] === undefined);
   return { variant, rows, syntheticTime: !haveStamps, missingFields: missing };
 }
@@ -256,40 +241,75 @@ function parseRun(text) {
 /* ==================================================================== *
  * 2. Derived series
  *
- * Cumulative counters mean nothing undifferenced: a monotonically rising
- * `evicted` looks the same for a healthy run and a thrashing one. Ratios
- * are NOT differenced — differencing a ratio is meaningless; the two
- * underlying counters are differenced and divided instead.
+ * Nothing here differences a counter: every plotted quantity (`hit_rate`,
+ * `ttft_win_ms`, `ttft_p95_ms`, `regret`) is already a cumulative,
+ * per-window or trailing value the engine computed, and differencing a ratio
+ * is meaningless. Counter deltas appear only as denominators — to decide
+ * whether a window measured anything at all.
  * ==================================================================== */
 
 function num(v) { return Number.isFinite(v) ? v : 0; }
 
-function rateSeries(rows, field) {
-  // Emitted as explicit step rectangles: the rate over [t(i-1), t(i)] is a
-  // property of the interval, not of an instant.
+/**
+ * Every rate on the line is guarded by a zero-denominator check in the engine
+ * and returns a literal `0.0` when it has nothing to divide — `hit_rate` with
+ * no queries, `ttft_*` with no samples, `regret` with no scored eviction yet
+ * (`metrics.py:358`, `:151`). Those zeros are absences, and the real logs are
+ * full of them: `baseline.kv_hbm` prints `hit_rate=0.0000 query_tokens=0` on
+ * its first line and `ttft_win_ms=0.0 ttft_n=11` on two more. Plotted, each
+ * one is a cliff to the floor that the server never experienced — and it drags
+ * the auto-fitted axis down with it. `requireField` names the denominator; a
+ * sample where it has not moved becomes a break in the line, not a zero.
+ */
+function levelSeries(rows, field, requireField) {
+  return rows.map(r =>
+    (requireField !== undefined && !(num(r[requireField]) > 0))
+      ? null
+      : [r.t, num(r[field])]);
+}
+
+/**
+ * A *window* value — `ttft_win_ms` — describes the interval that produced it:
+ * the engine resets those counters every time it emits a line
+ * (`controller.py: ttft.reset_window()`), so the number printed at t(i)
+ * covers [t(i-1), t(i)].
+ *
+ * Drawn as an explicit horizontal segment over exactly that interval. Holding
+ * it *forward* to the next sample, which is what a plain step-after line does,
+ * reports every window one interval late — under a stretch of the run that
+ * did not produce it. The lines are change-gated, so those intervals are not
+ * uniform and the error does not come out in the wash.
+ */
+function windowSeries(rows, field, requireField) {
+  const dt0 = medianDt(rows);
   const pts = [];
-  for (let i = 1; i < rows.length; i++) {
-    const dt = rows[i].t - rows[i - 1].t;
-    if (dt <= 0) continue;
-    const r = (num(rows[i][field]) - num(rows[i - 1][field])) / dt;
-    pts.push([rows[i - 1].t, r], [rows[i].t, r]);
+  for (let i = 0; i < rows.length; i++) {
+    const t1 = rows[i].t;
+    // The first line's window opened before the log starts; the median period
+    // is the only defensible guess for where. Time is measured from that same
+    // first line, so the guess collapses to a zero-width segment — dropped
+    // rather than drawn, since its interval is genuinely unknown.
+    const t0 = i > 0 ? rows[i - 1].t : Math.max(0, t1 - dt0);
+    if (!(t1 > t0)) continue;
+    // The line is change-gated on a fingerprint that includes evictions and
+    // query tokens, so it prints for windows in which no request finished at
+    // all. Those windows carry `ttft_win_ms=0.0` — the zero-denominator guard
+    // value, not a latency. Break the line rather than plot the zero.
+    const moved = requireField === undefined ||
+      num(rows[i][requireField]) - (i > 0 ? num(rows[i - 1][requireField]) : 0) > 0;
+    if (!moved) { pts.push(null); continue; }
+    pts.push([t0, num(rows[i][field])], [t1, num(rows[i][field])]);
   }
   return pts;
 }
 
-function ratioSeries(rows, numField, denField) {
-  const pts = [];
-  for (let i = 1; i < rows.length; i++) {
-    const dn = num(rows[i][numField]) - num(rows[i - 1][numField]);
-    const dd = num(rows[i][denField]) - num(rows[i - 1][denField]);
-    const v = dd > 0 ? dn / dd : 0;
-    pts.push([rows[i - 1].t, v], [rows[i].t, v]);
-  }
-  return pts;
-}
-
-function levelSeries(rows, field, scale) {
-  return rows.map(r => [r.t, num(r[field]) * (scale === undefined ? 1 : scale)]);
+// Movement of a counter across the window ending at `row`, for tooltips: a
+// window rate computed over 3k tokens and one over 300k are not comparable
+// evidence, and the chart cannot show that on its own.
+function windowDelta(run, row, field) {
+  const i = run.rows.indexOf(row);
+  if (i < 0) return 0;
+  return num(row[field]) - (i > 0 ? num(run.rows[i - 1][field]) : 0);
 }
 
 // Median sample spacing, used to mark idle gaps. The line is change-gated,
@@ -311,15 +331,8 @@ const S = {
   runs: {},                 // variant -> parsed run
   domain: null,             // [t0, t1] or null for full extent
   solo: "all",
-  hiddenLabels: new Set(),
-  labelColour: new Map(),
   panels: [],               // render handles for crosshair
 };
-
-const PALETTE = [
-  "#4c78a8","#f58518","#54a24b","#b279a2","#e45756","#72b7b2",
-  "#ff9da6","#9d755d","#bab0ac","#7f7f7f","#17becf","#bcbd22",
-];
 
 function runList() {
   const out = [];
@@ -347,10 +360,6 @@ function fmtNum(v, digits) {
   return v.toFixed(digits === undefined ? (a < 10 ? 2 : 0) : digits);
 }
 function fmtPct(v) { return Number.isFinite(v) ? (v * 100).toFixed(1) + "%" : "–"; }
-function fmtMB(v) {
-  if (!Number.isFinite(v)) return "–";
-  return v >= 1024 ? (v / 1024).toFixed(2) + " GB" : v.toFixed(1) + " MB";
-}
 function fmtMs(v) {
   if (!Number.isFinite(v)) return "–";
   return Math.abs(v) >= 1000 ? (v / 1000).toFixed(2) + " s" : v.toFixed(0) + " ms";
@@ -388,7 +397,8 @@ function niceTicks(lo, hi, count) {
 }
 
 const M = { top: 8, right: 12, bottom: 22, left: 56 };
-const PANEL_H = 150;
+const PANEL_H = 190;
+let clipSeq = 0;
 
 function fullExtent() {
   let hi = 0;
@@ -400,9 +410,11 @@ function fullExtent() {
 function xDomain() { return S.domain || fullExtent(); }
 
 /**
- * Line panel. Series are step-after: the value holds until the next sample.
- * Linear interpolation across an idle gap would draw a smooth ramp through
- * a state the server was never in.
+ * Line panel. Level series are step-after: the value holds until the next
+ * sample. Linear interpolation across an idle gap would draw a smooth ramp
+ * through a state the server was never in. Window series arrive from
+ * `windowSeries` as explicit segment pairs and set `stepped: false`, so they
+ * are drawn over the interval they were measured on instead.
  */
 function drawLinePanel(host, cfg) {
   const width = host.clientWidth || 800;
@@ -411,21 +423,40 @@ function drawLinePanel(host, cfg) {
   const [x0, x1] = xDomain();
   const iw = width - M.left - M.right, ih = h - M.top - M.bottom;
 
-  let lo = 0, hi = 0;
+  // The axis fits the data, and is NOT stretched to include zero. Anchoring
+  // at zero drew hit rates of 0.56–0.77 as two hairlines a pixel apart and
+  // regret of ~0.08 as a flat line on the floor — the whole result invisible
+  // inside a mostly empty panel. `clampLo`/`clampHi` keep the padding from
+  // running past a bound the quantity cannot cross (a rate below 0 or above
+  // 1); they do not force the axis out to meet them.
+  let lo = Infinity, hi = -Infinity;
   for (const s of cfg.series) {
-    for (const [t, v] of s.points) {
+    for (const p of s.points) {
+      if (!p) continue;                       // break marker, not a sample
+      const [t, v] = p;
       if (t < x0 || t > x1) continue;
       if (!Number.isFinite(v)) continue;
       lo = Math.min(lo, v); hi = Math.max(hi, v);
     }
   }
-  if (cfg.yMax !== undefined) hi = cfg.yMax;
-  if (cfg.yMin !== undefined) lo = cfg.yMin;
-  if (hi <= lo) hi = lo + 1;
-  if (cfg.yMax === undefined) hi *= 1.08;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) { lo = 0; hi = 1; }
+  // A flat series still needs a band around it, or it lands on an edge and
+  // reads as missing rather than constant.
+  const span = (hi - lo) || Math.max(Math.abs(hi), 1e-9) * 0.2;
+  lo -= span * 0.12; hi += span * 0.12;
+  if (cfg.clampLo !== undefined) lo = Math.max(lo, cfg.clampLo);
+  if (cfg.clampHi !== undefined) hi = Math.min(hi, cfg.clampHi);
+  if (hi <= lo) hi = lo + (Math.abs(lo) || 1) * 0.1;
 
   const X = t => M.left + (t - x0) / ((x1 - x0) || 1) * iw;
   const Y = v => M.top + ih - (v - lo) / ((hi - lo) || 1) * ih;
+
+  // Without this, a zoom paints every out-of-range sample over the axis
+  // labels and the neighbouring panels.
+  const clipId = `plot${++clipSeq}`;
+  const clip = el("clipPath", { id: clipId });
+  clip.appendChild(el("rect", { x: M.left, y: M.top - 4, width: iw, height: ih + 4 }));
+  svg.appendChild(clip);
 
   for (const tick of niceTicks(lo, hi, 4)) {
     const y = Y(tick);
@@ -445,98 +476,50 @@ function drawLinePanel(host, cfg) {
   }
 
   for (const s of cfg.series) {
-    const pts = s.points.filter(p => Number.isFinite(p[1]));
-    if (!pts.length) continue;
     const solid = [], dashed = [];
-    let cur = solid, started = false, d = "";
-    const flush = arr => { if (d) arr.push(d); d = ""; };
+    let d = "", prev = null;
+    const flush = () => { if (d) solid.push(d); d = ""; };
 
-    for (let i = 0; i < pts.length; i++) {
-      const [t, v] = pts[i];
-      if (!started) { d = `M ${X(t)} ${Y(v)}`; started = true; continue; }
+    for (const p of s.points) {
+      // A break marker lifts the pen. Joining across it would invent a value
+      // for a window the engine reported nothing for.
+      if (!p || !Number.isFinite(p[1])) { flush(); prev = null; continue; }
+      const [t, v] = p;
+      if (prev === null) { d = `M ${X(t)} ${Y(v)}`; prev = p; continue; }
       const gap = s.stepped === false
         ? false
-        : (t - pts[i - 1][0]) > (s.gapThreshold || Infinity);
+        : (t - prev[0]) > (s.gapThreshold || Infinity);
       if (gap) {
-        // Break the run: the held segment across an idle window is drawn
-        // dashed so silence reads differently from continuous data.
-        flush(cur);
-        dashed.push(`M ${X(pts[i - 1][0])} ${Y(pts[i - 1][1])} L ${X(t)} ${Y(pts[i - 1][1])}`);
-        d = `M ${X(t)} ${Y(pts[i - 1][1])} L ${X(t)} ${Y(v)}`;
-        cur = solid;
-        continue;
+        // The held segment across an idle stretch is drawn dashed, so silence
+        // reads differently from continuous data.
+        flush();
+        dashed.push(`M ${X(prev[0])} ${Y(prev[1])} L ${X(t)} ${Y(prev[1])}`);
+        d = `M ${X(t)} ${Y(prev[1])} L ${X(t)} ${Y(v)}`;
+      } else {
+        d += s.stepped === false
+          ? ` L ${X(t)} ${Y(v)}`
+          : ` L ${X(t)} ${Y(prev[1])} L ${X(t)} ${Y(v)}`;
       }
-      d += s.stepped === false
-        ? ` L ${X(t)} ${Y(v)}`
-        : ` L ${X(t)} ${Y(pts[i - 1][1])} L ${X(t)} ${Y(v)}`;
+      prev = p;
     }
-    flush(cur);
+    flush();
 
     for (const path of solid) {
       svg.appendChild(el("path", { d: path, fill: "none", stroke: s.colour,
         "stroke-width": s.width || 1.8, "stroke-dasharray": s.dash,
-        "stroke-linejoin": "round" }));
+        "stroke-linejoin": "round", "clip-path": `url(#${clipId})` }));
     }
     for (const path of dashed) {
       svg.appendChild(el("path", { d: path, fill: "none", stroke: s.colour,
-        "stroke-width": 1, "stroke-dasharray": "2 4", opacity: 0.55 }));
+        "stroke-width": 1, "stroke-dasharray": "2 4", opacity: 0.55,
+        "clip-path": `url(#${clipId})` }));
     }
   }
 
   return finishPanel(host, svg, width, X, x0, x1, cfg);
 }
 
-/**
- * Stacked attribution. Windowed data, so it is drawn as rectangles over the
- * interval each sample covers — not as a smooth area, which would imply
- * per-instant values the log does not carry.
- */
-function drawStackPanel(host, cfg) {
-  const width = host.clientWidth || 800;
-  const h = PANEL_H;
-  const svg = el("svg", { viewBox: `0 0 ${width} ${h}`, height: h });
-  const [x0, x1] = xDomain();
-  const iw = width - M.left - M.right, ih = h - M.top - M.bottom;
-  const hi = Math.max(cfg.yMax || 0, 1);
-
-  const X = t => M.left + (t - x0) / ((x1 - x0) || 1) * iw;
-  const Y = v => M.top + ih - v / hi * ih;
-
-  for (const tick of niceTicks(0, hi, 4)) {
-    const y = Y(tick);
-    svg.appendChild(el("line", { x1: M.left, x2: width - M.right, y1: y, y2: y,
-                                stroke: "var(--grid)", "stroke-width": 1 }));
-    const tx = el("text", { x: M.left - 8, y: y + 3.5, "text-anchor": "end",
-                            fill: "var(--muted)", "font-size": 10 });
-    tx.textContent = fmtNum(tick, 0);
-    svg.appendChild(tx);
-  }
-  for (const tick of niceTicks(x0, x1, 6)) {
-    const tx = el("text", { x: X(tick), y: h - 6, "text-anchor": "middle",
-                            fill: "var(--muted)", "font-size": 10 });
-    tx.textContent = fmtTime(tick);
-    svg.appendChild(tx);
-  }
-
-  for (const w of cfg.windows) {
-    if (w.t1 < x0 || w.t0 > x1) continue;
-    const xa = X(Math.max(w.t0, x0)), xb = X(Math.min(w.t1, x1));
-    let acc = 0;
-    for (const [label, v] of w.bands) {
-      if (v <= 0) continue;
-      const yTop = Y(acc + v), yBot = Y(acc);
-      svg.appendChild(el("rect", {
-        x: xa, y: yTop, width: Math.max(0.5, xb - xa), height: Math.max(0, yBot - yTop),
-        fill: S.labelColour.get(label) || "#888", opacity: 0.9,
-      }));
-      acc += v;
-    }
-  }
-
-  return finishPanel(host, svg, width, X, x0, x1, cfg);
-}
-
-// Crosshair, zoom brush and hover target, shared by both panel kinds.
+// Crosshair, zoom brush and hover target.
 function finishPanel(host, svg, width, X, x0, x1, cfg) {
   const cross = el("line", { y1: M.top, y2: PANEL_H - M.bottom, stroke: "var(--muted)",
                              "stroke-width": 1, "stroke-dasharray": "3 3",
@@ -605,6 +588,16 @@ function nearest(rows, t) {
   return best;
 }
 
+// On a window panel the segment under the cursor belongs to the line that
+// *closed* that window — the one at its right edge. Nearest-stamp picks the
+// left edge for the first half of every interval and reads out the previous
+// window's numbers.
+function rowFor(rows, t, windowed) {
+  if (!windowed) return nearest(rows, t);
+  for (const r of rows) if (r.t >= t) return r;
+  return rows[rows.length - 1] || null;
+}
+
 function showCrosshair(t, clientX, clientY, cfg) {
   for (const p of S.panels) {
     const px = p.X(t);
@@ -615,7 +608,10 @@ function showCrosshair(t, clientX, clientY, cfg) {
   const rows = [];
   rows.push(`<div class="tt-t">t = ${fmtTime(t)}</div>`);
   for (const run of runList()) {
-    const s = nearest(run.rows, t);
+    // A policy-only panel must not read out a baseline value: the panel omits
+    // that curve precisely so a constant 0.000 is not mistaken for a result.
+    if (cfg.policyOnly && run.variant !== "node_eviction") continue;
+    const s = rowFor(run.rows, t, cfg.windowed);
     if (!s) continue;
     const v = cfg.readout ? cfg.readout(s, run) : null;
     if (v === null || v === undefined) continue;
@@ -639,57 +635,7 @@ function hideCrosshair() {
 }
 
 /* ==================================================================== *
- * 7. Attribution windows
- *
- * `top_evicted` names only the top N keys, so the named bands do NOT sum to
- * the eviction total. The remainder gets an explicit band: without it the
- * chart silently under-reports and a reader concludes five nodes did
- * everything. `<untracked>` is a real category (requests with no job_id),
- * not a remainder, so it keeps its own band.
- * ==================================================================== */
-
-const OTHER = "other (untruncated)";
-
-function attributionWindows(run) {
-  const out = [];
-  for (let i = 0; i < run.rows.length; i++) {
-    const r = run.rows[i];
-    const prev = i > 0 ? run.rows[i - 1] : null;
-    const t0 = prev ? prev.t : Math.max(0, r.t - 30);
-    const dEvicted = prev ? num(r.evicted) - num(prev.evicted) : num(r.evicted);
-    let named = 0;
-    const bands = [];
-    for (const [label, v] of r._top) {
-      named += v;
-      if (S.hiddenLabels.has(label)) continue;
-      bands.push([label, v]);
-    }
-    bands.sort((a, b) => a[0].localeCompare(b[0]));
-    const other = Math.max(0, dEvicted - named);
-    if (other > 0 && !S.hiddenLabels.has(OTHER)) bands.push([OTHER, other]);
-    out.push({ t0, t1: r.t, bands });
-  }
-  return out;
-}
-
-function collectLabels() {
-  const set = new Set();
-  for (const run of Object.values(S.runs)) {
-    if (!run) continue;
-    for (const r of run.rows) for (const k of r._top.keys()) set.add(k);
-  }
-  const sorted = [...set].sort();
-  S.labelColour = new Map();
-  sorted.forEach((l, i) => S.labelColour.set(l, PALETTE[i % PALETTE.length]));
-  // Stable across BOTH runs — if a node is teal on one panel and amber on
-  // the other, the comparison is unreadable.
-  S.labelColour.set(OTHER, "var(--muted)");
-  S.labelColour.set("<untracked>", "#9d755d");
-  return sorted;
-}
-
-/* ==================================================================== *
- * 8. Summary header
+ * 7. Summary header
  * ==================================================================== */
 
 function last(run) { return run.rows[run.rows.length - 1]; }
@@ -700,15 +646,11 @@ function buildSummary() {
   const b = S.runs.baseline, p = S.runs.node_eviction;
   if (!b && !p) return;
 
-  // "lower is better" for movement; "higher is better" for hit rate.
+  // Higher is better for hit rate, lower for TTFT and regret. The two
+  // trailing rows are not results — they are the denominators the three
+  // above are only interpretable against.
   const metrics = [
-    { key: "KV rebuilt (remat_mb)", headline: true, lowerBetter: true,
-      get: r => num(last(r).remat_mb), fmt: fmtMB },
-    { key: "Blocks rebuilt (remat_blocks)", lowerBetter: true,
-      get: r => num(last(r).remat_blocks), fmt: v => fmtNum(v, 0) },
-    { key: "Redo share (remat_ratio)", lowerBetter: true,
-      get: r => num(last(r).remat_ratio), fmt: fmtPct },
-    { key: "Hit rate (cumulative)", lowerBetter: false,
+    { key: "Hit rate (cumulative)", headline: true, lowerBetter: false,
       get: r => num(last(r).hit_rate), fmt: fmtPct },
     // Engine-side TTFT: scheduler queueing + prefill, which is the part a
     // cache miss actually pays for. If hit rate moved and this did not, the
@@ -717,22 +659,12 @@ function buildSummary() {
       get: r => num(last(r).ttft_ms), fmt: fmtMs },
     { key: "TTFT p95", lowerBetter: true,
       get: r => num(last(r).ttft_p95_ms), fmt: fmtMs },
-    { key: "Requests measured (ttft_n)", lowerBetter: null,
-      get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
-    { key: "Evictions", lowerBetter: true,
-      get: r => num(last(r).evicted), fmt: v => fmtNum(v, 0) },
-    { key: "Mean occupancy", lowerBetter: null,
-      get: r => r.rows.reduce((a, x) => a + num(x.usage), 0) / r.rows.length / 100,
-      fmt: fmtPct },
-    { key: "Blocks spliced", lowerBetter: null,
-      get: r => num(last(r).spliced_blocks), fmt: v => fmtNum(v, 0) },
     { key: "Final regret", lowerBetter: true,
       get: r => num(last(r).regret), fmt: v => v.toFixed(3) },
-    { key: "Tokens served (query_tokens)", lowerBetter: null,
+    { key: "Tokens queried (query_tokens)", lowerBetter: null,
       get: r => num(last(r).query_tokens), fmt: v => fmtNum(v, 0) },
-    { key: "Distinct job:node keys", lowerBetter: null,
-      get: r => new Set(r.rows.flatMap(x => [...x._top.keys()])).size,
-      fmt: v => String(v) },
+    { key: "Requests measured (ttft_n)", lowerBetter: null,
+      get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
   ];
 
   const rows = metrics.map(m => {
@@ -765,7 +697,7 @@ function buildSummary() {
 }
 
 /* ==================================================================== *
- * 9. Banners — refuse to let the page flatter the result
+ * 8. Banners — refuse to let the page flatter the result
  * ==================================================================== */
 
 function buildBanners() {
@@ -787,34 +719,23 @@ function buildBanners() {
     return;
   }
 
-  // Runs that did not serve the same work cannot be compared on absolute MB.
+  // Hit rate is token-normalised and survives a size mismatch; the TTFT
+  // means do not, because they average over whatever requests arrived.
   const qb = num(last(b).query_tokens), qp = num(last(p).query_tokens);
   if (qb > 0 && qp > 0) {
     const diff = Math.abs(qp - qb) / Math.max(qb, qp);
     if (diff > 0.10) {
       add(`<b>Runs served different amounts of work</b> — ` +
           `query_tokens differ by ${(diff * 100).toFixed(0)}% ` +
-          `(${fmtNum(qb, 0)} vs ${fmtNum(qp, 0)}). The absolute ` +
-          `<code>remat_mb</code> delta is not a fair number here; quote ` +
-          `<code>remat_ratio</code> instead.`);
+          `(${fmtNum(qb, 0)} vs ${fmtNum(qp, 0)}). Hit rate is a per-token ` +
+          `ratio and survives that; the TTFT means describe two different ` +
+          `workloads, so treat their delta as unreliable here.`);
     }
   }
 
-  // remat_mb == 0 with remat_blocks > 0 means the page size was never
-  // configured. Plotting that as "no movement" inverts the conclusion.
-  for (const r of [b, p]) {
-    const L = last(r);
-    if (num(L.remat_blocks) > 0 && num(L.remat_mb) === 0) {
-      add(`<b>${labelFor(r.variant)}: KV page size unknown</b> — ` +
-          `<code>remat_mb</code> is 0 while <code>remat_blocks</code> is ` +
-          `${fmtNum(L.remat_blocks, 0)}. Panel 1 falls back to blocks. ` +
-          `This is the engine declining to guess, not an absence of movement.`);
-    }
-  }
-
-  // TTFT means over different request counts are not a comparison. This is
-  // the one number on the page that is per-request rather than per-block, so
-  // it is the one an unmatched workload silently corrupts.
+  // TTFT means over different request counts are not a comparison. It is the
+  // one quantity here that is per-request rather than per-token, so it is the
+  // one an unmatched workload silently corrupts.
   const nb = num(last(b).ttft_n), np = num(last(p).ttft_n);
   if (nb > 0 && np > 0) {
     const d = Math.abs(np - nb) / Math.max(nb, np);
@@ -827,13 +748,7 @@ function buildBanners() {
   } else if (nb === 0 && np === 0) {
     add(`<b>No TTFT samples in either run</b> — <code>ttft_n=0</code>. Either ` +
         `no request produced a token, or the log predates the field. ` +
-        `Panels 4 and 5 will be flat.`);
-  }
-
-  if (num(last(p).splices) === 0) {
-    add(`<b>The policy never spliced</b> — <code>splices=0</code> for the ` +
-        `whole run. The tick never reached the splice, so this is a bug in ` +
-        `the run, not a result about the policy.`);
+        `Panels 2 and 3 will be flat.`);
   }
 
   for (const r of [b, p]) {
@@ -850,140 +765,48 @@ function buildBanners() {
 }
 
 /* ==================================================================== *
- * 10. Panel definitions
+ * 9. Panel definitions
  * ==================================================================== */
 
-function useBlocksForMovement() {
-  // Fall back to blocks when no run knows its page size.
-  for (const r of Object.values(S.runs)) {
-    if (r && num(last(r).remat_mb) > 0) return false;
-  }
-  return true;
-}
-
 function panelDefs() {
-  const asBlocks = useBlocksForMovement();
-  const movField = asBlocks ? "remat_blocks" : "remat_mb";
-  const movFmt = asBlocks ? (v => fmtNum(v, 0)) : fmtMB;
-  const movUnit = asBlocks ? "blocks" : "MB";
-
   return [
-  { id: "rebuilt",
-    title: `1 · KV rebuilt, cumulative (${movUnit})`,
-    why: "The headline. The gap between the two curves at the right edge is the result.",
-    kind: "line",
-    fmtY: movFmt,
-    series: run => [{ points: levelSeries(run.rows, movField) }],
-    readout: s => movFmt(num(s[movField])),
-  },
-  { id: "rebuildRate",
-    title: `2 · Rebuild rate (${movUnit}/s)`,
-    why: "When the policy helped. A gap that opens only under pressure is a different story from a constant offset.",
-    kind: "line",
-    fmtY: v => fmtNum(v, 2),
-    series: run => [{ points: rateSeries(run.rows, movField) }],
-    readout: (s, run) => {
-      const i = run.rows.indexOf(s);
-      if (i < 1) return "–";
-      const dt = s.t - run.rows[i-1].t;
-      return dt > 0 ? fmtNum((num(s[movField]) - num(run.rows[i-1][movField])) / dt, 2) + "/s" : "–";
-    },
-  },
-  { id: "hit",
-    title: "3 · Prefix cache hit rate (this window)",
-    why: "Read against panel 1. Movement down with hit rate flat or up is the win; movement down and hit rate down means it served less, not better.",
-    kind: "line", yMin: 0, yMax: 1, fmtY: fmtPct,
-    series: run => [{ points: levelSeries(run.rows, "hit_rate_win") }],
-    readout: s => fmtPct(num(s.hit_rate_win)) + " (cum " + fmtPct(num(s.hit_rate)) + ")",
+  { id: "hitCum",
+    title: "1 · Prefix cache hit rate, cumulative",
+    why: "<code>hit_tokens / query_tokens</code> since the run started — the field <code>hit_rate</code>, and the number you get computing it by hand from the last line. Prompt tokens served from HBM-resident blocks, counted once per request. Deliberately not vLLM's own <code>Prefix cache hit rate</code> line, which re-counts a request on every scheduler step it spends queued and so is weighted by the queueing delay eviction pressure itself sets. It can fall as well as rise: queried tokens that miss enter the denominator.",
+    kind: "line", clampLo: 0, clampHi: 1, fmtY: fmtPct,
+    series: run => [{ points: levelSeries(run.rows, "hit_rate", "query_tokens") }],
+    readout: (s, run) => fmtPct(num(s.hit_rate)) + "  (" + fmtNum(num(s.hit_tokens), 0) +
+                         " / " + fmtNum(num(s.query_tokens), 0) + " tokens)",
   },
   { id: "ttft",
-    title: "4 · Time to first token, engine-side (this window)",
-    why: "What the misses cost. Read against panel 3: hit rate says how often the cache worked, this says whether it mattered. Scheduler queueing plus prefill only — it excludes front-end queueing and detokenization, so it reads lower than the client's TTFT and is not the same quantity.",
-    kind: "line", yMin: 0, fmtY: fmtMs,
-    series: run => [{ points: levelSeries(run.rows, "ttft_win_ms") }],
-    readout: s => fmtMs(num(s.ttft_win_ms)) + "  (cum " + fmtMs(num(s.ttft_ms)) +
-                  ", n=" + fmtNum(num(s.ttft_n), 0) + ")",
+    title: "2 · Time to first token, engine-side (this window)",
+    why: "What the misses cost. Read against panel 1: hit rate says how often the cache worked, this says whether it mattered — a policy can raise hit rate on blocks that were cheap to rebuild and move nothing here. Scheduler queueing plus prefill only; it excludes front-end queueing and detokenization, so it reads lower than the client's TTFT and is not the same quantity. Windows with no completed request are breaks, not zeros.",
+    kind: "line", clampLo: 0, fmtY: fmtMs, windowed: true,
+    series: run => [{ points: windowSeries(run.rows, "ttft_win_ms", "ttft_n"),
+                      stepped: false }],
+    readout: (s, run) => fmtMs(num(s.ttft_win_ms)) + "  (over " +
+                  fmtNum(windowDelta(run, s, "ttft_n"), 0) + " requests; cum " +
+                  fmtMs(num(s.ttft_ms)) + " over " + fmtNum(num(s.ttft_n), 0) + ")",
   },
   { id: "ttftP95",
-    title: "5 · TTFT p95 (last 4096 requests)",
-    why: "The tail, which the mean hides. A policy that destroys one large prefix can hold the mean flat and still make a minority of requests much worse.",
-    kind: "line", yMin: 0, fmtY: fmtMs,
-    series: run => [{ points: levelSeries(run.rows, "ttft_p95_ms") }],
+    title: "3 · TTFT p95 (last 4096 requests)",
+    why: "The tail, which the mean hides. A policy that destroys one large prefix can hold the mean flat and still make a minority of requests much worse. A trailing quantity, not a window one — it is the p95 over the last 4096 requests as of each line, so it is held forward until the next.",
+    kind: "line", clampLo: 0, fmtY: fmtMs,
+    series: run => [{ points: levelSeries(run.rows, "ttft_p95_ms", "ttft_n") }],
     readout: s => fmtMs(num(s.ttft_p95_ms)),
   },
-  { id: "redo",
-    title: "6 · Redo share — rebuilt / cached (this window)",
-    why: "Normalises panel 2 for throughput, so a quiet run cannot fake an improvement.",
-    kind: "line", yMin: 0, fmtY: fmtPct,
-    series: run => [{ points: ratioSeries(run.rows, "remat_blocks", "blocks_cached") }],
-    readout: (s, run) => {
-      const i = run.rows.indexOf(s);
-      if (i < 1) return "–";
-      const dn = num(s.remat_blocks) - num(run.rows[i-1].remat_blocks);
-      const dd = num(s.blocks_cached) - num(run.rows[i-1].blocks_cached);
-      return dd > 0 ? fmtPct(dn / dd) : "–";
-    },
-  },
-  { id: "occupancy",
-    title: "7 · HBM occupancy",
-    why: "used / total. Fixed 0–100% axis so the two runs are directly comparable.",
-    kind: "line", yMin: 0, yMax: 100, fmtY: v => v.toFixed(0) + "%",
-    series: run => [{ points: levelSeries(run.rows, "usage") }],
-    readout: s => num(s.usage).toFixed(1) + "%  (" + fmtNum(s.used, 0) + " / " + fmtNum(s.total, 0) + ")",
-  },
-  { id: "queue",
-    title: "8 · Free queue depth (eviction candidates)",
-    why: "A policy that keeps this deeper is holding more evictable-but-cached blocks.",
-    kind: "line", yMin: 0, fmtY: v => fmtNum(v, 0),
-    series: run => [{ points: levelSeries(run.rows, "queue") }],
-    readout: s => fmtNum(num(s.queue), 0) + " blocks",
-  },
-  { id: "evictRate",
-    title: "9 · Eviction rate (blocks/s)",
-    why: "Churn volume, for context on panels 1 and 2.",
-    kind: "line", yMin: 0, fmtY: v => fmtNum(v, 1),
-    series: run => [{ points: rateSeries(run.rows, "evicted") }],
-    readout: (s, run) => {
-      const i = run.rows.indexOf(s);
-      if (i < 1) return "–";
-      const dt = s.t - run.rows[i-1].t;
-      return dt > 0 ? fmtNum((num(s.evicted) - num(run.rows[i-1].evicted)) / dt, 1) + "/s" : "–";
-    },
-  },
-  { id: "splice",
-    title: "10 · Splice activity (blocks/s)",
-    why: "Policy only — LRU never reorders the queue. A flat zero here is a bug in the run, not a result.",
-    kind: "line", yMin: 0, fmtY: v => fmtNum(v, 1), policyOnly: true,
-    series: run => [{ points: rateSeries(run.rows, "spliced_blocks") }],
-    readout: s => fmtNum(num(s.spliced_blocks), 0) + " cumulative",
-  },
-  { id: "attrPolicy",  kind: "stack", variant: "node_eviction",
-    title: "11 · Evictions by job:node — policy",
-    why: "Per window. Bands do not sum to the eviction total, so the remainder is drawn explicitly.",
-  },
-  { id: "attrBaseline", kind: "stack", variant: "baseline",
-    title: "12 · Evictions by job:node — baseline",
-    why: "Same colours and the same y-scale as panel 11. Locking the scale is what makes them comparable at a glance.",
-  },
   { id: "regret",
-    title: "13 · Regret",
-    why: "Policy only. The baseline emits a constant 0.000 — plotting it would read as 'no regret' rather than 'not measured'.",
-    kind: "line", yMin: 0, yMax: 1, fmtY: v => v.toFixed(2), policyOnly: true,
-    series: run => [{ points: levelSeries(run.rows, "regret") }],
+    title: "4 · Regret",
+    why: "<code>evicted_then_needed / evicted_by_score</code>, cumulative — the share of scored evictions the policy had to take back. Policy only: the baseline emits a constant 0.000, and plotting it would read as 'no regret' rather than 'not measured'. The axis fits the data, so read the numbers, not the slope's steepness.",
+    kind: "line", clampLo: 0, clampHi: 1, fmtY: v => v.toFixed(3), policyOnly: true,
+    series: run => [{ points: levelSeries(run.rows, "regret", "evicted_by_score") }],
     readout: s => num(s.regret).toFixed(3),
-  },
-  { id: "scored",
-    title: "14 · Scored coverage — evicted_by_score / evicted",
-    why: "Policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so.",
-    kind: "line", yMin: 0, yMax: 1, fmtY: fmtPct, policyOnly: true,
-    series: run => [{ points: run.rows.map(r => [r.t, num(r.evicted) > 0 ? num(r.evicted_by_score) / num(r.evicted) : 0]) }],
-    readout: s => num(s.evicted) > 0 ? fmtPct(num(s.evicted_by_score) / num(s.evicted)) : "–",
   },
   ];
 }
 
 /* ==================================================================== *
- * 11. Render
+ * 10. Render
  * ==================================================================== */
 
 function render() {
@@ -999,55 +822,10 @@ function render() {
   }
   document.getElementById("toolbar").hidden = false;
 
-  const labels = collectLabels();
-
-  // Panels 9 and 10 share a y-scale; that is what makes them comparable.
-  let stackMax = 1;
-  const stackCache = {};
-  for (const v of ["baseline", "node_eviction"]) {
-    if (!S.runs[v]) continue;
-    const w = attributionWindows(S.runs[v]);
-    stackCache[v] = w;
-    for (const win of w) {
-      const sum = win.bands.reduce((a, x) => a + x[1], 0);
-      if (sum > stackMax) stackMax = sum;
-    }
-  }
-
   for (const def of panelDefs()) {
     const sec = document.createElement("section");
     sec.className = "panel";
     sec.innerHTML = `<h3>${def.title}</h3><p class="why">${def.why}</p>`;
-
-    if (def.kind === "stack") {
-      if (!S.runs[def.variant]) continue;
-      if (S.solo !== "all" && S.solo !== def.variant) continue;
-      if (labels.length) {
-        const leg = document.createElement("div");
-        leg.className = "legend";
-        for (const l of [...labels, OTHER]) {
-          const s = document.createElement("span");
-          s.className = "item" + (S.hiddenLabels.has(l) ? "" : " active");
-          s.innerHTML = `<span class="swatch" style="background:${S.labelColour.get(l)}"></span>${l}`;
-          s.onclick = () => {
-            S.hiddenLabels.has(l) ? S.hiddenLabels.delete(l) : S.hiddenLabels.add(l);
-            render();
-          };
-          leg.appendChild(s);
-        }
-        sec.appendChild(leg);
-      }
-      host.appendChild(sec);
-      drawStackPanel(sec, {
-        windows: stackCache[def.variant] || [],
-        yMax: stackMax,
-        readout: s => {
-          const parts = [...s._top].map(([k, v]) => `${k}=${v}`);
-          return parts.length ? parts.join(", ") : "–";
-        },
-      });
-      continue;
-    }
 
     const series = [];
     for (const run of runs) {
@@ -1056,6 +834,9 @@ function render() {
       for (const s of def.series(run)) {
         series.push({
           points: s.points,
+          // Dropping this was what let the window panels fall back to
+          // step-after and shift a window off its own interval.
+          stepped: s.stepped,
           colour: colourFor(run.variant),
           dash: run.variant === "baseline" ? "5 3" : undefined,
           gapThreshold: gap,
@@ -1077,8 +858,9 @@ function render() {
     host.appendChild(sec);
 
     drawLinePanel(sec, {
-      series, yMin: def.yMin, yMax: def.yMax,
-      fmtY: def.fmtY, readout: def.readout,
+      series, clampLo: def.clampLo, clampHi: def.clampHi,
+      fmtY: def.fmtY, readout: def.readout, windowed: def.windowed,
+      policyOnly: def.policyOnly,
     });
   }
 
@@ -1086,7 +868,7 @@ function render() {
 }
 
 /* ==================================================================== *
- * 12. Intake
+ * 11. Intake
  * ==================================================================== */
 
 function ingest(text, hintVariant) {
@@ -1101,7 +883,6 @@ function ingest(text, hintVariant) {
 
 function afterLoad() {
   S.domain = null;
-  S.hiddenLabels.clear();
   buildBanners();
   render();
 }
@@ -1183,45 +964,31 @@ window.addEventListener("resize", () => {
 document.getElementById("demo").addEventListener("click", () => {
   const mk = (variant, seed) => {
     const lines = [];
-    let evicted = 0, remat = 0, cached = 0, spliced = 0, splices = 0;
     let hitT = 0, qT = 0, ttftN = 0, ttftSum = 0;
-    const total = 24000;
-    const rematRate = variant === "baseline" ? 1.0 : 0.55;
     const hit = variant === "baseline" ? 0.62 : 0.71;
     // Higher hit rate, lower prefill cost — the shape a working policy has.
     const ttftBase = variant === "baseline" ? 640 : 470;
     for (let i = 0; i < 60; i++) {
       const t = new Date(Date.UTC(2026, 7, 7, 12, 0, 0) + i * 30000);
       const load = 0.6 + 0.4 * Math.sin(i / 7 + seed);
-      evicted += Math.round(220 * load);
-      cached += Math.round(340 * load);
-      remat += Math.round(90 * load * rematRate);
-      if (variant !== "baseline") { splices += 1; spliced += Math.round(180 * load); }
       const q = Math.round(52000 * load); qT += q;
       const hw = hit + 0.06 * Math.sin(i / 4 + seed);
       hitT += Math.round(q * hw);
       const ttftWin = ttftBase * (0.85 + 0.5 * load);
       const nWin = Math.round(14 * load);
       ttftN += nWin; ttftSum += ttftWin * nWin;
-      const used = Math.round(total * (0.72 + 0.2 * load * 0.5));
       const stamp = `INFO 08-07 ${String(t.getUTCHours()).padStart(2,"0")}:` +
                     `${String(t.getUTCMinutes()).padStart(2,"0")}:` +
                     `${String(t.getUTCSeconds()).padStart(2,"0")} [controller.py:600]`;
-      const topA = Math.round(120 * load), topB = Math.round(70 * load);
+      // Only the fields this page reads; a real line carries many more.
       lines.push(
-        `${stamp} kv_hbm variant=${variant} total=${total} used=${used} ` +
-        `free=${total-used} usage=${(used/total*100).toFixed(1)}% queue=${total-used} ` +
-        `splices=${splices} spliced_blocks=${spliced} evicted=${evicted} ` +
-        `evicted_by_score=${variant==="baseline"?0:Math.round(evicted*0.72)} ` +
+        `${stamp} kv_hbm variant=${variant} ` +
         `regret=${variant==="baseline"?"0.000":(0.09+0.02*Math.sin(i/5)).toFixed(3)} ` +
         `hit_rate=${(hitT/qT).toFixed(4)} hit_rate_win=${hw.toFixed(4)} ` +
         `ttft_ms=${(ttftSum/Math.max(ttftN,1)).toFixed(1)} ` +
         `ttft_win_ms=${ttftWin.toFixed(1)} ` +
         `ttft_p95_ms=${(ttftWin*1.9).toFixed(1)} ttft_n=${ttftN} ` +
-        `hit_tokens=${hitT} query_tokens=${qT} remat_blocks=${remat} ` +
-        `remat_mb=${(remat*2).toFixed(1)} remat_ratio=${(remat/cached).toFixed(4)} ` +
-        `blocks_cached=${cached} index_keys=112 index_blocks=9130 ` +
-        `top_evicted=run-42:research=${topA},run-42:supervisor=${topB},<untracked>=${Math.round(20*load)}`
+        `hit_tokens=${hitT} query_tokens=${qT}`
       );
     }
     return lines.join("\n");

@@ -158,6 +158,7 @@ async def _fan_out_prefetches(
     agent_id: str,
     k: int | None,
     wait: bool,
+    identity: dict[str, str] | None = None,
 ) -> tuple[int, int]:
     """Submit phantom prefetches for ``agent_id``.
 
@@ -165,6 +166,12 @@ async def _fan_out_prefetches(
     agent is warmed (no top-K truncation). When ``k`` is a positive
     int, only the ``k`` most-recently-used prefixes are warmed; ``k``
     <= 0 is a no-op.
+
+    ``identity`` rides into ``sampling_params.extra_args`` and is what makes
+    the warmed blocks visible to the node-eviction policy; see
+    :meth:`PhantomPrefetchSubmitter.submit`. Passing it is the whole
+    difference between a warmed prefix the policy can protect and one it
+    evicts by age like any anonymous block.
 
     Returns ``(submitted, completed)`` -- ``submitted`` is the number
     of phantoms actually handed to the engine after dedup; ``completed``
@@ -185,6 +192,7 @@ async def _fan_out_prefetches(
             token_ids=desc.token_ids,
             prefix_hash=desc.prefix_hash,
             cache_salt=desc.cache_salt,
+            identity=identity,
         )
         if task is not None:
             tasks.append(task)
@@ -199,6 +207,31 @@ async def _fan_out_prefetches(
     results = await asyncio.gather(*tasks, return_exceptions=True)
     completed = sum(1 for r in results if not isinstance(r, BaseException))
     return submitted, completed
+
+
+def _prefetch_identity(request: AgentPrefetchRequest) -> dict[str, str] | None:
+    """The `(job_id, langgraph_node, call_type)` the phantom should carry.
+
+    Returns None unless *both* `job_id` and `langgraph_node` are present,
+    because that is exactly `node_key_for_request`'s own requirement: it
+    returns None if either is missing, and a partial identity would ride into
+    `extra_args` looking like attribution while indexing nothing.
+
+    `agent_id` is included too. The policy ignores it, but it is the field
+    `FileStatLogger`'s per-request CSV attributes on, and a phantom that
+    cannot be told apart from a real request in that CSV makes the prefetch
+    arm impossible to audit after the fact.
+    """
+    if not request.job_id or not request.langgraph_node:
+        return None
+    identity = {
+        "job_id": request.job_id,
+        "langgraph_node": request.langgraph_node,
+        "agent_id": request.agent_id,
+    }
+    if request.call_type:
+        identity["call_type"] = request.call_type
+    return identity
 
 
 def _record_in_registry(
@@ -502,17 +535,31 @@ async def prefetch_agent_cache(
 
     available = registry.agent_size(request.agent_id)
     top_k_repr = "all" if effective_top_k is None else str(effective_top_k)
+    identity = _prefetch_identity(request)
 
     logger.info(
         "agent_prefetch: prefetch request for agent=%s kind=%s seeded=%s "
-        "top_k=%s available=%d wait=%s",
+        "top_k=%s available=%d wait=%s identity=%s",
         request.agent_id,
         request.agent_kind,
         seeded,
         top_k_repr,
         available,
         request.wait,
+        # Logged on every call, not once: which prefetches carry an identity
+        # and which do not is a per-call property, and reading it off the log
+        # is the only way to tell a warmed-and-protected prefix from a warmed
+        # -and-LRU one after the run.
+        identity or "none",
     )
+    if identity is None:
+        logger.warning_once(
+            "agent_prefetch: prefetch called without job_id/langgraph_node "
+            "-- the warmed blocks will be cached but never indexed by the "
+            "node-eviction policy (node_key_for_request returns None), so "
+            "they carry no score and are evicted in LRU order. Send the "
+            "identity the following real request will send. Logged once."
+        )
 
     submitted, completed = await _fan_out_prefetches(
         registry=registry,
@@ -520,6 +567,7 @@ async def prefetch_agent_cache(
         agent_id=request.agent_id,
         k=effective_top_k,
         wait=request.wait,
+        identity=identity,
     )
 
     elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
@@ -534,6 +582,10 @@ async def prefetch_agent_cache(
         "completed": completed,
         "waited": request.wait,
         "duration_ms": round(elapsed_ms, 2),
+        # Echoed so a caller can assert it sent a usable identity without
+        # having to read the server log.
+        "identity": identity,
+        "scored": identity is not None,
     }
     logger.info(
         "agent_prefetch: prefetch done agent=%s submitted=%d completed=%d "

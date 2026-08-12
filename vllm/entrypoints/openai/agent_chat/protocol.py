@@ -118,3 +118,38 @@ class AgentPrefetchRequest(BaseModel):
         "phantom prefetches. Omit to use whatever the registry already "
         "holds for the agent."
     )
+    # --- node-eviction identity -------------------------------------
+    #
+    # `(job_id, langgraph_node, call_type)` is the key the node-aware
+    # eviction policy indexes blocks under (`node_key_for_request`). Without
+    # it a phantom's blocks are cached but never indexed: `on_blocks_cached`
+    # returns early on `key is None`, so they carry no score, are never
+    # stamped speculative, and are evicted in plain LRU order — the opposite
+    # of what warming them was for.
+    #
+    # These must be the identity the *upcoming real request* will present,
+    # not the prefetch caller's own. `agent_id` is namespace-scoped and its
+    # node segment can be a graph path (`langgraph:research_supervisor:
+    # supervisor_tools:researcher`) while the real request sends the bare
+    # runtime node (`researcher`), so the node is NOT derived from it here —
+    # a derived-but-wrong key indexes the phantom under a name no real
+    # request ever presents, which is worse than leaving it unscored.
+    job_id: str | None = Field(
+        default=None, max_length=256,
+        description="Job the warmed prefix belongs to. First element of "
+        "the node-eviction index key. Omit only if you accept unscored "
+        "blocks."
+    )
+    langgraph_node: str | None = Field(
+        default=None, max_length=256,
+        description="Runtime node name the warmed prefix will be used by "
+        "— the bare value the real request sends as `langgraph_node`, not "
+        "the graph path embedded in `agent_id`. Second element of the "
+        "index key."
+    )
+    call_type: str | None = Field(
+        default=None, max_length=256,
+        description="Flattened leaf label for the call, third element of "
+        "the index key. Defaults server-side to the empty string, which is "
+        "what `use_call_type=False` keying uses."
+    )

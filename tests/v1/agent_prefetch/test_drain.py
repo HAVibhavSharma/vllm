@@ -169,9 +169,14 @@ def test_the_identity_round_trips_into_the_key_the_engine_asked_for():
 
 
 def test_an_anonymous_phantom_is_invisible_to_the_policy():
-    """Records the pre-existing behaviour the identity argument fixes: the
-    `/v1/agents/prefetch` endpoint submits without identity, so its phantoms
-    still cannot be stamped speculative."""
+    """`submit` without an identity still yields an unscored phantom.
+
+    Not a wish: a caller that cannot name the node the prefix is for has
+    nothing safe to send, and inventing a key from `agent_id` would index the
+    blocks under a name no real request presents. `/v1/agents/prefetch` now
+    supplies the identity when the caller gives it one — see
+    `test_prefetch_identity.py` — so this is the deliberate fallback, not the
+    endpoint's behaviour."""
     captured = {}
 
     class CapturingEngineClient:

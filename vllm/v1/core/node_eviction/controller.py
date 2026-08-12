@@ -342,7 +342,6 @@ class NodeEvictionController:
         self,
         num_tokens: int,
         num_hits: int,
-        preempted: bool = False,
         request=None,
     ) -> None:
         """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
@@ -360,7 +359,7 @@ class NodeEvictionController:
         if not self.enabled:
             return
         phantom = request is not None and _is_prefetch_only(request)
-        self.movement.on_cache_query(num_tokens, num_hits, preempted, phantom)
+        self.movement.on_cache_query(num_tokens, num_hits, phantom)
 
     def on_request_finished(self, request) -> None:
         """`KVCacheManager.free` — the request is done with its blocks.
@@ -786,7 +785,6 @@ class NodeEvictionController:
             f"evicted_by_score={c.evictions_by_score_total} "
             f"regret={c.regret_rate:.3f} "
             f"hit_rate={m.hit_rate:.4f} "
-            f"hit_rate_fresh={m.hit_rate_fresh:.4f} "
             f"hit_rate_win={m.window_hit_rate:.4f} "
             # Engine-side TTFT — what a miss cost, next to how often it
             # happened. Hit rate alone cannot separate a policy that kept
@@ -797,7 +795,6 @@ class NodeEvictionController:
             f"ttft_n={self.ttft.count} "
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
-            f"query_tokens_fresh={m.query_tokens_fresh} "
             # Phantom traffic, excluded from every rate above. Reported so
             # the prefill origination bought is visible next to the hit rate
             # it was meant to raise, rather than hidden inside it.

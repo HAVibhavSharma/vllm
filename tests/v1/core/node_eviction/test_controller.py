@@ -758,7 +758,6 @@ def test_a_phantom_lookup_is_not_counted_as_demand():
 
     m = controller.movement
     assert m.hit_rate == 1.0
-    assert m.hit_rate_fresh == 1.0
     assert m.window_hit_rate == 1.0
     assert m.query_tokens == 100
 

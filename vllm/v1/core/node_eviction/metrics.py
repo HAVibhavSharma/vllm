@@ -272,13 +272,6 @@ class CacheMovementTracker:
         self.blocks_cached = 0
         self.hit_tokens = 0
         self.query_tokens = 0
-        # First-scheduling queries only, excluding preempted re-queries. This
-        # is the subset vLLM's own "Prefix cache hit rate" counts, so it is
-        # what reconciles this line against the engine's log. Without it the
-        # two numbers disagree by a factor that grows with preemption rate
-        # and nobody can tell which is broken.
-        self.hit_tokens_fresh = 0
-        self.query_tokens_fresh = 0
         # Reset when a summary line is emitted, so the line can show the
         # rate *now* next to the rate since boot. A cumulative hit rate over
         # a long run is dominated by whatever the workload did first.
@@ -292,7 +285,6 @@ class CacheMovementTracker:
         self,
         num_tokens: int,
         num_hits: int,
-        preempted: bool = False,
         phantom: bool = False,
     ) -> None:
         if phantom:
@@ -305,9 +297,6 @@ class CacheMovementTracker:
         self.hit_tokens += num_hits
         self.window_query_tokens += num_tokens
         self.window_hit_tokens += num_hits
-        if not preempted:
-            self.query_tokens_fresh += num_tokens
-            self.hit_tokens_fresh += num_hits
 
     def on_block_cached(self, block_hash) -> None:
         self.blocks_cached += 1
@@ -353,34 +342,22 @@ class CacheMovementTracker:
 
     @property
     def hit_rate(self) -> float:
-        if self.query_tokens == 0:
-            return 0.0
-        return self.hit_tokens / self.query_tokens
+        """Demand-side hit rate, one query counted per request.
 
-    @property
-    def hit_rate_fresh(self) -> float:
-        """Demand-side hit rate: first scheduling of each request only.
-
-        A preempted request re-queries with a `num_tokens` that has grown to
-        include what it already generated, so counting those re-queries
-        inflates the denominator with work no cache was ever going to serve.
-        `PrefixCacheStats` routes them to its `preempted_*` fields and
-        `CachingMetrics.observe` ignores those entirely; this mirrors that.
-
-        **Deliberately no longer comparable to vLLM's `Prefix cache hit rate`
+        **Deliberately not comparable to vLLM's `Prefix cache hit rate`
         line.** That one counts every call to `get_computed_blocks`, and the
         scheduler makes one per step for as long as a request sits in the
         waiting queue — so its denominator is weighted by queueing delay,
         which eviction pressure itself sets. Measured on the 2026-08-09 run
         that came to 779M query tokens against ~440k real prompt tokens, a
-        factor of ~1771. The caller now counts each request once
+        factor of ~1771. The caller counts each request once
         (`Request.cache_query_counted`); upstream's counter is left alone so
         it stays comparable to stock vLLM. Expect the two numbers to differ,
         and expect this one to be the meaningful one.
         """
-        if self.query_tokens_fresh == 0:
+        if self.query_tokens == 0:
             return 0.0
-        return self.hit_tokens_fresh / self.query_tokens_fresh
+        return self.hit_tokens / self.query_tokens
 
     @property
     def window_hit_rate(self) -> float:
@@ -427,11 +404,8 @@ class CacheMovementTracker:
         return {
             "hit_rate": self.hit_rate,
             "hit_rate_window": self.window_hit_rate,
-            "hit_rate_fresh": self.hit_rate_fresh,
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
-            "hit_tokens_fresh": self.hit_tokens_fresh,
-            "query_tokens_fresh": self.query_tokens_fresh,
             "phantom_hit_rate": self.phantom_hit_rate,
             "phantom_hit_tokens": self.phantom_hit_tokens,
             "phantom_query_tokens": self.phantom_query_tokens,

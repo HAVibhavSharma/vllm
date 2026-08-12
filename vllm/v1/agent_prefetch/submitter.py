@@ -164,6 +164,20 @@ class PhantomPrefetchSubmitter:
         """Drain the engine generator. Exceptions are logged, never raised."""
         try:
             prompt: dict[str, Any] = {"prompt_token_ids": token_ids}
+            # The success path used to be silent, which left `submitted` /
+            # `completed` from the HTTP layer as the only evidence a phantom
+            # existed — and those count asyncio tasks, not engine requests. A
+            # phantom that never reaches the scheduler is then
+            # indistinguishable from one that ran: both report
+            # `submitted=1 completed=1`. Debug, not info: at real want volume
+            # this is one line per phantom.
+            logger.debug(
+                "agent_prefetch: submitting phantom %s (%d prompt tokens, "
+                "identity=%s)",
+                request_id,
+                len(token_ids),
+                params.extra_args,
+            )
             gen = self._engine_client.generate(prompt, params, request_id)
             # Consume the generator until the engine finishes. We don't
             # use the outputs; the engine handles APC registration in
@@ -172,6 +186,9 @@ class PhantomPrefetchSubmitter:
             # cached.
             async for _ in gen:
                 pass
+            logger.debug(
+                "agent_prefetch: phantom %s finished in engine", request_id
+            )
         except asyncio.CancelledError:
             raise
         except Exception:

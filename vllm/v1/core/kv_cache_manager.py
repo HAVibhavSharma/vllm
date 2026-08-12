@@ -257,7 +257,6 @@ class KVCacheManager:
             self.node_eviction.on_cache_query(
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
-                preempted=request.num_preemptions > 0,
                 # Lets the tracker route a phantom prefetch's own lookup out
                 # of the headline hit rate.
                 request=request,

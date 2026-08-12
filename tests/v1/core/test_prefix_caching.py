@@ -2651,6 +2651,5 @@ def test_a_waiting_requery_is_counted_once(monkeypatch):
 
     movement = manager.node_eviction.movement
     assert movement.query_tokens == req.num_tokens
-    assert movement.query_tokens_fresh == req.num_tokens
     # Upstream's counter is intentionally left alone.
     assert manager.prefix_cache_stats.queries == 5 * req.num_tokens
