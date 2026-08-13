@@ -613,10 +613,13 @@ async def prefetch_agent_cache(
         logger.warning(
             "agent_prefetch: nothing to warm for agent=%s -- no prefixes are "
             "registered under that id, so this call submitted no phantoms. "
-            "Expected on a node's first execution; if it persists, the "
-            "registry is empty (needs VLLM_NODE_EVICTION_PREFETCH_DRAIN=1 for "
-            "it to exist from startup) or the client's agent_id does not "
-            "match the `%s:<langgraph_node>` key the writers use.",
+            "Registration is retrospective, so this is expected on a node's "
+            "first execution. If it persists past the second visit, the "
+            "client's agent_id does not match the `%s:<langgraph_node>` key "
+            "chat traffic registers under. (Setting "
+            "VLLM_NODE_EVICTION_PREFETCH_DRAIN=1 is NOT the fix: it creates "
+            "the registry at startup, but it also switches on engine-core "
+            "want origination, which submits phantoms of its own.)",
             request.agent_id,
             request.agent_id.split(":", 1)[0] if ":" in request.agent_id else "ns",
         )

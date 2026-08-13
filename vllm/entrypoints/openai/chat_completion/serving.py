@@ -84,6 +84,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _identity_extra_args(request: ChatCompletionRequest) -> dict[str, Any]:
+    """The `extra_args` engine core will actually see, for read-only use.
+
+    Mirrors `ChatCompletionRequest.to_sampling_params`
+    (`chat_completion/protocol.py:562`): `vllm_xargs` as the base, then
+    `model_extra` on top. Both halves matter — a client may send identity
+    under `vllm_xargs`, or as top-level `extra_body` fields that Pydantic
+    collects into `model_extra`, and the two are indistinguishable by the
+    time they reach the engine.
+
+    Builds a new dict rather than reusing the request's. `to_sampling_params`
+    mutates `self.vllm_xargs` in place when it merges; doing the same here
+    would make an observability read-out edit the request it is observing.
+    """
+    merged: dict[str, Any] = dict(request.vllm_xargs) if request.vllm_xargs else {}
+    if request.model_extra:
+        merged.update(request.model_extra)
+    return merged
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -277,15 +297,26 @@ class OpenAIServingChat(OpenAIServing):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
 
             # Record this prefix for node-aware prefetch origination. No-op
-            # unless the drainer created a registry at startup and the
-            # request carries `langgraph_node` in `vllm_xargs` — the same
-            # identity engine core keys the eviction policy on. Without it
-            # the want-list drains to zero phantoms forever, because the
-            # registry is otherwise only written by /v1/agents/*.
+            # unless a registry exists and the request carries
+            # `langgraph_node` — the same identity engine core keys the
+            # eviction policy on. Without it the want-list drains to zero
+            # phantoms forever, and every /v1/agents/prefetch answers
+            # `available=0`, because the registry is otherwise only written
+            # by /v1/agents/*.
+            #
+            # `vllm_xargs` alone is NOT that identity. `to_sampling_params`
+            # builds `extra_args` as `vllm_xargs` updated with `model_extra`
+            # (`chat_completion/protocol.py:562`), and a client that sends
+            # `job_id` / `langgraph_node` as top-level `extra_body` fields —
+            # which the OpenAI layer allows, and which is how the LangGraph
+            # integration sends them — lands entirely in `model_extra` with
+            # `vllm_xargs` unset. Reading only `vllm_xargs` therefore saw
+            # nothing while engine core saw the full identity, so eviction
+            # attribution worked and prefetch registration silently did not.
             if raw_request is not None:
                 maybe_record_chat_prefix(
                     raw_request.app.state,
-                    extra_args=request.vllm_xargs,
+                    extra_args=_identity_extra_args(request),
                     model_name=self.model_config.model,
                     prompt_token_ids=prompt_token_ids,
                     cache_salt=getattr(request, "cache_salt", None),
