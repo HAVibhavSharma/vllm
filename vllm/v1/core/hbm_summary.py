@@ -271,15 +271,35 @@ class HBMSummaryLogger:
             return 0.0
         return self.ttft_window_total_ms / self.ttft_window_count
 
-    @property
-    def ttft_p95_ms(self) -> float:
-        """Over the retained ring, not the whole run."""
+    def _ttft_percentile(self, q: float) -> float:
+        """Nearest-rank over the retained ring, not the whole run."""
         if not self._ttft_recent:
             return 0.0
         ordered = sorted(self._ttft_recent)
-        # Nearest-rank: the smallest sample at or above the 95th percentile.
-        idx = min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)
+        # The smallest sample at or above the qth percentile.
+        idx = min(len(ordered) - 1, int(math.ceil(q * len(ordered))) - 1)
         return ordered[max(idx, 0)]
+
+    @property
+    def ttft_p50_ms(self) -> float:
+        """The median, and the number to read *first*.
+
+        TTFT is heavy-tailed: one cold prefill in a window of short ones drags
+        the mean somewhere no request actually was. The mean still answers
+        "what did this cost in aggregate"; the median answers "what did a
+        request see". When they disagree by a lot, the mean is describing the
+        tail — which is what `ttft_p95_ms` is for.
+
+        Over the same ring as `ttft_p95_ms`, so the two are drawn from one
+        population and their spread means something. Mirrors
+        `node_eviction/metrics.py::TTFTTracker.p50_ms`.
+        """
+        return self._ttft_percentile(0.50)
+
+    @property
+    def ttft_p95_ms(self) -> float:
+        """Over the retained ring, not the whole run."""
+        return self._ttft_percentile(0.95)
 
     def on_reset_prefix_cache(self) -> None:
         # Every hash in the pool was just invalidated, so every claim here is
@@ -420,6 +440,7 @@ class HBMSummaryLogger:
             # cheap-to-rebuild blocks from one that kept expensive ones.
             f"ttft_ms={self.ttft_mean_ms:.1f} "
             f"ttft_win_ms={self.ttft_window_mean_ms:.1f} "
+            f"ttft_p50_ms={self.ttft_p50_ms:.1f} "
             f"ttft_p95_ms={self.ttft_p95_ms:.1f} "
             f"ttft_n={self.ttft_count} "
             f"hit_tokens={self.hit_tokens} "
@@ -502,6 +523,7 @@ class HBMSummaryLogger:
             "hit_rate_fresh": self.hit_rate_fresh,
             "ttft_ms": self.ttft_mean_ms,
             "ttft_window_ms": self.ttft_window_mean_ms,
+            "ttft_p50_ms": self.ttft_p50_ms,
             "ttft_p95_ms": self.ttft_p95_ms,
             "ttft_n": self.ttft_count,
             "hit_tokens": self.hit_tokens,

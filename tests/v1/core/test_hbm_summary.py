@@ -36,6 +36,7 @@ EXPECTED_FIELDS = [
     "hit_rate_win",
     "ttft_ms",
     "ttft_win_ms",
+    "ttft_p50_ms",
     "ttft_p95_ms",
     "ttft_n",
     "hit_tokens",
@@ -457,6 +458,7 @@ def test_ttft_p95_is_over_the_ring():
     assert logger.ttft_count == 100
     assert logger.ttft_mean_ms == pytest.approx(50.5)
     assert logger.ttft_p95_ms == pytest.approx(95.0)
+    assert logger.ttft_p50_ms == pytest.approx(50.0)
 
 
 def test_the_summary_line_carries_ttft():
@@ -465,4 +467,27 @@ def test_the_summary_line_carries_ttft():
     fields = parse(logger.summary())
     assert float(fields["ttft_ms"]) == 500.0
     assert float(fields["ttft_win_ms"]) == 500.0
+    assert float(fields["ttft_p50_ms"]) == 500.0
     assert fields["ttft_n"] == "1"
+
+
+def test_ttft_median_ignores_the_outlier_the_mean_chases():
+    """The reason the median is on the line at all. Nine fast requests and one
+    30s cold prefill: the mean lands at 3s, which is not what any of the ten
+    saw. Mean >> median says the tail moved, not the common case."""
+    logger = make_logger(FakePool())
+    for _ in range(9):
+        logger.on_request_finished(_ttft_request(0.0, 0.1))
+    logger.on_request_finished(_ttft_request(0.0, 30.0))
+
+    assert logger.ttft_mean_ms == pytest.approx(3090.0)
+    assert logger.ttft_p50_ms == pytest.approx(100.0)
+    assert logger.ttft_p95_ms == pytest.approx(30_000.0)
+
+
+def test_ttft_percentiles_are_zero_before_any_sample():
+    """Not NaN: a NaN poisons every downstream average, and the summary line
+    has to print something on the startup line."""
+    logger = make_logger(FakePool())
+    assert logger.ttft_p50_ms == 0.0
+    assert logger.ttft_p95_ms == 0.0
