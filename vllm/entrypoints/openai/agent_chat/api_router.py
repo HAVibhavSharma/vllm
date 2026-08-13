@@ -234,6 +234,56 @@ def _prefetch_identity(request: AgentPrefetchRequest) -> dict[str, str] | None:
     return identity
 
 
+def _resolve_registry_agent_id(
+    registry: AgentPrefixRegistry,
+    request: AgentPrefetchRequest,
+) -> str:
+    """The requested `agent_id`, unless nothing is filed under it and the
+    request's own `langgraph_node` names an agent that does exist.
+
+    Two writers fill this registry and both key it on the **bare** node:
+    `auto_register.maybe_record_chat_prefix` uses
+    `f"{namespace}:{extra_args['langgraph_node']}"`, and engine core builds
+    `PrefetchWant.agent_id` as `f"{namespace}:{key.node}"` from a `NodeKey`
+    that holds only the node. A client that identifies nodes by their graph
+    position instead — `langgraph:research_supervisor:supervisor_tools:
+    researcher` against a registry holding `langgraph:researcher` — asks for
+    an agent no writer ever creates.
+
+    That failure is silent in the worst way. `agent_size` returns 0, the
+    fan-out submits nothing, and the endpoint still answers 200 OK in under a
+    millisecond, so the client sees a successful prefetch and the run shows
+    `phantom_query_tokens=0` with no error anywhere. It cost a full
+    measurement run to find.
+
+    The fix belongs in the client, and is one there. This is the guard: it
+    only fires when the requested id is genuinely empty *and* the fallback is
+    genuinely populated, so it cannot mask a legitimately cold agent or
+    redirect a request that was already correct — and it warns every time,
+    because a server quietly rewriting the caller's key is not something to
+    discover from a metric weeks later.
+    """
+    if registry.agent_size(request.agent_id) > 0:
+        return request.agent_id
+    if not request.langgraph_node:
+        return request.agent_id
+    namespace = request.agent_id.split(":", 1)[0] if ":" in request.agent_id else ""
+    fallback = f"{namespace}:{request.langgraph_node}" if namespace else None
+    if not fallback or fallback == request.agent_id:
+        return request.agent_id
+    if registry.agent_size(fallback) == 0:
+        return request.agent_id
+    logger.warning(
+        "agent_prefetch: no prefixes registered under agent_id=%r, but %r "
+        "has some -- warming that instead. The registry is keyed on the bare "
+        "`langgraph_node`, so the client should derive agent_id from the "
+        "node, not from its graph path.",
+        request.agent_id,
+        fallback,
+    )
+    return fallback
+
+
 def _record_in_registry(
     *,
     registry: AgentPrefixRegistry,
@@ -533,7 +583,10 @@ async def prefetch_agent_cache(
     else:
         effective_top_k = request.prefetch_top_k
 
-    available = registry.agent_size(request.agent_id)
+    # The id the fan-out actually reads from. Normally the requested one; see
+    # `_resolve_registry_agent_id` for the single case where it is not.
+    lookup_agent_id = _resolve_registry_agent_id(registry, request)
+    available = registry.agent_size(lookup_agent_id)
     top_k_repr = "all" if effective_top_k is None else str(effective_top_k)
     identity = _prefetch_identity(request)
 
@@ -552,6 +605,21 @@ async def prefetch_agent_cache(
         # -and-LRU one after the run.
         identity or "none",
     )
+    if available == 0:
+        # The endpoint answers 200 OK either way, so without this a no-op
+        # prefetch is indistinguishable from a working one at the call site.
+        # Not `warning_once`: which calls warmed nothing is a per-call fact,
+        # and on a first visit to a node it is expected rather than a fault.
+        logger.warning(
+            "agent_prefetch: nothing to warm for agent=%s -- no prefixes are "
+            "registered under that id, so this call submitted no phantoms. "
+            "Expected on a node's first execution; if it persists, the "
+            "registry is empty (needs VLLM_NODE_EVICTION_PREFETCH_DRAIN=1 for "
+            "it to exist from startup) or the client's agent_id does not "
+            "match the `%s:<langgraph_node>` key the writers use.",
+            request.agent_id,
+            request.agent_id.split(":", 1)[0] if ":" in request.agent_id else "ns",
+        )
     if identity is None:
         logger.warning_once(
             "agent_prefetch: prefetch called without job_id/langgraph_node "
@@ -564,7 +632,7 @@ async def prefetch_agent_cache(
     submitted, completed = await _fan_out_prefetches(
         registry=registry,
         submitter=submitter,
-        agent_id=request.agent_id,
+        agent_id=lookup_agent_id,
         k=effective_top_k,
         wait=request.wait,
         identity=identity,
@@ -573,6 +641,13 @@ async def prefetch_agent_cache(
     elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
     body: dict[str, Any] = {
         "agent_id": request.agent_id,
+        # Present only when the fallback above fired, so a caller can assert
+        # its own key was used without having to parse the server log.
+        **(
+            {"resolved_agent_id": lookup_agent_id}
+            if lookup_agent_id != request.agent_id
+            else {}
+        ),
         "agent_kind": request.agent_kind,
         "seeded_from_text": seeded,
         # "all" when no cap was provided; an int otherwise.
