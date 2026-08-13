@@ -791,6 +791,10 @@ class NodeEvictionController:
             # cheap-to-rebuild blocks from one that kept expensive ones.
             f"ttft_ms={self.ttft.mean_ms:.1f} "
             f"ttft_win_ms={self.ttft.window_mean_ms:.1f} "
+            # The median sits between the two means and the tail on purpose:
+            # read left to right it goes aggregate cost, this window, what a
+            # typical request saw, what the worst 5% saw.
+            f"ttft_p50_ms={self.ttft.p50_ms:.1f} "
             f"ttft_p95_ms={self.ttft.p95_ms:.1f} "
             f"ttft_n={self.ttft.count} "
             f"hit_tokens={m.hit_tokens} "

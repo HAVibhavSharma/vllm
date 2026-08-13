@@ -74,6 +74,7 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
 | `hit_rate_win` | Same, this window only | same |
 | `ttft_ms` | Engine-side time to first token, mean since boot | same |
 | `ttft_win_ms` | Same, this window only | same |
+| `ttft_p50_ms` | Median over the last 4096 samples | same |
 | `ttft_p95_ms` | 95th percentile over the last 4096 samples | same |
 | `ttft_n` | Samples taken, i.e. requests that produced a token | same |
 | `hit_tokens` / `query_tokens` | The raw numerator and denominator | same |
@@ -148,10 +149,19 @@ request keeps its original `first_token_ts`, so the sample is gated on
 often they were preempted. A request that never produced a token contributes
 nothing rather than a zero.
 
-The mean is exact and cumulative; `ttft_p95_ms` comes from a bounded ring of
-the last 4096 samples, because retaining every sample for an exact percentile
-is unbounded under load. Read the p95 alongside the mean: a policy that
-evicts one large prefix can hold the mean flat and wreck the tail.
+The mean is exact and cumulative; `ttft_p50_ms` and `ttft_p95_ms` come from a
+bounded ring of the last 4096 samples, because retaining every sample for an
+exact percentile is unbounded under load. Both percentiles are drawn from that
+one ring, so the median-to-p95 spread describes a single population.
+
+Read all three together. TTFT is heavy-tailed, so the mean can sit somewhere
+no request actually was: nine 100 ms prefills and one 30 s cold miss average
+to 3.09 s, which describes none of the ten. The median says what a typical
+request saw, the p95 says what the worst 5% saw, and the mean says what the
+work cost in aggregate. **A mean that moved without the median is a tail
+effect** — quoting it as "requests got faster" is the specific mistake the
+median was added to prevent. The converse is also a finding: median down with
+the mean flat means the common case improved and one straggler ate the gain.
 
 ### 2.1.1 Phantoms are excluded, not discarded
 
@@ -416,9 +426,19 @@ VLLM_NODE_EVICTION_POLICY=1 vllm serve ... 2>&1 | tee policy.log
 # Baseline clone.
 VLLM_HBM_SUMMARY_PERIOD_MS=30000 vllm serve ... 2>&1 | tee baseline.log
 
-grep 'kv_hbm ' policy.log   > policy.kv_hbm
-grep 'kv_hbm ' baseline.log > baseline.kv_hbm
+# Continuum clone (`/Users/vibhavsharma/Projects/vllm-continuum`) — same
+# module, same env vars, `variant=continuum`.
+VLLM_HBM_SUMMARY_PERIOD_MS=30000 vllm serve ... 2>&1 | tee continuum.log
+
+grep 'kv_hbm ' policy.log    > policy.kv_hbm
+grep 'kv_hbm ' baseline.log  > baseline.kv_hbm
+grep 'kv_hbm ' continuum.log > continuum.kv_hbm
 ```
+
+`plan/hbm-timeline.html` takes all **three** at once: it holds runs in slots
+A, B and C rather than in fixed arms, and labels each column with the variant
+its own lines name. Slot A is the reference — every Δ is measured against it,
+so load `baseline.kv_hbm` there.
 
 Both files are `key=value` lines with identical field order, so they parse
 with a two-line split and diff directly. To visualise them over time, see

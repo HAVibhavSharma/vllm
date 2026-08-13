@@ -469,15 +469,38 @@ class TTFTTracker:
             return 0.0
         return self.window_total_ms / self.window_count
 
-    @property
-    def p95_ms(self) -> float:
-        """Over the retained ring, not the whole run."""
+    def _percentile(self, q: float) -> float:
+        """Nearest-rank over the retained ring, not the whole run."""
         if not self._recent:
             return 0.0
         ordered = sorted(self._recent)
-        # Nearest-rank: the smallest sample at or above the 95th percentile.
-        idx = min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1)
+        # The smallest sample at or above the qth percentile.
+        idx = min(len(ordered) - 1, int(math.ceil(q * len(ordered))) - 1)
         return ordered[max(idx, 0)]
+
+    @property
+    def p50_ms(self) -> float:
+        """The median, and the number to read *first*.
+
+        TTFT is heavy-tailed: one 30-second cold prefill in a window of short
+        ones drags the mean somewhere no request actually was. The mean is
+        still the right figure for total work, but it answers "what did this
+        cost in aggregate", not "what did a request see". When the mean and
+        the median disagree by a lot, the mean is describing the tail — and
+        the tail is what `p95_ms` is for.
+
+        Over the same bounded ring as `p95_ms`, so the two are always drawn
+        from the same population and their spread is meaningful. That makes it
+        a median over recent samples, not over the whole run; an exact
+        lifetime median needs every sample retained, which is unbounded under
+        load and is what the ring exists to avoid.
+        """
+        return self._percentile(0.50)
+
+    @property
+    def p95_ms(self) -> float:
+        """Over the retained ring, not the whole run."""
+        return self._percentile(0.95)
 
     def reset_window(self) -> None:
         self.window_count = 0
@@ -487,6 +510,7 @@ class TTFTTracker:
         return {
             "ttft_ms": self.mean_ms,
             "ttft_window_ms": self.window_mean_ms,
+            "ttft_p50_ms": self.p50_ms,
             "ttft_p95_ms": self.p95_ms,
             "ttft_n": self.count,
         }

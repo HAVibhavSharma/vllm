@@ -8,27 +8,31 @@
   :root {
     --bg: #ffffff; --fg: #16191d; --muted: #6b7280; --line: #e3e6ea;
     --panel: #fafbfc; --warn-bg: #fff4e5; --warn-fg: #8a4b00; --warn-br: #f0c68a;
-    --baseline: #d97528; --policy: #1f8f7a; --grid: #eceff3;
+    --baseline: #d97528; --policy: #1f8f7a; --third: #5b5bd6;
+    --grid: #eceff3;
     --good: #147a5e; --bad: #b3261e;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14171a; --fg: #e6e9ed; --muted: #98a2b3; --line: #2a2f36;
       --panel: #1a1e23; --warn-bg: #3a2a12; --warn-fg: #f0c68a; --warn-br: #6b4a1c;
-      --baseline: #f0913f; --policy: #35bda3; --grid: #23282e;
+      --baseline: #f0913f; --policy: #35bda3; --third: #9d9bf5;
+      --grid: #23282e;
       --good: #35bda3; --bad: #f2726a;
     }
   }
   :root[data-theme="light"] {
     --bg: #ffffff; --fg: #16191d; --muted: #6b7280; --line: #e3e6ea;
     --panel: #fafbfc; --warn-bg: #fff4e5; --warn-fg: #8a4b00; --warn-br: #f0c68a;
-    --baseline: #d97528; --policy: #1f8f7a; --grid: #eceff3;
+    --baseline: #d97528; --policy: #1f8f7a; --third: #5b5bd6;
+    --grid: #eceff3;
     --good: #147a5e; --bad: #b3261e;
   }
   :root[data-theme="dark"] {
     --bg: #14171a; --fg: #e6e9ed; --muted: #98a2b3; --line: #2a2f36;
     --panel: #1a1e23; --warn-bg: #3a2a12; --warn-fg: #f0c68a; --warn-br: #6b4a1c;
-    --baseline: #f0913f; --policy: #35bda3; --grid: #23282e;
+    --baseline: #f0913f; --policy: #35bda3; --third: #9d9bf5;
+      --grid: #23282e;
     --good: #35bda3; --bad: #f2726a;
   }
 
@@ -48,7 +52,8 @@
             background: var(--panel); margin-bottom: 20px; }
   #intake.drag { border-color: var(--policy); background: color-mix(in srgb, var(--policy) 8%, var(--panel)); }
   .intake-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-  .paste-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+  .paste-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+  @media (max-width: 980px) { .paste-grid { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 720px) { .paste-grid { grid-template-columns: 1fr; } }
   textarea { width: 100%; min-height: 90px; resize: vertical; padding: 8px;
              border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
@@ -110,9 +115,23 @@
 <div class="wrap">
   <h1>KV eviction — HBM timeline</h1>
   <p class="sub">
-    Drop the <code>kv_hbm</code> lines from both runs. Three quantities only —
-    prefix cache hit rate, engine-side TTFT, regret. Everything is computed in
-    the page; nothing leaves your machine.
+    Drop the <code>kv_hbm</code> lines from both runs — prefix cache hit rate,
+    engine-side TTFT (mean, median, p95), regret. Optionally add each arm's
+    harness report
+    (<code>armD_rep1.jsonl</code> / <code>armE_rep1.jsonl</code>) for
+    client-measured end-to-end latency, paired per trace key. Everything is
+    computed in the page; nothing leaves your machine.
+  </p>
+  <p class="sub">
+    Up to <b>three</b> arms at once, held in slots, not in fixed variants:
+    <code>baseline</code>, <code>node_eviction</code>, <code>continuum</code>,
+    or any other <code>variant=</code> value. <b>Slot A is the reference</b> —
+    every Δ in the summary is measured against it, so put the arm you are
+    comparing <em>to</em> there. A is dashed, B solid, C dotted, and each is
+    labelled with the variant its own lines name. Policy-only panels (splice,
+    regret, scored coverage) still render only for <code>node_eviction</code>:
+    the other variants emit a constant zero there, and plotting it would read
+    as a result rather than as "not measured".
   </p>
 
   <div id="intake">
@@ -124,12 +143,33 @@
     </div>
     <div class="paste-grid">
       <div>
-        <label class="fld" for="pasteA">Run A — paste <code>grep 'kv_hbm ' baseline.log</code></label>
+        <label class="fld" for="pasteA">Run A (reference) — paste <code>grep 'kv_hbm ' baseline.log</code></label>
         <textarea id="pasteA" spellcheck="false" placeholder="kv_hbm variant=baseline total=…"></textarea>
       </div>
       <div>
-        <label class="fld" for="pasteB">Run B — paste <code>grep 'kv_hbm ' test_our.log</code></label>
+        <label class="fld" for="pasteB">Run B (under test) — paste <code>grep 'kv_hbm ' test_our.log</code></label>
         <textarea id="pasteB" spellcheck="false" placeholder="kv_hbm variant=node_eviction total=…"></textarea>
+      </div>
+      <div>
+        <label class="fld" for="pasteC">Run C (third arm) — optional</label>
+        <textarea id="pasteC" spellcheck="false" placeholder="kv_hbm variant=continuum total=…"></textarea>
+      </div>
+    </div>
+    <div class="paste-grid" style="margin-top:12px">
+      <div>
+        <label class="fld" for="reportA">Run A arm report
+          <code>.jsonl</code> — optional</label>
+        <input type="file" id="reportA" accept=".jsonl,.json,.txt">
+      </div>
+      <div>
+        <label class="fld" for="reportB">Run B arm report
+          <code>.jsonl</code> — optional</label>
+        <input type="file" id="reportB" accept=".jsonl,.json,.txt">
+      </div>
+      <div>
+        <label class="fld" for="reportC">Run C arm report
+          <code>.jsonl</code> — optional</label>
+        <input type="file" id="reportC" accept=".jsonl,.json,.txt">
       </div>
     </div>
     <div class="intake-row" style="margin-top:10px">
@@ -141,9 +181,10 @@
   <div id="banners"></div>
 
   <div class="toolbar" id="toolbar" hidden>
-    <button data-solo="all" class="on" type="button">Both runs</button>
-    <button data-solo="baseline" type="button">Baseline only</button>
-    <button data-solo="node_eviction" type="button">Policy only</button>
+    <button data-solo="all" class="on" type="button">All runs</button>
+    <button data-solo="A" id="soloA" type="button">Run A only</button>
+    <button data-solo="B" id="soloB" type="button">Run B only</button>
+    <button data-solo="C" id="soloC" type="button">Run C only</button>
     <span class="spacer"></span>
     <span class="hint" id="zoomHint">Drag on any panel to zoom · double-click to reset</span>
     <button id="theme" type="button">Theme</button>
@@ -174,8 +215,8 @@
 // of data, not a policy with no regret.
 const NUMERIC_FIELDS = new Set([
   "regret","hit_rate",
-  "ttft_ms","ttft_win_ms","ttft_p95_ms","ttft_n",
-  "hit_tokens","query_tokens","evicted_by_score",
+  "ttft_ms","ttft_win_ms","ttft_p50_ms","ttft_p95_ms","ttft_n",
+  "hit_tokens","query_tokens","evicted_by_score","evicted",
 ]);
 
 // vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
@@ -233,9 +274,105 @@ function parseRun(text) {
   });
 
   const variant = rows[0].variant;
-  const missing = ["hit_rate", "ttft_ms", "regret"]
+  // `ttft_p50_ms` is here so a log written before the median was added says so
+  // instead of drawing panel 3 empty and leaving the reader to guess whether
+  // the median was zero or absent.
+  const missing = ["hit_rate", "ttft_ms", "ttft_p50_ms", "regret"]
     .filter(k => rows[0][k] === undefined);
   return { variant, rows, syntheticTime: !haveStamps, missingFields: missing };
+}
+
+/* ==================================================================== *
+ * 1b. End-to-end reports
+ *
+ * A different source with different semantics from `kv_hbm`, so it is parsed
+ * and labelled separately: the engine line measures what the engine did, the
+ * report measures what the client waited for. E2E carries front-end queueing,
+ * detokenization, tool calls and the harness's own overhead — none of which an
+ * eviction policy can move — so it is the number that matters to a user and
+ * the noisier one to attribute.
+ *
+ * One JSON object per line, from `ODR_TRACE_REPORT`. Only `key` and
+ * `live_latency_ns` are required; `key` is the trace key, which is what makes
+ * a *paired* comparison possible — the same prompt in both arms, so the
+ * difference is not confounded by which prompts happened to run.
+ * ==================================================================== */
+
+function parseReport(text) {
+  const recs = [];
+  let bad = 0;
+  for (const line of text.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    let o;
+    try { o = JSON.parse(s); } catch { bad++; continue; }
+    const ns = Number(o.live_latency_ns);
+    if (!Number.isFinite(ns) || ns <= 0) continue;
+    recs.push({
+      key: String(o.key === undefined ? "" : o.key),
+      ns,
+      tokens: Number(o.live_completion_tokens) || 0,
+    });
+  }
+  if (!recs.length) return null;
+
+  // These files are append-only: one run's records sit on top of the last,
+  // with no timestamp to tell them apart. Observed in the wild —
+  // `armE_rep1.jsonl` once held 48 records over 14 keys. Last occurrence per
+  // key wins, being the most recent run, and the number collapsed is
+  // surfaced: silently averaging several runs into one E2E figure is exactly
+  // the mistake this page exists to prevent.
+  const byKey = new Map();
+  for (const r of recs) byKey.set(r.key, r);
+  const kept = [...byKey.values()];
+  const sorted = kept.map(r => r.ns).sort((a, b) => a - b);
+  const total = kept.reduce((a, r) => a + r.ns, 0);
+  return {
+    byKey,
+    calls: kept.length,
+    rawRecords: recs.length,
+    duplicates: recs.length - byKey.size,
+    badLines: bad,
+    totalNs: total,
+    meanNs: total / kept.length,
+    medianNs: sorted[Math.floor(sorted.length / 2)],
+  };
+}
+
+/**
+ * Paired E2E over the keys present in both arms.
+ *
+ * Paired, not two independent means: the trace is pinned, so the same key is
+ * the same prompt with the same pinned `max_tokens` in both runs. Comparing
+ * per key removes the "did the two runs serve the same work" question that
+ * every unpaired number on this page has to carry a banner about.
+ *
+ * Both the aggregate (Σpolicy / Σbaseline) and the median per-key ratio are
+ * reported. They answer different questions and disagree usefully: the
+ * aggregate is what the wall clock did, the median is what a typical call did,
+ * and a large gap between them means one long call is carrying the result.
+ */
+function pairedE2E(rb, rp) {
+  if (!rb || !rp) return null;
+  let bSum = 0, pSum = 0;
+  const ratios = [];
+  for (const [k, br] of rb.byKey) {
+    const pr = rp.byKey.get(k);
+    if (!pr) continue;
+    bSum += br.ns;
+    pSum += pr.ns;
+    ratios.push(pr.ns / br.ns - 1);
+  }
+  if (!ratios.length) return null;
+  ratios.sort((a, b) => a - b);
+  return {
+    n: ratios.length,
+    bSum, pSum,
+    aggregate: pSum / bSum - 1,
+    median: ratios[Math.floor(ratios.length / 2)],
+    improved: ratios.filter(r => r < 0).length,
+    unmatched: [rb.byKey.size - ratios.length, rp.byKey.size - ratios.length],
+  };
 }
 
 /* ==================================================================== *
@@ -263,7 +400,12 @@ function num(v) { return Number.isFinite(v) ? v : 0; }
  */
 function levelSeries(rows, field, requireField) {
   return rows.map(r =>
-    (requireField !== undefined && !(num(r[requireField]) > 0))
+    // A field the log predates is a break, not a zero. `num()` maps undefined
+    // to 0, which is right for the engine's own zero-denominator zeros and
+    // wrong here: a log written before `ttft_p50_ms` existed would draw a
+    // confident flat line at 0 ms across the whole run.
+    (r[field] === undefined ||
+     (requireField !== undefined && !(num(r[requireField]) > 0)))
       ? null
       : [r.t, num(r[field])]);
 }
@@ -312,6 +454,33 @@ function windowDelta(run, row, field) {
   return num(row[field]) - (i > 0 ? num(run.rows[i - 1][field]) : 0);
 }
 
+/**
+ * When eviction started, as far as the log can prove.
+ *
+ * `evicted` is cumulative, so the first line carrying a nonzero value bounds
+ * the start to the interval `(t(i-1), t(i)]` — a sampled counter cannot do
+ * better. The mark goes at `t(i)`, the earliest instant at which eviction is
+ * *known* to have happened; the label carries the window so nobody reads a
+ * 30s-resolution bound as a timestamp.
+ *
+ * A run already evicting on its first line is reported as such rather than
+ * marked at t=0: the start is then outside the log, and drawing it at the
+ * left edge would assert a beginning the data does not contain.
+ */
+function firstEvictionMark(run) {
+  for (let i = 0; i < run.rows.length; i++) {
+    if (num(run.rows[i].evicted) > 0) {
+      return {
+        t: run.rows[i].t,
+        since: i > 0 ? run.rows[i - 1].t : null,
+        blocks: num(run.rows[i].evicted),
+        atStart: i === 0,
+      };
+    }
+  }
+  return null;
+}
+
 // Median sample spacing, used to mark idle gaps. The line is change-gated,
 // so a gap means "nothing moved", not "no data" — but the reader still has
 // to be able to tell those apart from a dropped log.
@@ -327,25 +496,72 @@ function medianDt(rows) {
  * 3. State
  * ==================================================================== */
 
+// Runs are keyed by *slot*, not by variant. Keying by variant hard-wired the
+// page to one pairing (baseline vs node_eviction) and silently dropped any
+// other `variant=` value — a `continuum` log parsed fine and then rendered
+// nothing at all, which is the worst possible failure for a comparison tool.
+// The slot says which side of the comparison a run is; the variant is only
+// its name.
+// Three, because the comparison that actually gets run is baseline vs
+// node_eviction vs continuum, and doing it as two separate two-way pages
+// means eyeballing a scroll between them — the one thing §6 of the spec says
+// the layout must never require.
+const SLOTS = ["A", "B", "C"];
+
 const S = {
-  runs: {},                 // variant -> parsed run
+  runs: {},                 // slot -> parsed run
+  reports: {},              // slot -> parsed end-to-end report
   domain: null,             // [t0, t1] or null for full extent
   solo: "all",
   panels: [],               // render handles for crosshair
 };
 
+// Known variants get a fuller name; anything else is printed as it names
+// itself, so a new arm needs no change here to be legible.
+const VARIANT_LABEL = {
+  baseline: "baseline (LRU)",
+  node_eviction: "node_eviction",
+  continuum: "continuum",
+};
+
 function runList() {
   const out = [];
-  if (S.runs.baseline) out.push(S.runs.baseline);
-  if (S.runs.node_eviction) out.push(S.runs.node_eviction);
-  return out.filter(r => S.solo === "all" || r.variant === S.solo);
+  for (const slot of SLOTS) if (S.runs[slot]) out.push(S.runs[slot]);
+  return out.filter(r => S.solo === "all" || r.slot === S.solo);
 }
-function colourFor(variant) {
-  return variant === "baseline" ? "var(--baseline)" : "var(--policy)";
+const SLOT_COLOUR = { A: "var(--baseline)", B: "var(--policy)", C: "var(--third)" };
+// Dashed / solid / dotted, so the three stay separable in a greyscale
+// screenshot and for a reader who cannot rely on hue.
+const SLOT_DASH = { A: "5 3", B: undefined, C: "1 3" };
+const MARK_DASH = { A: "4 3", B: undefined, C: "1 3" };
+
+function colourFor(slot) { return SLOT_COLOUR[slot] || "var(--policy)"; }
+// Named after the variant the run's own lines carry, falling back to the slot
+// when nothing is loaded there yet — the report inputs can be filled before
+// the logs are, and a header reading `undefined` is worse than "Run B".
+function labelFor(slot) {
+  const run = S.runs[slot];
+  const v = run && run.variant;
+  if (!v) return "Run " + slot;
+  return VARIANT_LABEL[v] || v;
 }
-function labelFor(variant) {
-  return variant === "baseline" ? "baseline (LRU)" : "node_eviction";
+// Slots holding something — a run, a report, or both. The summary and the
+// banners are built over these, so an unused third slot costs a column of
+// dashes rather than appearing at all.
+function activeSlots() {
+  return SLOTS.filter(s => S.runs[s] || S.reports[s]);
 }
+// Every Δ on the page is against one arm, and it is the leftmost one loaded.
+// A three-way table with pairwise deltas between all of them has six delta
+// columns and no reading order; against a fixed reference it has two, and
+// "which is better" is answerable by scanning one column.
+function referenceSlot() {
+  return activeSlots()[0] || "A";
+}
+// The policy-only panels are a property of the *variant*, not the slot: only
+// node_eviction populates splice, regret and scored coverage. Every other
+// variant emits a constant zero there.
+function isPolicy(run) { return run && run.variant === "node_eviction"; }
 
 /* ==================================================================== *
  * 4. Formatting
@@ -516,6 +732,33 @@ function drawLinePanel(host, cfg) {
     }
   }
 
+  // Event marks, drawn last so they sit above the curves. Same dash
+  // convention as the runs (baseline dashed) so two marks close together stay
+  // attributable without reading the labels.
+  (cfg.marks || []).forEach((mk, i) => {
+    if (mk.t < x0 || mk.t > x1) return;
+    const x = X(mk.t);
+    svg.appendChild(el("line", {
+      x1: x, x2: x, y1: M.top, y2: M.top + ih,
+      stroke: "var(--bad)", "stroke-width": 1.5, "stroke-dasharray": mk.dash,
+      opacity: 0.8, "clip-path": `url(#${clipId})`,
+    }));
+    // Flip the label to the left of the line near the right edge, and stagger
+    // by index so two marks in the same window do not overprint.
+    const flip = x > M.left + iw * 0.72;
+    const tx = el("text", {
+      x: flip ? x - 5 : x + 5, y: M.top + 10 + i * 12,
+      "text-anchor": flip ? "end" : "start",
+      fill: "var(--bad)", "font-size": 9.5,
+      // Halo in the panel colour: the label sits at the top of the plot,
+      // which is exactly where a high hit-rate curve runs, and red-on-teal
+      // with no separation is unreadable in both themes.
+      stroke: "var(--panel)", "stroke-width": 3, "paint-order": "stroke fill",
+    });
+    tx.textContent = mk.label;
+    svg.appendChild(tx);
+  });
+
   return finishPanel(host, svg, width, X, x0, x1, cfg);
 }
 
@@ -608,15 +851,16 @@ function showCrosshair(t, clientX, clientY, cfg) {
   const rows = [];
   rows.push(`<div class="tt-t">t = ${fmtTime(t)}</div>`);
   for (const run of runList()) {
-    // A policy-only panel must not read out a baseline value: the panel omits
-    // that curve precisely so a constant 0.000 is not mistaken for a result.
-    if (cfg.policyOnly && run.variant !== "node_eviction") continue;
+    // A policy-only panel must not read out another variant's value: the panel
+    // omits that curve precisely so a constant 0.000 is not mistaken for a
+    // result.
+    if (cfg.policyOnly && !isPolicy(run)) continue;
     const s = rowFor(run.rows, t, cfg.windowed);
     if (!s) continue;
     const v = cfg.readout ? cfg.readout(s, run) : null;
     if (v === null || v === undefined) continue;
     rows.push(
-      `<div class="tt-row"><span><span class="swatch" style="background:${colourFor(run.variant)}"></span>${labelFor(run.variant)}</span>` +
+      `<div class="tt-row"><span><span class="swatch" style="background:${colourFor(run.slot)}"></span>${labelFor(run.slot)}</span>` +
       `<span class="tt-v">${v}</span></div>`
     );
   }
@@ -640,60 +884,201 @@ function hideCrosshair() {
 
 function last(run) { return run.rows[run.rows.length - 1]; }
 
+// One row of the summary table. `cells` is one pre-formatted string per active
+// slot, `deltas` one `[text, class]` pair per non-reference slot — the E2E
+// block needs both to be arrays because two of its rows (the paired figures)
+// carry only a delta and no per-arm value at all.
+function summaryRow(label, cells, deltas, headline) {
+  return `<tr class="${headline ? "headline" : ""}">
+    <td>${label}</td>
+    ${cells.map(c => `<td class="num">${c}</td>`).join("")}
+    ${deltas.map(([t, c]) => `<td class="num delta ${c || ""}">${t}</td>`).join("")}
+    </tr>`;
+}
+
+function e2eRows(slots, ref) {
+  const reps = slots.map(s => S.reports[s]);
+  if (!reps.some(Boolean)) return "";
+  const others = slots.filter(s => s !== ref);
+  const fmt = ns => fmtMs(ns / 1e6);
+  const cell = (r, pick) => (r ? fmt(pick(r)) : "–");
+  const rr = S.reports[ref];
+
+  // Signed relative change against the reference, coloured as an improvement
+  // when negative: E2E is a latency, so down is the win.
+  const deltaRow = (pick) => others.map(s => {
+    const rp = S.reports[s];
+    if (!rr || !rp) return ["–", ""];
+    const bv = pick(rr), pv = pick(rp);
+    if (!(bv > 0)) return ["–", ""];
+    const rel = (pv - bv) / bv * 100;
+    const sign = pv - bv > 0 ? "+" : "";
+    return [`${sign}${fmt(pv - bv)} (${sign}${rel.toFixed(1)}%)`,
+            pv < bv ? "good" : pv > bv ? "bad" : ""];
+  });
+
+  const span = 1 + slots.length + others.length;
+  let out =
+    `<tr><td colspan="${span}" style="padding-top:14px;color:var(--muted);
+      border-bottom:none;font-size:12px">
+      End-to-end, client-measured (<code>live_latency_ns</code> from the
+      harness report) — includes everything the engine line excludes
+    </td></tr>` +
+    summaryRow("E2E total", reps.map(r => cell(r, x => x.totalNs)),
+               deltaRow(r => r.totalNs), true) +
+    summaryRow("E2E mean per call", reps.map(r => cell(r, x => x.meanNs)),
+               deltaRow(r => r.meanNs)) +
+    summaryRow("E2E median per call", reps.map(r => cell(r, x => x.medianNs)),
+               deltaRow(r => r.medianNs)) +
+    summaryRow("Calls in report", reps.map(r => (r ? String(r.calls) : "–")),
+               others.map(s => {
+                 const rp = S.reports[s];
+                 if (!rr || !rp) return ["–", ""];
+                 const d = rp.calls - rr.calls;
+                 return [`${d > 0 ? "+" : ""}${d}`, ""];
+               }));
+
+  // The paired figures: one row per non-reference arm, each paired against
+  // the reference on the keys the two have in common. Shown last so the
+  // unpaired totals above cannot be mistaken for them. A blank per-arm column
+  // where the pairing does not apply, because the number *is* the comparison.
+  for (const s of others) {
+    const pair = pairedE2E(rr, S.reports[s]);
+    if (!pair) continue;
+    const aggSign = pair.aggregate > 0 ? "+" : "";
+    const medSign = pair.median > 0 ? "+" : "";
+    const cellsFor = v => slots.map(x =>
+      x === ref ? fmt(pair.bSum) : x === s ? fmt(pair.pSum) : "–");
+    const only = (slot, txt, cls) =>
+      others.map(o => (o === slot ? [txt, cls] : ["", ""]));
+    out += summaryRow(
+      `E2E paired vs ${labelFor(ref)} · ${pair.n} matched keys`,
+      cellsFor(), only(s, `${aggSign}${(pair.aggregate * 100).toFixed(1)}%`,
+                       pair.aggregate < 0 ? "good" : pair.aggregate > 0 ? "bad" : ""),
+      true);
+    out += summaryRow(
+      "  ↳ median per-key change", slots.map(() => "–"),
+      only(s, `${medSign}${(pair.median * 100).toFixed(1)}%`,
+           pair.median < 0 ? "good" : pair.median > 0 ? "bad" : ""));
+    out += summaryRow(
+      "  ↳ keys that got faster", slots.map(() => "–"),
+      only(s, `${pair.improved} of ${pair.n}`, ""));
+  }
+  return out;
+}
+
 function buildSummary() {
   const host = document.getElementById("summary");
   host.innerHTML = "";
-  const b = S.runs.baseline, p = S.runs.node_eviction;
-  if (!b && !p) return;
+  // Reports alone are enough to render the table: E2E is a self-contained
+  // measurement and someone may have only the harness output to hand.
+  const slots = activeSlots();
+  if (!slots.length) return;
+  const ref = referenceSlot();
+  const others = slots.filter(s => s !== ref);
 
-  // Higher is better for hit rate, lower for TTFT and regret. The two
-  // trailing rows are not results — they are the denominators the three
-  // above are only interpretable against.
+  // Higher is better for hit rate, lower for TTFT and regret. The trailing
+  // rows are not results on their own — they are the raw counts the rates
+  // above are computed from, and the terms the comparison is only valid in.
+  //
+  // `showAbs` prints the absolute movement beside the percentage. On a token
+  // count the percentage alone is misleading in both directions: +2% of a
+  // 2M-token run and +2% of an 80k-token run are different findings, and a
+  // large percentage on a small base reads as a result when it is noise.
   const metrics = [
     { key: "Hit rate (cumulative)", headline: true, lowerBetter: false,
-      get: r => num(last(r).hit_rate), fmt: fmtPct },
+      field: "hit_rate", get: r => num(last(r).hit_rate), fmt: fmtPct },
     // Engine-side TTFT: scheduler queueing + prefill, which is the part a
     // cache miss actually pays for. If hit rate moved and this did not, the
     // hit rate moved on blocks that were cheap to rebuild.
     { key: "TTFT mean (engine-side)", headline: true, lowerBetter: true,
-      get: r => num(last(r).ttft_ms), fmt: fmtMs },
+      field: "ttft_ms", get: r => num(last(r).ttft_ms), fmt: fmtMs },
+    // Directly under the mean, because the pair is the finding: a mean that
+    // moved without the median is a tail effect, and quoting it as "requests
+    // got faster" is the mistake this row exists to catch.
+    { key: "TTFT median", headline: true, lowerBetter: true,
+      field: "ttft_p50_ms", get: r => num(last(r).ttft_p50_ms), fmt: fmtMs },
     { key: "TTFT p95", lowerBetter: true,
-      get: r => num(last(r).ttft_p95_ms), fmt: fmtMs },
+      field: "ttft_p95_ms", get: r => num(last(r).ttft_p95_ms), fmt: fmtMs },
     { key: "Final regret", lowerBetter: true,
-      get: r => num(last(r).regret), fmt: v => v.toFixed(3) },
-    { key: "Tokens queried (query_tokens)", lowerBetter: null,
-      get: r => num(last(r).query_tokens), fmt: v => fmtNum(v, 0) },
-    { key: "Requests measured (ttft_n)", lowerBetter: null,
-      get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
+      field: "regret", get: r => num(last(r).regret), fmt: v => v.toFixed(3) },
+    // The hit rate's numerator. Higher is better *at a fixed denominator* —
+    // which is why `query_tokens` sits directly beneath it and the
+    // work-mismatch banner fires above the table. More hit tokens off a
+    // bigger denominator is more work served, not a better cache.
+    { key: "Tokens hit (hit_tokens)", lowerBetter: false, showAbs: true,
+      field: "hit_tokens", get: r => num(last(r).hit_tokens), fmt: v => fmtNum(v, 0) },
+    // The denominator. Neutral by construction: the workload sets it, not
+    // the policy, and a run that served more is not a run that did better.
+    { key: "Tokens queried (query_tokens)", lowerBetter: null, showAbs: true,
+      field: "query_tokens", get: r => num(last(r).query_tokens), fmt: v => fmtNum(v, 0) },
+    { key: "Requests measured (ttft_n)", lowerBetter: null, showAbs: true,
+      field: "ttft_n", get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
   ];
 
+  // `num()` maps an absent field to 0, which is right for the engine's own
+  // zero-denominator zeros but wrong for a field the log predates: a log
+  // written before `ttft_p50_ms` existed would print a confident "0 ms"
+  // median. `field` names the raw key so an absent one reads as "–" and the
+  // delta column stays empty rather than claiming a 100% improvement.
+  const valueOf = (slot, m) => {
+    const run = S.runs[slot];
+    if (!run) return null;
+    if (m.field && last(run)[m.field] === undefined) return null;
+    return m.get(run);
+  };
+
   const rows = metrics.map(m => {
-    const bv = b ? m.get(b) : null, pv = p ? m.get(p) : null;
-    let deltaCell = "<td>–</td>";
-    if (bv !== null && pv !== null && Number.isFinite(bv) && Number.isFinite(pv)) {
-      const abs = pv - bv;
-      const pct = bv !== 0 ? (abs / bv) * 100 : null;
+    const rv = valueOf(ref, m);
+    const cells = slots.map(s => {
+      const v = valueOf(s, m);
+      return v === null ? "–" : m.fmt(v);
+    });
+    const deltas = others.map(s => {
+      const pv = valueOf(s, m);
+      if (rv === null || pv === null ||
+          !Number.isFinite(rv) || !Number.isFinite(pv)) return ["–", ""];
+      const abs = pv - rv;
+      const pct = rv !== 0 ? (abs / rv) * 100 : null;
       let cls = "";
       if (m.lowerBetter === true) cls = abs < 0 ? "good" : abs > 0 ? "bad" : "";
       if (m.lowerBetter === false) cls = abs > 0 ? "good" : abs < 0 ? "bad" : "";
       const sign = abs > 0 ? "+" : "";
-      const txt = pct === null ? `${sign}${m.fmt(abs)}`
-                               : `${sign}${pct.toFixed(1)}%`;
-      deltaCell = `<td class="num delta ${cls}">${txt}</td>`;
-    }
-    return `<tr class="${m.headline ? "headline" : ""}">
-      <td>${m.key}</td>
-      <td class="num">${b ? m.fmt(bv) : "–"}</td>
-      <td class="num">${p ? m.fmt(pv) : "–"}</td>
-      ${deltaCell}</tr>`;
+      const pctTxt = pct === null ? null : `${sign}${pct.toFixed(1)}%`;
+      const txt = pctTxt === null ? `${sign}${m.fmt(abs)}`
+                : m.showAbs ? `${sign}${m.fmt(abs)} (${pctTxt})`
+                : pctTxt;
+      return [txt, cls];
+    });
+    return summaryRow(m.key, cells, deltas, m.headline);
   }).join("");
 
+  const valueHeads = slots.map(s =>
+    `<th><span class="swatch" style="background:${colourFor(s)}"></span>` +
+    `${labelFor(s)}${s === ref ? " <span class=\"hint\">(ref)</span>" : ""}</th>`
+  ).join("");
+  const deltaHeads = others.map(s =>
+    `<th>Δ ${labelFor(s)}</th>`).join("");
+
   host.innerHTML = `<div class="scroll"><table>
-    <thead><tr><th>Metric</th>
-      <th><span class="swatch" style="background:var(--baseline)"></span>baseline (LRU)</th>
-      <th><span class="swatch" style="background:var(--policy)"></span>node_eviction</th>
-      <th>Δ</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>`;
+    <thead><tr><th>Metric</th>${valueHeads}${deltaHeads}</tr></thead>
+    <tbody>${rows}${e2eRows(slots, ref)}</tbody></table></div>
+    <p class="hint" style="margin:8px 0 0">
+      Every Δ is against <b>${labelFor(ref)}</b>, the leftmost arm loaded —
+      the arms are not compared to each other, so a Δ column says how that arm
+      did versus the reference and nothing about the other column.
+      Token rows show the absolute movement with the
+      percentage beside it; a hit-token gain only means a better cache when
+      <code>query_tokens</code> matches, so read those two rows together.
+      <code>hit_tokens</code> counts HBM-resident hits only — reuse served by
+      an external connector (LMCache) is not in it, and on a run where the
+      external hit rate is high most of the reuse never appears here.
+      End-to-end rows come from the harness, not the engine: they carry
+      front-end queueing, detokenization and tool calls, so they are the
+      user-visible number and the one an eviction policy has the least
+      leverage over. Quote the <b>paired</b> row — the unpaired totals above it
+      still depend on which prompts each arm happened to run.
+    </p>`;
 }
 
 /* ==================================================================== *
@@ -710,54 +1095,113 @@ function buildBanners() {
     host.appendChild(d);
   };
 
-  const b = S.runs.baseline, p = S.runs.node_eviction;
-  if (!b || !p) {
-    if (b || p) {
-      add(`<b>One run loaded</b> (${labelFor((b || p).variant)}). ` +
-          `Comparison columns stay empty — load the other run to fill them.`);
+  // Report warnings first, and outside the both-runs guard: an append-only
+  // report is wrong on its own, whether or not the other arm is loaded.
+  for (const v of SLOTS) {
+    const rep = S.reports[v];
+    if (!rep) continue;
+    if (rep.duplicates > 0) {
+      add(`<b>${labelFor(v)} report holds more than one run</b> — ` +
+          `${rep.rawRecords} records over ${rep.calls} distinct keys ` +
+          `(${rep.duplicates} collapsed). <code>ODR_TRACE_REPORT</code> is ` +
+          `append-only and carries no timestamp, so the last record per key ` +
+          `is used and the earlier runs are discarded. Rotate the report ` +
+          `path per run to make this unambiguous.`);
+    }
+    if (rep.badLines > 0) {
+      add(`<b>${labelFor(v)} report: ${rep.badLines} unparsable line(s)</b> — ` +
+          `skipped. Expected one JSON object per line.`);
+    }
+  }
+  const ref = referenceSlot();
+  // One key-coverage check per non-reference arm. A third arm that replayed a
+  // different trace is exactly as wrong as a second one, and rolling them into
+  // a single banner would name neither.
+  for (const s of SLOTS) {
+    if (s === ref) continue;
+    const pair = pairedE2E(S.reports[ref], S.reports[s]);
+    if (!pair || !(pair.unmatched[0] || pair.unmatched[1])) continue;
+    add(`<b>${labelFor(s)} and ${labelFor(ref)} reports do not cover the same ` +
+        `trace keys</b> — ${pair.n} keys matched, with ${pair.unmatched[0]} ` +
+        `${labelFor(ref)}-only and ${pair.unmatched[1]} ${labelFor(s)}-only ` +
+        `left out of the paired figure. The unpaired E2E totals include them, ` +
+        `so those rows are not measuring the same workload.`);
+  }
+
+  const loaded = SLOTS.filter(s => S.runs[s]);
+  if (loaded.length < 2) {
+    if (loaded.length === 1) {
+      add(`<b>One run loaded</b> (${labelFor(loaded[0])}). ` +
+          `Comparison columns stay empty — load another run to fill them.`);
     }
     return;
   }
 
+  // Two logs naming the same variant is almost always a mistake — the same arm
+  // dropped twice, or a rerun pasted over the wrong box. The page cannot tell
+  // which, and every delta would be noise presented as a result.
+  const byVariant = new Map();
+  for (const s of loaded) {
+    const v = S.runs[s].variant;
+    byVariant.set(v, (byVariant.get(v) || []).concat(s));
+  }
+  for (const [v, ss] of byVariant) {
+    if (ss.length < 2) continue;
+    add(`<b>Slots ${ss.join(" and ")} both hold <code>variant=${v}</code></b> — ` +
+        `those logs name the same arm. If that is deliberate (repeat runs of ` +
+        `one build) their delta measures run-to-run variance, not a policy ` +
+        `effect — which is worth knowing, but is not the comparison the rest ` +
+        `of this page is making.`);
+  }
+
+  const refRun = S.runs[ref];
+  const others = loaded.filter(s => s !== ref);
+
   // Hit rate is token-normalised and survives a size mismatch; the TTFT
   // means do not, because they average over whatever requests arrived.
-  const qb = num(last(b).query_tokens), qp = num(last(p).query_tokens);
-  if (qb > 0 && qp > 0) {
+  const qb = refRun ? num(last(refRun).query_tokens) : 0;
+  for (const s of others) {
+    const qp = num(last(S.runs[s]).query_tokens);
+    if (!(qb > 0 && qp > 0)) continue;
     const diff = Math.abs(qp - qb) / Math.max(qb, qp);
     if (diff > 0.10) {
-      add(`<b>Runs served different amounts of work</b> — ` +
-          `query_tokens differ by ${(diff * 100).toFixed(0)}% ` +
-          `(${fmtNum(qb, 0)} vs ${fmtNum(qp, 0)}). Hit rate is a per-token ` +
-          `ratio and survives that; the TTFT means describe two different ` +
-          `workloads, so treat their delta as unreliable here.`);
+      add(`<b>${labelFor(s)} served a different amount of work from ` +
+          `${labelFor(ref)}</b> — query_tokens differ by ` +
+          `${(diff * 100).toFixed(0)}% (${fmtNum(qb, 0)} vs ${fmtNum(qp, 0)}). ` +
+          `Hit rate is a per-token ratio and survives that; the TTFT means ` +
+          `describe two different workloads, so treat that delta as ` +
+          `unreliable.`);
     }
   }
 
   // TTFT means over different request counts are not a comparison. It is the
   // one quantity here that is per-request rather than per-token, so it is the
   // one an unmatched workload silently corrupts.
-  const nb = num(last(b).ttft_n), np = num(last(p).ttft_n);
-  if (nb > 0 && np > 0) {
+  const nb = refRun ? num(last(refRun).ttft_n) : 0;
+  for (const s of others) {
+    const np = num(last(S.runs[s]).ttft_n);
+    if (!(nb > 0 && np > 0)) continue;
     const d = Math.abs(np - nb) / Math.max(nb, np);
     if (d > 0.10) {
-      add(`<b>TTFT was measured over different request counts</b> — ` +
-          `${fmtNum(nb, 0)} vs ${fmtNum(np, 0)} (${(d * 100).toFixed(0)}% apart). ` +
-          `The means describe different populations; pair per request before ` +
-          `quoting a TTFT delta.`);
+      add(`<b>${labelFor(s)}: TTFT measured over a different request count ` +
+          `from ${labelFor(ref)}</b> — ${fmtNum(nb, 0)} vs ${fmtNum(np, 0)} ` +
+          `(${(d * 100).toFixed(0)}% apart). The means describe different ` +
+          `populations; pair per request before quoting a TTFT delta.`);
     }
-  } else if (nb === 0 && np === 0) {
-    add(`<b>No TTFT samples in either run</b> — <code>ttft_n=0</code>. Either ` +
-        `no request produced a token, or the log predates the field. ` +
+  }
+  if (loaded.every(s => num(last(S.runs[s]).ttft_n) === 0)) {
+    add(`<b>No TTFT samples in any run</b> — <code>ttft_n=0</code>. Either ` +
+        `no request produced a token, or the logs predate the field. ` +
         `Panels 2 and 3 will be flat.`);
   }
 
-  for (const r of [b, p]) {
+  for (const r of loaded.map(s => S.runs[s])) {
     if (r.syntheticTime) {
-      add(`<b>${labelFor(r.variant)}: no parsable timestamps</b> — the x-axis ` +
+      add(`<b>${labelFor(r.slot)}: no parsable timestamps</b> — the x-axis ` +
           `assumes the nominal 30s period. Rates are approximate.`);
     }
     if (r.missingFields.length) {
-      add(`<b>${labelFor(r.variant)}: log predates some fields</b> ` +
+      add(`<b>${labelFor(r.slot)}: log predates some fields</b> ` +
           `(${r.missingFields.join(", ")}). Those panels will be empty — ` +
           `re-run against the updated build.`);
     }
@@ -772,8 +1216,8 @@ function panelDefs() {
   return [
   { id: "hitCum",
     title: "1 · Prefix cache hit rate, cumulative",
-    why: "<code>hit_tokens / query_tokens</code> since the run started — the field <code>hit_rate</code>, and the number you get computing it by hand from the last line. Prompt tokens served from HBM-resident blocks, counted once per request. Deliberately not vLLM's own <code>Prefix cache hit rate</code> line, which re-counts a request on every scheduler step it spends queued and so is weighted by the queueing delay eviction pressure itself sets. It can fall as well as rise: queried tokens that miss enter the denominator.",
-    kind: "line", clampLo: 0, clampHi: 1, fmtY: fmtPct,
+    why: "<code>hit_tokens / query_tokens</code> since the run started — the field <code>hit_rate</code>, and the number you get computing it by hand from the last line. Prompt tokens served from HBM-resident blocks, counted once per request. Deliberately not vLLM's own <code>Prefix cache hit rate</code> line, which re-counts a request on every scheduler step it spends queued and so is weighted by the queueing delay eviction pressure itself sets. It can fall as well as rise: queried tokens that miss enter the denominator. <b>The red rule marks the first line reporting evictions</b> — before it the cache was never under pressure, so hit rate on that stretch says nothing about any eviction policy; it is the same cache in both arms.",
+    kind: "line", clampLo: 0, clampHi: 1, fmtY: fmtPct, evictionMark: true,
     series: run => [{ points: levelSeries(run.rows, "hit_rate", "query_tokens") }],
     readout: (s, run) => fmtPct(num(s.hit_rate)) + "  (" + fmtNum(num(s.hit_tokens), 0) +
                          " / " + fmtNum(num(s.query_tokens), 0) + " tokens)",
@@ -788,15 +1232,22 @@ function panelDefs() {
                   fmtNum(windowDelta(run, s, "ttft_n"), 0) + " requests; cum " +
                   fmtMs(num(s.ttft_ms)) + " over " + fmtNum(num(s.ttft_n), 0) + ")",
   },
+  { id: "ttftP50",
+    title: "3 · TTFT median (last 4096 requests)",
+    why: "What a <i>typical</i> request saw. TTFT is heavy-tailed, so panel 2's mean can sit somewhere no request actually was — one cold prefill among short ones moves it and the median not at all. Read the two together: median down with the mean flat means the common case improved and the tail ate the gain; the mean down with the median flat means one or two slow outliers went away and most requests are unchanged. Same bounded ring as panel 4, so the median-to-p95 spread is drawn from one population. Trailing, not windowed — held forward until the next line.",
+    kind: "line", clampLo: 0, fmtY: fmtMs,
+    series: run => [{ points: levelSeries(run.rows, "ttft_p50_ms", "ttft_n") }],
+    readout: s => fmtMs(num(s.ttft_p50_ms)),
+  },
   { id: "ttftP95",
-    title: "3 · TTFT p95 (last 4096 requests)",
+    title: "4 · TTFT p95 (last 4096 requests)",
     why: "The tail, which the mean hides. A policy that destroys one large prefix can hold the mean flat and still make a minority of requests much worse. A trailing quantity, not a window one — it is the p95 over the last 4096 requests as of each line, so it is held forward until the next.",
     kind: "line", clampLo: 0, fmtY: fmtMs,
     series: run => [{ points: levelSeries(run.rows, "ttft_p95_ms", "ttft_n") }],
     readout: s => fmtMs(num(s.ttft_p95_ms)),
   },
   { id: "regret",
-    title: "4 · Regret",
+    title: "5 · Regret",
     why: "<code>evicted_then_needed / evicted_by_score</code>, cumulative — the share of scored evictions the policy had to take back. Policy only: the baseline emits a constant 0.000, and plotting it would read as 'no regret' rather than 'not measured'. The axis fits the data, so read the numbers, not the slope's steepness.",
     kind: "line", clampLo: 0, clampHi: 1, fmtY: v => v.toFixed(3), policyOnly: true,
     series: run => [{ points: levelSeries(run.rows, "regret", "evicted_by_score") }],
@@ -816,11 +1267,23 @@ function render() {
 
   const runs = runList();
   if (!runs.length) {
-    host.innerHTML = `<div class="empty">No data loaded yet.</div>`;
+    host.innerHTML = `<div class="empty">` +
+      (SLOTS.some(s => S.reports[s])
+        ? `End-to-end report loaded. Add the <code>kv_hbm</code> lines for the panels.`
+        : `No data loaded yet.`) + `</div>`;
     document.getElementById("toolbar").hidden = true;
+    buildSummary();   // the E2E table stands on its own
     return;
   }
   document.getElementById("toolbar").hidden = false;
+  // The solo buttons name the arms actually loaded, so "Run C only" reads
+  // "continuum only" once a continuum log is in — and a slot with no run
+  // hides its button rather than offering a filter that empties the page.
+  for (const slot of SLOTS) {
+    const btn = document.getElementById("solo" + slot);
+    btn.hidden = !S.runs[slot];
+    btn.textContent = labelFor(slot) + " only";
+  }
 
   for (const def of panelDefs()) {
     const sec = document.createElement("section");
@@ -829,7 +1292,7 @@ function render() {
 
     const series = [];
     for (const run of runs) {
-      if (def.policyOnly && run.variant !== "node_eviction") continue;
+      if (def.policyOnly && !isPolicy(run)) continue;
       const gap = medianDt(run.rows) * 3;
       for (const s of def.series(run)) {
         series.push({
@@ -837,28 +1300,52 @@ function render() {
           // Dropping this was what let the window panels fall back to
           // step-after and shift a window off its own interval.
           stepped: s.stepped,
-          colour: colourFor(run.variant),
-          dash: run.variant === "baseline" ? "5 3" : undefined,
+          colour: colourFor(run.slot),
+          dash: SLOT_DASH[run.slot],
           gapThreshold: gap,
         });
       }
     }
     if (!series.length) continue;
 
+    const marks = [];
+    if (def.evictionMark) {
+      for (const run of runs) {
+        const mk = firstEvictionMark(run);
+        if (!mk) continue;
+        marks.push({
+          t: mk.t,
+          dash: MARK_DASH[run.slot],
+          label: mk.atStart
+            // Nothing was measured before this, so the start is outside the
+            // log and the mark is a lower bound, not an event.
+            ? `already evicting at first line · ${labelFor(run.slot)}`
+            : `evictions start ≤ ${fmtTime(mk.t)} · ${labelFor(run.slot)}`,
+        });
+      }
+    }
+
     const leg = document.createElement("div");
     leg.className = "legend";
     for (const run of runs) {
-      if (def.policyOnly && run.variant !== "node_eviction") continue;
+      if (def.policyOnly && !isPolicy(run)) continue;
       const s = document.createElement("span");
       s.className = "item active";
-      s.innerHTML = `<span class="swatch" style="background:${colourFor(run.variant)}"></span>${labelFor(run.variant)}`;
+      s.innerHTML = `<span class="swatch" style="background:${colourFor(run.slot)}"></span>${labelFor(run.slot)}`;
+      leg.appendChild(s);
+    }
+    if (marks.length) {
+      const s = document.createElement("span");
+      s.className = "item active";
+      s.innerHTML = `<span class="swatch" style="background:var(--bad)"></span>` +
+        `first line reporting evictions`;
       leg.appendChild(s);
     }
     sec.appendChild(leg);
     host.appendChild(sec);
 
     drawLinePanel(sec, {
-      series, clampLo: def.clampLo, clampHi: def.clampHi,
+      series, marks, clampLo: def.clampLo, clampHi: def.clampHi,
       fmtY: def.fmtY, readout: def.readout, windowed: def.windowed,
       policyOnly: def.policyOnly,
     });
@@ -871,13 +1358,32 @@ function render() {
  * 11. Intake
  * ==================================================================== */
 
-function ingest(text, hintVariant) {
+// Which side of the comparison a dropped file lands on, when the drop itself
+// carries no slot. Reloading an arm must *replace* it rather than push the
+// other one out, so a variant already on screen keeps its slot.
+function autoSlot(variant) {
+  for (const slot of SLOTS) {
+    if (S.runs[slot] && S.runs[slot].variant === variant) return slot;
+  }
+  // The reference arm goes left when it names itself and the seat is free;
+  // otherwise fill in drop order. Either way the column headers name the
+  // variant, so a surprising order is visible rather than silent.
+  if (variant === "baseline" && !S.runs.A) return "A";
+  for (const slot of SLOTS) if (!S.runs[slot]) return slot;
+  // All three full: the last slot is overwritten rather than the drop being
+  // dropped silently. Clearing is one button away and a vanished file is the
+  // more confusing failure.
+  return SLOTS[SLOTS.length - 1];
+}
+
+function ingest(text, slot) {
   const run = parseRun(text);
   if (!run) return false;
-  if (hintVariant && run.variant !== hintVariant) {
-    // The line names its own variant; trust it over which box it was pasted in.
-  }
-  S.runs[run.variant] = run;
+  // Deliberately not keyed by `run.variant`: the page compares two slots, and
+  // any pair of variants is a legal comparison — baseline vs node_eviction,
+  // baseline vs continuum, continuum vs node_eviction.
+  run.slot = slot || autoSlot(run.variant);
+  S.runs[run.slot] = run;
   return true;
 }
 
@@ -916,12 +1422,35 @@ intake.addEventListener("drop", ev => {
   }
 });
 
+// The report files carry no variant field — nothing inside `armD_rep1.jsonl`
+// says which arm it is — so the arm comes from which input it was dropped in.
+// Deliberately not inferred from the filename: a mislabelled arm silently
+// inverts the result.
+for (const [id, variant] of [["reportA", "A"], ["reportB", "B"], ["reportC", "C"]]) {
+  document.getElementById(id).addEventListener("change", ev => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => {
+      const rep = parseReport(String(fr.result));
+      if (!rep) {
+        alert("No usable records found. Expected one JSON object per line " +
+              "with a `live_latency_ns` field (the ODR_TRACE_REPORT format).");
+        return;
+      }
+      S.reports[variant] = rep;
+      afterLoad();
+    };
+    fr.readAsText(f);
+  });
+}
+
 document.getElementById("parsePaste").addEventListener("click", () => {
-  const a = document.getElementById("pasteA").value;
-  const b = document.getElementById("pasteB").value;
   let ok = false;
-  if (a.trim()) ok = ingest(a, "baseline") || ok;
-  if (b.trim()) ok = ingest(b, "node_eviction") || ok;
+  for (const slot of SLOTS) {
+    const text = document.getElementById("paste" + slot).value;
+    if (text.trim()) ok = ingest(text, slot) || ok;
+  }
   if (!ok) {
     alert("No kv_hbm lines found. Paste the output of:  grep 'kv_hbm ' <log>");
     return;
@@ -931,8 +1460,17 @@ document.getElementById("parsePaste").addEventListener("click", () => {
 
 document.getElementById("clear").addEventListener("click", () => {
   S.runs = {};
-  document.getElementById("pasteA").value = "";
-  document.getElementById("pasteB").value = "";
+  S.reports = {};
+  // A stale solo would filter the next pair of logs down to one arm with no
+  // visible cause — the toolbar is hidden while nothing is loaded.
+  S.solo = "all";
+  for (const btn of document.querySelectorAll("[data-solo]")) {
+    btn.classList.toggle("on", btn.dataset.solo === "all");
+  }
+  for (const slot of SLOTS) {
+    document.getElementById("paste" + slot).value = "";
+    document.getElementById("report" + slot).value = "";
+  }
   document.getElementById("banners").innerHTML = "";
   document.getElementById("summary").innerHTML = "";
   afterLoad();
@@ -964,10 +1502,13 @@ window.addEventListener("resize", () => {
 document.getElementById("demo").addEventListener("click", () => {
   const mk = (variant, seed) => {
     const lines = [];
-    let hitT = 0, qT = 0, ttftN = 0, ttftSum = 0;
-    const hit = variant === "baseline" ? 0.62 : 0.71;
+    let hitT = 0, qT = 0, ttftN = 0, ttftSum = 0, evicted = 0;
+    // The cache fills before it evicts, so both arms run clean for a while
+    // and the red rule has somewhere to sit.
+    const evictFrom = variant === "baseline" ? 12 : variant === "continuum" ? 14 : 15;
+    const hit = variant === "baseline" ? 0.62 : variant === "continuum" ? 0.66 : 0.71;
     // Higher hit rate, lower prefill cost — the shape a working policy has.
-    const ttftBase = variant === "baseline" ? 640 : 470;
+    const ttftBase = variant === "baseline" ? 640 : variant === "continuum" ? 550 : 470;
     for (let i = 0; i < 60; i++) {
       const t = new Date(Date.UTC(2026, 7, 7, 12, 0, 0) + i * 30000);
       const load = 0.6 + 0.4 * Math.sin(i / 7 + seed);
@@ -977,24 +1518,54 @@ document.getElementById("demo").addEventListener("click", () => {
       const ttftWin = ttftBase * (0.85 + 0.5 * load);
       const nWin = Math.round(14 * load);
       ttftN += nWin; ttftSum += ttftWin * nWin;
+      if (i >= evictFrom) evicted += Math.round(220 * load);
       const stamp = `INFO 08-07 ${String(t.getUTCHours()).padStart(2,"0")}:` +
                     `${String(t.getUTCMinutes()).padStart(2,"0")}:` +
                     `${String(t.getUTCSeconds()).padStart(2,"0")} [controller.py:600]`;
       // Only the fields this page reads; a real line carries many more.
       lines.push(
-        `${stamp} kv_hbm variant=${variant} ` +
+        `${stamp} kv_hbm variant=${variant} evicted=${evicted} ` +
+        `evicted_by_score=${variant==="baseline"?0:Math.round(evicted*0.97)} ` +
         `regret=${variant==="baseline"?"0.000":(0.09+0.02*Math.sin(i/5)).toFixed(3)} ` +
         `hit_rate=${(hitT/qT).toFixed(4)} hit_rate_win=${hw.toFixed(4)} ` +
         `ttft_ms=${(ttftSum/Math.max(ttftN,1)).toFixed(1)} ` +
         `ttft_win_ms=${ttftWin.toFixed(1)} ` +
+        // Median below the mean and well below the p95, which is the shape a
+        // right-skewed latency actually has.
+        `ttft_p50_ms=${(ttftWin*0.82).toFixed(1)} ` +
         `ttft_p95_ms=${(ttftWin*1.9).toFixed(1)} ttft_n=${ttftN} ` +
         `hit_tokens=${hitT} query_tokens=${qT}`
       );
     }
     return lines.join("\n");
   };
-  ingest(mk("baseline", 0));
-  ingest(mk("node_eviction", 1.2));
+  ingest(mk("baseline", 0), "A");
+  ingest(mk("node_eviction", 1.2), "B");
+  ingest(mk("continuum", 2.4), "C");
+
+  // A matching pair of harness reports, so the paired E2E block is
+  // inspectable too. Same keys in both arms, which is what pinned replay
+  // guarantees and what the pairing needs.
+  const mkReport = (scale, jitter) => {
+    const lines = [];
+    for (let i = 0; i < 14; i++) {
+      const base = 3.0e9 + 4.0e9 * Math.abs(Math.sin(i * 1.7));
+      const ns = Math.round(base * scale * (1 + jitter * Math.sin(i * 3.1)));
+      lines.push(JSON.stringify({
+        key: `k${String(i).padStart(2, "0")}`,
+        job_id: "1",
+        reason: "pinned",
+        live_status: 200,
+        live_latency_ns: ns,
+        live_completion_tokens: 120 + i * 7,
+      }));
+    }
+    return lines.join("\n");
+  };
+  S.reports.A = parseReport(mkReport(1.0, 0.05));
+  S.reports.B = parseReport(mkReport(0.78, 0.07));
+  S.reports.C = parseReport(mkReport(0.89, 0.06));
+
   afterLoad();
 });
 </script>

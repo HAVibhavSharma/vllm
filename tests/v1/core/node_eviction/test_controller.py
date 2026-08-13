@@ -1241,6 +1241,8 @@ def test_the_summary_line_carries_ttft():
     fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
     assert float(fields["ttft_ms"]) == 500.0
     assert float(fields["ttft_win_ms"]) == 500.0
+    assert float(fields["ttft_p50_ms"]) == 500.0
+    assert float(fields["ttft_p95_ms"]) == 500.0
     assert fields["ttft_n"] == "1"
 
 

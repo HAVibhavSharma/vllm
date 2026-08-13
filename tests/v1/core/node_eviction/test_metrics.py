@@ -207,6 +207,35 @@ def test_ttft_mean_is_exact_and_p95_is_over_the_ring():
     assert t.mean_ms == 50.5
     # Nearest-rank: the smallest sample at or above the 95th percentile.
     assert t.p95_ms == 95.0
+    assert t.p50_ms == 50.0
+
+
+def test_ttft_median_ignores_the_outlier_the_mean_chases():
+    """The reason the median is on the line at all. Nine fast requests and one
+    30s cold prefill: the mean lands at 3s, which is not what any of the ten
+    saw. Read together, mean >> median says the tail moved, not the common
+    case — and quoting the mean as "requests got faster" is the mistake this
+    guards."""
+    from vllm.v1.core.node_eviction.metrics import TTFTTracker
+
+    t = TTFTTracker()
+    for _ in range(9):
+        t.record(100.0)
+    t.record(30_000.0)
+
+    assert t.mean_ms == 3090.0
+    assert t.p50_ms == 100.0
+    assert t.p95_ms == 30_000.0
+
+
+def test_ttft_percentiles_are_zero_before_any_sample():
+    """Not NaN: a NaN here poisons every downstream average, and the summary
+    line has to print *something* on the startup line."""
+    from vllm.v1.core.node_eviction.metrics import TTFTTracker
+
+    t = TTFTTracker()
+    assert t.p50_ms == 0.0
+    assert t.p95_ms == 0.0
 
 
 def test_ttft_window_resets_but_cumulative_does_not():

@@ -41,6 +41,40 @@ baseline.kv_hbm
 policy.kv_hbm
 ```
 
+The page holds up to **three** at once, in slots A, B and C — not in fixed
+arms. Any set of `variant=` values is a legal comparison, and each column is
+labelled with the variant its own lines name. Keying the runs by variant
+instead of by slot is what made a `variant=continuum` log parse cleanly and
+then render nothing at all.
+
+Three rather than two because that is the comparison that actually gets run:
+`baseline` vs `node_eviction` vs `continuum`. Splitting it across two two-way
+pages means eyeballing a scroll between them, which §6 already rules out for
+two columns and is worse for three.
+
+**Slot A is the reference.** Every Δ in the summary is measured against it,
+never between the non-reference arms. Pairwise deltas across three arms is six
+delta columns with no reading order; against a fixed reference it is two, and
+"which arm won" is answerable by scanning one column. Slots fill in drop
+order, except that a run naming `variant=baseline` claims A when A is free.
+
+A is drawn dashed, B solid, C dotted — separable in a greyscale screenshot and
+without relying on hue. The policy-only panels (splice volume, regret, scored
+coverage) still render for `node_eviction` alone: every other variant emits a
+constant zero there, and a flat zero reads as "no regret" rather than "not
+measured".
+
+Slots that hold nothing do not appear: no empty column, no solo button, no
+delta of dashes.
+
+Optionally, one harness report per slot (`armD_rep1.jsonl` /
+`armE_rep1.jsonl` / …) for client-measured end-to-end latency. These carry no
+variant field, so the slot comes from which input the file was dropped in —
+never from the filename, because a mislabelled arm silently inverts the
+result. The paired E2E figure is computed once per non-reference arm, each
+against the reference on the keys those two have in common; the matched-key
+count differs per pair and is printed on its own row.
+
 Each line carries the log's own timestamp prefix followed by the `kv_hbm`
 payload. The payload is flat `key=value` pairs separated by single spaces,
 identical field order on both sides — see the field table in
@@ -91,7 +125,8 @@ time produces two disjoint traces on one axis.
 
 ```
 Run {
-  variant: "baseline" | "node_eviction",
+  slot: "A" | "B" | "C",      // A is the reference every Δ is taken against
+  variant: string,            // "baseline" | "node_eviction" | "continuum" | …
   samples: Sample[],          // ordered by t
 }
 
@@ -211,25 +246,29 @@ separate columns — the eye cannot align two columns across a scroll.
 | 2 | **Rebuild rate** | `ΔrematBlocks / Δt`, blocks/s, two lines. Shows *when* the policy helped — a gap that opens only under pressure is a different story from a constant offset. |
 | 3 | **Hit rate** | `hitRateWin`, two lines, 0–1. Read against panel 1: movement down with hit rate flat or up is the win. Movement down *and* hit rate down means it served less, not better. |
 | 4 | **TTFT** | `ttft_win_ms`, two lines, ms. Engine-side: scheduler queueing plus prefill, excluding front-end queueing and detokenization. Read against panel 3 — hit rate says how often the cache worked, this says whether it mattered. A hit-rate gain with TTFT flat means the hits landed on blocks that were cheap to rebuild. |
-| 5 | **TTFT p95** | `ttft_p95_ms`, two lines, ms. The tail the mean hides: destroying one large prefix can leave the mean flat and still make a minority of requests much worse. |
-| 6 | **Redo share** | Windowed `ΔrematBlocks / Δblocks_cached`, two lines, 0–1. Normalises panel 2 for throughput, so a quiet run cannot fake an improvement. |
-| 7 | **Occupancy** | `used`/`total` as a percentage. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
-| 8 | **Free queue depth** | `queue`, two lines. The eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
-| 9 | **Eviction rate** | `Δevicted / Δt`, blocks/s, two lines. |
-| 10 | **Splice activity** | `ΔsplicedBlocks / Δt`, policy only, filled area. Annotate `splices=0 for the whole run` in red if the policy series is flat zero — that is a bug, not a result. |
-| 11 | **Attribution — policy** | Stacked area, one band per `job:node`, plus `<untracked>` and `other`. Y is blocks evicted per window. |
-| 12 | **Attribution — baseline** | Same, same colours, same y-scale as panel 11. Locking the y-scale across the two is what makes them comparable at a glance. |
-| 13 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
-| 14 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
+| 5 | **TTFT median** | `ttft_p50_ms`, one line per arm, ms. What a *typical* request saw. TTFT is right-skewed, so panel 4's mean can sit where no request was — nine 100 ms prefills and one 30 s cold miss average to 3.09 s. Read against panel 4: **a mean that moved without the median is a tail effect**, not a faster common case. Same ring as panel 6, so the median-to-p95 spread is one population. |
+| 6 | **TTFT p95** | `ttft_p95_ms`, two lines, ms. The tail the mean hides: destroying one large prefix can leave the mean flat and still make a minority of requests much worse. |
+| 7 | **Redo share** | Windowed `ΔrematBlocks / Δblocks_cached`, two lines, 0–1. Normalises panel 2 for throughput, so a quiet run cannot fake an improvement. |
+| 8 | **Occupancy** | `used`/`total` as a percentage. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
+| 9 | **Free queue depth** | `queue`, two lines. The eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
+| 10 | **Eviction rate** | `Δevicted / Δt`, blocks/s, two lines. |
+| 11 | **Splice activity** | `ΔsplicedBlocks / Δt`, policy only, filled area. Annotate `splices=0 for the whole run` in red if the policy series is flat zero — that is a bug, not a result. |
+| 12 | **Attribution — policy** | Stacked area, one band per `job:node`, plus `<untracked>` and `other`. Y is blocks evicted per window. |
+| 13 | **Attribution — baseline** | Same, same colours, same y-scale as panel 11. Locking the y-scale across the two is what makes them comparable at a glance. |
+| 14 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
+| 15 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
 
 ### Summary header
 
-Above the panels, a compact row of paired numbers — baseline vs policy, with
-the delta. Movement first, because that is the claim:
+Above the panels, a compact table: one value column per loaded arm, then one Δ
+column per non-reference arm. Movement first, because that is the claim:
 
 - **KV rebuilt (`remat_mb`), and the delta as a percentage** — the headline
 - **TTFT mean (`ttft_ms`)** — the second headline, because it is the only
   figure that says the movement mattered
+- TTFT median (`ttft_p50_ms`), directly under the mean — the pair *is* the
+  finding, and a mean that moved without the median must not be quoted as
+  "requests got faster"
 - TTFT p95 (`ttft_p95_ms`), and `ttft_n` beside it: means over different
   request counts are not a comparison
 - redo share (`remat_ratio`)
@@ -242,17 +281,22 @@ the delta. Movement first, because that is the claim:
 
 This is what gets screenshotted into a writeup. Make it copyable as text.
 
-**Guard against the flattering comparison.** If the two runs differ in
-`query_tokens` by more than ~10%, they did not serve the same work and the
-absolute `remat_mb` delta is not a fair number. Detect it and print a warning
-banner: *"runs differ in served tokens by N% — compare `remat_ratio`, not
-`remat_mb`."* A visualisation that lets someone quote a win they did not earn
-is worse than no visualisation.
+**Guard against the flattering comparison.** If a run differs from the
+reference in `query_tokens` by more than ~10%, the two did not serve the same
+work and the absolute `remat_mb` delta is not a fair number. Detect it and
+print a warning banner naming *that arm*: *"<arm> served a different amount of
+work from <reference> — N% apart."* One banner per offending arm, not one
+rolled-up banner, which would name none of them. A visualisation that lets
+someone quote a win they did not earn is worse than no visualisation.
 
 The same guard applies to TTFT, for a different reason: it is the one
 per-*request* number on a page of per-*block* numbers, so an unmatched
 workload corrupts it silently. Warn when `ttft_n` differs by more than ~10%
-between the runs.
+from the reference.
+
+**And against comparing an arm with itself.** Two slots holding the same
+`variant=` is almost always a mis-drop, and their delta is run-to-run variance
+dressed as a policy effect. Name the slots and say so.
 
 ---
 
@@ -263,7 +307,8 @@ between the runs.
 - **Brush to zoom** on any panel, applied to all. Double-click resets.
 - **Legend toggles** per `job:node` label, applied to both attribution panels
   at once.
-- **Variant toggle** to solo baseline or policy.
+- **Solo toggle** per loaded arm, plus "all runs". A slot with no run loaded
+  hides its button rather than offering a filter that empties the page.
 
 Nothing else. Every additional control is one more thing to explain in the
 writeup.
