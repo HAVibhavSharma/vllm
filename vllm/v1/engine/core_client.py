@@ -232,6 +232,19 @@ class EngineCoreClient(ABC):
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
+    async def reset_kv_metrics_async(
+        self, label: str = "", flush_hbm: bool = False
+    ) -> dict[str, Any]:
+        """Start a new `kv_hbm` measurement epoch on the engine.
+
+        Answers instead of raising on clients that cannot reach an engine
+        core: the caller is a benchmark harness marking the end of its warmup,
+        and a failed marker should degrade to "the numbers still include the
+        warmup", which the response says plainly, rather than aborting a run
+        that is otherwise fine.
+        """
+        return {"ok": False, "reason": "unsupported_client"}
+
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -318,6 +331,14 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    async def reset_kv_metrics_async(
+        self, label: str = "", flush_hbm: bool = False
+    ) -> dict[str, Any]:
+        # In-process: no busy loop to hand the call to, so it runs here. Still
+        # exposed as the `_async` name so callers need not know which client
+        # they hold.
+        return self.engine_core.reset_kv_metrics(label, flush_hbm)
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -1092,6 +1113,11 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
+
+    async def reset_kv_metrics_async(
+        self, label: str = "", flush_hbm: bool = False
+    ) -> dict[str, Any]:
+        return await self.call_utility_async("reset_kv_metrics", label, flush_hbm)
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)

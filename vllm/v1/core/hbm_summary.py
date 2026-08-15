@@ -29,6 +29,8 @@ import math
 import os
 import time
 from collections import deque
+from collections.abc import Callable
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -41,6 +43,20 @@ _JOB_ID_FIELD = "job_id"
 _NODE_FIELD = "langgraph_node"
 
 UNTRACKED = "<untracked>"
+
+
+def is_prefetch_only(request) -> bool:
+    """A phantom prefetch, not demand.
+
+    `POST /v1/agents/prefetch` submits one request per prefix carrying
+    `kv_transfer_params={"prefetch_only": True}` (`agent_prefetch/
+    submitter.py`), and the scheduler discriminates on exactly this
+    (`Scheduler._is_prefetch_only_request`). This branch does not *originate*
+    phantoms the way the policy branch does, but it serves the endpoint, so
+    the traffic exists here too and has to be kept out of the headline rate.
+    """
+    params = getattr(request, "kv_transfer_params", None)
+    return bool(params and params.get("prefetch_only"))
 
 
 def node_label_for_request(request) -> str | None:
@@ -126,6 +142,17 @@ class HBMSummaryLogger:
         self._last_log_monotonic = 0.0
         self._last_fingerprint: tuple[int, ...] | None = None
 
+        # Measurement epoch. Bumped by `reset_measurement`, which a benchmark
+        # harness calls over `POST /v1/kv_metrics/reset` once its warmup has
+        # finished. Every `kv_hbm` line carries the epoch it was measured in,
+        # so a warmup line can never be mistaken for a measured one — they are
+        # otherwise identical in shape. Mirrors `node_eviction/controller.py`
+        # on the policy branch, field for field.
+        self.metrics_epoch = 0
+        self._epoch_started_monotonic = time.monotonic()
+        self._epoch_started_wall = time.time()
+        self._epoch_label = "boot"
+
     def _reset_totals(self) -> None:
         """Zero everything the prefix cache's contents can invalidate.
 
@@ -151,6 +178,9 @@ class HBMSummaryLogger:
         # is dominated by whatever the workload did first.
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
+        # Phantom prefetch traffic, kept out of every rate above.
+        self.phantom_hit_tokens = 0
+        self.phantom_query_tokens = 0
 
     def configure(self, block_size_bytes: int) -> None:
         """Told the KV page size after construction.
@@ -215,7 +245,11 @@ class HBMSummaryLogger:
         self._note_evicted(self._hash_of(block_id))
 
     def on_cache_query(
-        self, num_tokens: int, num_hits: int, preempted: bool = False
+        self,
+        num_tokens: int,
+        num_hits: int,
+        preempted: bool = False,
+        phantom: bool = False,
     ) -> None:
         """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
 
@@ -223,7 +257,20 @@ class HBMSummaryLogger:
         object is drained by whoever polls the metrics loggers — sharing it
         would make this hit rate depend on whether anything else was
         scraping, and on `log_stats` being on at all.
+
+        A phantom (`/v1/agents/prefetch`) touches only the phantom buckets.
+        Left in the headline rate it lands in both numerator and denominator,
+        and not with a consistent sign: a phantom's first prefill is a
+        near-total miss that deflates the rate, while a phantom for an
+        already-resident prefix is a large hit no user ever experienced.
+        Since the line exists to be diffed field-by-field against arms that
+        may originate a different number of phantoms, either direction shows
+        up as a policy difference that never happened.
         """
+        if phantom:
+            self.phantom_query_tokens += num_tokens
+            self.phantom_hit_tokens += num_hits
+            return
         self.query_tokens += num_tokens
         self.hit_tokens += num_hits
         self.window_query_tokens += num_tokens
@@ -389,6 +436,19 @@ class HBMSummaryLogger:
         return self.hit_tokens_fresh / self.query_tokens_fresh
 
     @property
+    def phantom_hit_rate(self) -> float:
+        """How often warming fetched something already resident.
+
+        High is not good: it means the prefetch bought nothing. Low with a
+        large `phantom_query_tokens` is the expensive case — real prefills
+        submitted ahead of user traffic. Either way it belongs next to the
+        real rate, not inside it.
+        """
+        if self.phantom_query_tokens == 0:
+            return 0.0
+        return self.phantom_hit_tokens / self.phantom_query_tokens
+
+    @property
     def window_hit_rate(self) -> float:
         if self.window_query_tokens == 0:
             return 0.0
@@ -446,21 +506,148 @@ class HBMSummaryLogger:
             f"hit_tokens={self.hit_tokens} "
             f"query_tokens={self.query_tokens} "
             f"query_tokens_fresh={self.query_tokens_fresh} "
-            # This branch originates no prefetch, so there is no phantom
-            # traffic to separate out. Emitted as zeros for the same reason as
-            # `staged`/`deficit`: on the policy branch these carry the prefill
-            # that origination bought, and a missing field there reads as a
-            # parse failure rather than an absence.
-            f"phantom_hit_rate=0.0000 "
-            f"phantom_query_tokens=0 "
+            # Phantom prefetch traffic (`/v1/agents/prefetch`), excluded from
+            # every rate above and reported here so the prefill that warming
+            # bought is visible next to the hit rate it was meant to raise,
+            # rather than hidden inside it.
+            f"phantom_hit_rate={self.phantom_hit_rate:.4f} "
+            f"phantom_query_tokens={self.phantom_query_tokens} "
             f"remat_blocks={self.remat_blocks} "
             f"remat_mb={self.remat_mb:.1f} "
             f"remat_ratio={self.remat_ratio:.4f} "
             f"blocks_cached={self.blocks_cached_total} "
             f"index_keys={len(set(self._owner.values()))} "
             f"index_blocks={len(self._owner)} "
+            # Which measurement epoch these numbers belong to, and how long it
+            # has been running. `epoch=0` is everything before the harness
+            # said its warmup was done; the run to report on is the highest
+            # epoch present. Ahead of `top_evicted` because that field is
+            # free-form (it contains `=` and `,`) and has to stay last.
+            f"epoch={self.metrics_epoch} "
+            f"epoch_age_s={self.epoch_age_s:.1f} "
             f"top_evicted={top_str}"
         )
+
+    @property
+    def epoch_age_s(self) -> float:
+        """Seconds since the current measurement epoch began.
+
+        The denominator for anything rate-like read off the line, and the
+        reason an end-to-end figure need not include the warmup: the epoch
+        clock restarts when the harness posts its reset.
+        """
+        return max(time.monotonic() - self._epoch_started_monotonic, 0.0)
+
+    def reset_measurement(
+        self,
+        label: str = "",
+        before_reset: Callable[[], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Discard everything measured so far and start a new epoch.
+
+        The workload calls this over `POST /v1/kv_metrics/reset` once its
+        warmup has populated the caches. A warmup pass corrupts every headline
+        number three separate ways: the TTFT mean, median and p95 carry cold
+        prefills no measured request paid; the hit rate is cumulative, so a
+        cold pass drags it down for the rest of the run; and the elapsed
+        window behind any rate starts at server boot rather than at the first
+        measured request.
+
+        `before_reset` is the hook the caller uses to flush HBM at the same
+        boundary (`EngineCore.reset_kv_metrics(flush_hbm=True)`). It runs
+        *after* the cold-phase numbers have been captured and *before* the
+        counters are zeroed, which is the only ordering that works: flushing
+        first fires `on_reset_prefix_cache`, which zeroes the token counters
+        itself, and the marker line would then report a cold phase that looks
+        like it never ran.
+
+        With no hook the KV cache is left alone — a warmup exists to fill it —
+        and the rematerialisation ring survives, because a block evicted
+        during the warmup and rebuilt afterwards is real rebuild work paid
+        inside the measured window. With one, the resident blocks go (and
+        `on_reset_prefix_cache` drops the ring, correctly: an operator wipe is
+        not policy eviction) but a KV connector's store does not, so the warm
+        phase starts with an empty HBM cache in front of a populated CPU tier.
+
+        Byte-compatible with the policy branch's
+        `NodeEvictionController.reset_measurement`, for the same reason the
+        `kv_hbm` line is: the two runs are meant to be diffed.
+        """
+        # Ungated: `maybe_log` would suppress this if the period had not
+        # elapsed or nothing had changed, and the one line guaranteed to
+        # matter is the last one before the boundary.
+        discarded_line = self.summary()
+        logger.info("%s", discarded_line)
+
+        discarded = self.stats()
+        previous_epoch = self.metrics_epoch
+        epoch_age_s = self.epoch_age_s
+
+        # Whatever the hook does to the cache — including the counter writes
+        # its own hooks make — is undone by the zeroing below, so the new
+        # epoch starts at zero either way.
+        hbm_flushed = "skipped"
+        if before_reset is not None:
+            hbm_flushed = "true" if before_reset() else "false"
+
+        self._reset_totals()
+        self.evictions_total = 0
+        self._evictions_by_key.clear()
+        # Percentiles are nearest-rank over the retained ring, so without this
+        # the warmup's cold prefills stay in the tail — and keep being
+        # reported as the measured run's p95 — for the next 4096 requests.
+        self._ttft_recent.clear()
+        self.ttft_count = 0
+        self.ttft_total_ms = 0.0
+        self.ttft_window_count = 0
+        self.ttft_window_total_ms = 0.0
+
+        self.metrics_epoch += 1
+        self._epoch_started_monotonic = time.monotonic()
+        self._epoch_started_wall = time.time()
+        self._epoch_label = label or "reset"
+
+        # So the first line of the new epoch is not withheld by the rate limit
+        # or the change gate — with the counters at zero the fingerprint would
+        # otherwise have to move before anything printed.
+        self._last_log_monotonic = 0.0
+        self._last_fingerprint = None
+
+        marker = (
+            f"kv_hbm_reset variant=baseline "
+            f"epoch={self.metrics_epoch} "
+            f"prev_epoch={previous_epoch} "
+            f"label={self._epoch_label} "
+            f"at={self._epoch_started_wall:.3f} "
+            f"prev_epoch_age_s={epoch_age_s:.1f} "
+            # Whether the resident blocks went with the counters. Reading a
+            # hit rate without knowing this is meaningless: an epoch that
+            # started with an empty HBM cache and one that inherited a full
+            # one are not the same measurement.
+            f"hbm_flushed={hbm_flushed} "
+            f"discarded_ttft_n={discarded['ttft_n']} "
+            f"discarded_ttft_ms={discarded['ttft_ms']:.1f} "
+            f"discarded_ttft_p50_ms={discarded['ttft_p50_ms']:.1f} "
+            f"discarded_ttft_p95_ms={discarded['ttft_p95_ms']:.1f} "
+            f"discarded_hit_rate={discarded['hit_rate']:.4f} "
+            f"discarded_query_tokens={discarded['query_tokens']} "
+            f"discarded_evicted={discarded['evictions_total']}"
+        )
+        logger.info("%s", marker)
+
+        return {
+            "ok": True,
+            "variant": "baseline",
+            "epoch": self.metrics_epoch,
+            "prev_epoch": previous_epoch,
+            "label": self._epoch_label,
+            "at": self._epoch_started_wall,
+            "prev_epoch_age_s": epoch_age_s,
+            "hbm_flushed": hbm_flushed,
+            "discarded_line": discarded_line,
+            "discarded_stats": discarded,
+            "marker": marker,
+        }
 
     def maybe_log(self, now: float | None = None) -> str | None:
         """Rate-limited *and* change-gated, so an idle server logs nothing.
@@ -530,9 +717,9 @@ class HBMSummaryLogger:
             "query_tokens": self.query_tokens,
             "hit_tokens_fresh": self.hit_tokens_fresh,
             "query_tokens_fresh": self.query_tokens_fresh,
-            "phantom_hit_rate": 0.0,
-            "phantom_hit_tokens": 0,
-            "phantom_query_tokens": 0,
+            "phantom_hit_rate": self.phantom_hit_rate,
+            "phantom_hit_tokens": self.phantom_hit_tokens,
+            "phantom_query_tokens": self.phantom_query_tokens,
             "remat_blocks": self.remat_blocks,
             "remat_mb": self.remat_mb,
             "remat_ratio": self.remat_ratio,
@@ -540,4 +727,8 @@ class HBMSummaryLogger:
             "block_size_bytes": self.block_size_bytes,
             "index_keys": len(set(self._owner.values())),
             "index_blocks": len(self._owner),
+            # Which measurement window these numbers describe. Without it a
+            # scraped sample cannot be told apart from one taken during warmup.
+            "metrics_epoch": self.metrics_epoch,
+            "epoch_age_s": self.epoch_age_s,
         }

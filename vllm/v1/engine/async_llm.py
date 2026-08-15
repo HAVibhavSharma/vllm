@@ -896,6 +896,23 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def reset_kv_metrics(
+        self, label: str = "", flush_hbm: bool = False
+    ) -> dict[str, Any]:
+        """End the warmup: zero the `kv_hbm` measurements, keep the cache.
+
+        Served by `POST /v1/kv_metrics/reset`. A benchmark's cold phase is
+        there to fill the caches, and it also fills the counters — with cold
+        prefills in the TTFT percentiles, misses in a cumulative hit rate that
+        never recovers, and an elapsed window that starts at server boot. This
+        draws the line between the two phases in the engine's own log.
+
+        `flush_hbm` also drops the resident GPU blocks at that boundary while
+        leaving any KV connector's store intact, so the warm phase begins with
+        an empty HBM cache in front of a populated CPU tier.
+        """
+        return await self.engine_core.reset_kv_metrics_async(label, flush_hbm)
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -258,6 +258,9 @@ class KVCacheManager:
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
+                # `/v1/agents/prefetch` warming is not demand the cache
+                # served, so it is routed out of the headline hit rate.
+                phantom=is_prefetch_only(request),
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
@@ -594,3 +597,25 @@ class KVCacheManager:
         if self.block_pool.hbm_summary is None:
             return None
         return self.block_pool.hbm_summary.stats()
+
+    def reset_kv_metrics(
+        self,
+        label: str = "",
+        before_reset: Callable[[], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a new measurement epoch; leave the KV cache alone.
+
+        Reached from `POST /v1/kv_metrics/reset` over `call_utility`, so it
+        runs on the busy-loop thread that owns the scheduler — the same thread
+        that mutates these counters — and needs no lock.
+
+        `before_reset` is forwarded so the caller can flush the resident
+        blocks at exactly the same boundary; see `reset_measurement`.
+
+        A no-op result rather than an exception when the instrumentation is
+        off: the harness posts this unconditionally at the end of its warmup,
+        and an arm that answers `ok: false` is more useful to it than a 500.
+        """
+        if self.block_pool.hbm_summary is None:
+            return {"ok": False, "reason": "hbm_summary_disabled"}
+        return self.block_pool.hbm_summary.reset_measurement(label, before_reset)

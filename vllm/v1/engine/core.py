@@ -606,6 +606,70 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def reset_kv_metrics(
+        self, label: str = "", flush_hbm: bool = False
+    ) -> dict[str, Any]:
+        """Zero the `kv_hbm` measurements and open a new epoch.
+
+        A `call_utility` target, so it runs on the busy-loop thread that owns
+        the scheduler — which is what makes it safe to touch counters the
+        scheduler writes on every step.
+
+        Called by a benchmark harness once its cold phase has finished, so the
+        numbers it goes on to report describe the warm phase only.
+
+        `flush_hbm` additionally drops every resident block from the GPU
+        prefix cache at the same instant, so the warm phase starts with an
+        empty HBM cache. **The KV connector is deliberately left alone**: with
+        a CPU tier (LMCache and friends) configured, this is what makes the
+        warm phase read "cold HBM, warm CPU" — every prefix the cold phase
+        produced is still held one level down and gets pulled back up, which
+        is the transfer path the experiment is there to measure. Without a
+        connector there is nothing underneath, and flushing simply makes the
+        warm phase cold; the response says which case this server is in.
+
+        The flush is threaded down as a callback rather than done here so it
+        lands *between* capturing the cold-phase numbers and zeroing the
+        counters. Doing it first would fire `on_reset_prefix_cache`, whose own
+        hook zeroes the token counters, and the marker line would report a
+        cold phase that looks like it never ran.
+        """
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return {"ok": False, "reason": "no_kv_cache_manager"}
+        result = kv_cache_manager.reset_kv_metrics(
+            label, self._flush_hbm_blocks if flush_hbm else None
+        )
+        # Reported unconditionally so a run can tell "flushed into a warm CPU
+        # tier" from "flushed into nothing", which produce very different
+        # warm-phase hit rates for reasons that have nothing to do with the
+        # policy under test.
+        result["kv_connector_configured"] = (
+            getattr(self.vllm_config, "kv_transfer_config", None) is not None
+        )
+        return result
+
+    def _flush_hbm_blocks(self) -> bool:
+        """Drop every resident block from the GPU prefix cache, keep the tier.
+
+        `reset_connector=False` is the point of the whole call: the CPU-side
+        store stays, so the warm phase re-reads from it rather than from the
+        model. `reset_running_requests=False` because a benchmark calls this
+        between phases with nothing in flight, and silently aborting requests
+        to force a flush would be worse than reporting that the flush did not
+        happen — which is what the `False` return says.
+        """
+        flushed = self.reset_prefix_cache(
+            reset_running_requests=False, reset_connector=False
+        )
+        if not flushed:
+            logger.warning(
+                "kv_metrics: HBM flush refused -- cached blocks are still "
+                "referenced by in-flight requests; the warm phase starts "
+                "with those blocks resident"
+            )
+        return bool(flushed)
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
