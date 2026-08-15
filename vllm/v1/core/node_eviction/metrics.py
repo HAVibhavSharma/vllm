@@ -140,6 +140,50 @@ class EvictionCounters:
             "index_blocks": self.index_blocks,
         }
 
+    def reset_measurement(self) -> None:
+        """Zero the run-to-date totals at a measurement epoch boundary.
+
+        Called from `NodeEvictionController.reset_measurement` when the
+        workload says its warmup is finished. Every field here is a *count of
+        things that happened*, and a warmup exists precisely so those things
+        happen without being measured.
+
+        Deliberately mutated in place rather than swapping in a fresh
+        `EvictionCounters`: `EvictionObserver.counters` is handed out by
+        reference (the controller keeps `c = self.observer.counters` locals,
+        and `stats()` reads the same object), so rebinding would leave stale
+        readers pointed at the old instance.
+
+        `policy_enabled` and the four gauges below are configuration or
+        current state, not counts, and survive: zeroing `index_keys` would
+        claim the index emptied itself, and zeroing the pending want gauges
+        would lose wants that are still outstanding across the boundary.
+        """
+        self.ticks_total = 0
+        self.ticks_skipped_fresh = 0
+        self.ticks_skipped_unchanged = 0
+        self.splices_total = 0
+        self.blocks_spliced_total = 0
+        self.splice_restages_total = 0
+        self.evictions_total = 0
+        self.evictions_by_score_total = 0
+        self.unscored_evictions_total = 0
+        self.evicted_then_needed_total = 0
+        self.evicted_then_needed_cost_ms = 0.0
+        self.speculative_created = 0
+        self.speculative_confirmed = 0
+        self.speculative_blocks_created = 0
+        self.speculative_evicted_before_confirm = 0
+        self.prefetch_wants_created = 0
+        self.prefetch_wants_dropped = 0
+        self.prefetch_wants_drained = 0
+        self.prefetch_wants_satisfied = 0
+        self.prefetch_wants_expired = 0
+        self.needed_score_sum = 0.0
+        self.needed_count = 0
+        self.not_needed_score_sum = 0.0
+        self.not_needed_count = 0
+
     @property
     def unscored_eviction_ratio(self) -> float:
         if self.evictions_total == 0:
@@ -400,6 +444,19 @@ class CacheMovementTracker:
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
 
+    def reset_measurement(self) -> None:
+        """Zero the token and block totals, keeping the eviction ring.
+
+        The difference from `on_reset` is deliberate and is the whole point of
+        having both. `on_reset` follows a `reset_prefix_cache`, where the ring
+        must go too because nothing in it can be rematerialised any more. A
+        measurement reset does *not* touch the cache — the warmup ran to fill
+        it — so a block evicted during warmup and rebuilt afterwards is real
+        rebuild work paid inside the measured window, and dropping the ring
+        would hide it.
+        """
+        self._reset_totals()
+
     def as_dict(self) -> dict[str, float | int]:
         return {
             "hit_rate": self.hit_rate,
@@ -503,6 +560,21 @@ class TTFTTracker:
         return self._percentile(0.95)
 
     def reset_window(self) -> None:
+        self.window_count = 0
+        self.window_total_ms = 0.0
+
+    def reset_measurement(self) -> None:
+        """Drop every sample, including the percentile ring.
+
+        The ring is the reason this exists as a separate call. `p50_ms` and
+        `p95_ms` are nearest-rank over retained samples, so a warmup's cold
+        prefills stay in the tail for the next `ring_size` requests and keep
+        being reported as the measured run's percentiles — which is exactly
+        the number an eviction experiment is trying to read.
+        """
+        self._recent.clear()
+        self.count = 0
+        self.total_ms = 0.0
         self.window_count = 0
         self.window_total_ms = 0.0
 
@@ -674,6 +746,18 @@ class EvictionObserver:
                 record.counted = True
                 counters.not_needed_score_sum += record.score
                 counters.not_needed_count += 1
+
+    def reset_measurement(self) -> None:
+        """Start a fresh measurement epoch: counters to zero, ring emptied.
+
+        The ring goes too. Its records are warmup-era evictions, and leaving
+        them means the first requests after the boundary charge regret — and
+        the `e_miss_ms` cost of a cold prefill — to the measured window for
+        decisions the measured window did not make.
+        """
+        self.counters.reset_measurement()
+        self._recent.clear()
+        self._recent_by_key.clear()
 
     def close(self) -> None:
         if self._log_file is not None and not self._log_file.closed:

@@ -189,6 +189,16 @@ def build_app(
 
     register_models_api_router(app)
 
+    # Unconditional, and deliberately not behind VLLM_SERVER_DEV_MODE the way
+    # /reset_prefix_cache is: this only marks the end of a benchmark's warmup,
+    # and needing dev mode for it would mean measuring a server configured
+    # differently from the one under test.
+    from vllm.entrypoints.openai.kv_metrics_router import (
+        attach_router as attach_kv_metrics_router,
+    )
+
+    attach_kv_metrics_router(app)
+
     from vllm.entrypoints.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
     )

@@ -25,7 +25,8 @@ behaviour (01 §6.5).
 
 import heapq
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.node_eviction.config import NodeEvictionConfig
@@ -167,6 +168,16 @@ class NodeEvictionController:
         self._last_hbm_log_monotonic = 0.0
         self._last_hbm_fingerprint: tuple[int, ...] | None = None
         self._evictions_by_key: dict[str, int] = {}
+
+        # Measurement epoch. Bumped by `reset_measurement`, which the
+        # benchmark harness calls over `POST /v1/kv_metrics/reset` once its
+        # warmup has finished. Every `kv_hbm` line carries the epoch it was
+        # measured in, so a line from the warmup can never be mistaken for a
+        # line from the run — the two are otherwise identical in shape.
+        self.metrics_epoch = 0
+        self._epoch_started_monotonic = time.monotonic()
+        self._epoch_started_wall = time.time()
+        self._epoch_label = "boot"
 
         # Hit rate and the movement number. The default window is one full
         # pool turnover: a block evicted longer ago than that is not
@@ -736,6 +747,21 @@ class NodeEvictionController:
         logger.info("%s", summary)
         return summary
 
+    @property
+    def _variant(self) -> str:
+        """The arm this server is running, as it appears on the log line.
+
+        Keyed on whether the splice *can* run, not on the observe flag alone:
+        `splice_max_blocks: 0` in the JSON is behaviourally the same arm and
+        used to report itself as `node_eviction`, which made the two runs
+        indistinguishable in the field the timeline tool keys on.
+        """
+        return (
+            "baseline"
+            if self.config.observe_only or self.config.splice_max_blocks <= 0
+            else "node_eviction"
+        )
+
     def hbm_summary(self) -> str:
         """One line of HBM block accounting, in `key=value` form.
 
@@ -759,17 +785,8 @@ class NodeEvictionController:
             self._evictions_by_key.items(), key=lambda kv: (-kv[1], kv[0])
         )[: self.config.hbm_summary_top_keys]
         top_str = ",".join(f"{label}={n}" for label, n in top) or "-"
-        # Keyed on whether the splice *can* run, not on the observe flag
-        # alone: `splice_max_blocks: 0` in the JSON is behaviourally the same
-        # arm and used to report itself as `node_eviction`, which made the
-        # two runs indistinguishable in the field the timeline tool keys on.
-        variant = (
-            "baseline"
-            if self.config.observe_only or self.config.splice_max_blocks <= 0
-            else "node_eviction"
-        )
         return (
-            f"kv_hbm variant={variant} "
+            f"kv_hbm variant={self._variant} "
             f"total={total} used={used} free={free} "
             f"usage={(used / total * 100.0) if total else 0.0:.1f}% "
             f"queue={pool.free_block_queue.num_free_blocks} "
@@ -810,8 +827,128 @@ class NodeEvictionController:
             f"blocks_cached={m.blocks_cached} "
             f"index_keys={self.index.num_keys} "
             f"index_blocks={self.index.num_blocks} "
+            # Which measurement epoch these numbers belong to, and how long it
+            # has been running. `epoch=0` is everything before the harness
+            # said its warmup was done; the run to report on is the highest
+            # epoch present. Placed ahead of `top_evicted` because that field
+            # is free-form (it contains `=` and `,`) and has to stay last.
+            f"epoch={self.metrics_epoch} "
+            f"epoch_age_s={self.epoch_age_s:.1f} "
             f"top_evicted={top_str}"
         )
+
+    @property
+    def epoch_age_s(self) -> float:
+        """Seconds since the current measurement epoch began.
+
+        This is the denominator for anything rate-like computed off the line,
+        and the reason end-to-end timing does not have to include the warmup:
+        the epoch clock restarts when the harness posts its reset.
+        """
+        return max(time.monotonic() - self._epoch_started_monotonic, 0.0)
+
+    def reset_measurement(
+        self,
+        label: str = "",
+        before_reset: Callable[[], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Discard everything measured so far and start a new epoch.
+
+        The workload calls this over `POST /v1/kv_metrics/reset` once its
+        warmup has populated the caches. It exists because a warmup pass
+        corrupts every headline number three separate ways: the TTFT mean,
+        median and p95 carry cold prefills no measured request paid; the hit
+        rate is cumulative, so a cold pass permanently drags it down; and the
+        elapsed window used for end-to-end figures starts at server boot
+        rather than at the first measured request.
+
+        `before_reset` is the hook the caller uses to flush HBM at the same
+        boundary (`EngineCore.reset_kv_metrics(flush_hbm=True)`). It runs
+        *after* the cold-phase numbers have been captured and *before* the
+        counters are zeroed, which is the only ordering that works: flushing
+        first would fire `on_reset_prefix_cache`, which zeroes the token
+        counters itself, and the marker line would report a cold phase that
+        looks like it never ran.
+
+        With no hook, the KV cache is left alone — a warmup exists to fill it.
+        With one, the resident blocks go but a KV connector's store does not,
+        so the warm phase starts with an empty HBM cache in front of a
+        populated CPU tier.
+
+        The final pre-reset `kv_hbm` line is emitted first, ungated, so the
+        cold phase's numbers survive in the log rather than being thrown away;
+        then a `kv_hbm_reset` marker line names the boundary. Returns the
+        discarded stats so the caller can file them with its own results.
+        """
+        # Ungated: `_maybe_log_hbm_summary` would suppress this if the period
+        # had not elapsed or nothing had changed, and the one line guaranteed
+        # to matter is the last one before the boundary.
+        discarded_line = self.hbm_summary()
+        logger.info("%s", discarded_line)
+
+        discarded = self.stats()
+        previous_epoch = self.metrics_epoch
+        epoch_age_s = self.epoch_age_s
+
+        # Whatever the hook does to the cache — including the counter writes
+        # its own hooks make — is undone by the zeroing below, so the new
+        # epoch starts at zero either way.
+        hbm_flushed: str = "skipped"
+        if before_reset is not None:
+            hbm_flushed = "true" if before_reset() else "false"
+
+        self.observer.reset_measurement()
+        self.observer.counters.policy_enabled = self.enabled
+        self.movement.reset_measurement()
+        self.ttft.reset_measurement()
+        self._evictions_by_key.clear()
+
+        self.metrics_epoch += 1
+        self._epoch_started_monotonic = time.monotonic()
+        self._epoch_started_wall = time.time()
+        self._epoch_label = label or "reset"
+
+        # So the first line of the new epoch is not withheld by the rate limit
+        # or the change gate — with the counters at zero the fingerprint would
+        # otherwise have to move before anything printed.
+        self._last_hbm_log_monotonic = 0.0
+        self._last_hbm_fingerprint = None
+
+        marker = (
+            f"kv_hbm_reset variant={self._variant} "
+            f"epoch={self.metrics_epoch} "
+            f"prev_epoch={previous_epoch} "
+            f"label={self._epoch_label} "
+            f"at={self._epoch_started_wall:.3f} "
+            f"prev_epoch_age_s={epoch_age_s:.1f} "
+            # Whether the resident blocks went with the counters. Reading a
+            # hit rate without knowing this is meaningless: an epoch that
+            # started with an empty HBM cache and one that inherited a full
+            # one are not the same measurement.
+            f"hbm_flushed={hbm_flushed} "
+            f"discarded_ttft_n={discarded.get('ttft_n', 0)} "
+            f"discarded_ttft_ms={discarded.get('ttft_ms', 0.0):.1f} "
+            f"discarded_ttft_p50_ms={discarded.get('ttft_p50_ms', 0.0):.1f} "
+            f"discarded_ttft_p95_ms={discarded.get('ttft_p95_ms', 0.0):.1f} "
+            f"discarded_hit_rate={discarded.get('hit_rate', 0.0):.4f} "
+            f"discarded_query_tokens={discarded.get('query_tokens', 0)} "
+            f"discarded_evicted={discarded.get('evictions_total', 0)}"
+        )
+        logger.info("%s", marker)
+
+        return {
+            "ok": True,
+            "variant": self._variant,
+            "epoch": self.metrics_epoch,
+            "prev_epoch": previous_epoch,
+            "label": self._epoch_label,
+            "at": self._epoch_started_wall,
+            "prev_epoch_age_s": epoch_age_s,
+            "hbm_flushed": hbm_flushed,
+            "discarded_line": discarded_line,
+            "discarded_stats": discarded,
+            "marker": marker,
+        }
 
     def _maybe_log_hbm_summary(self, now: float) -> str | None:
         """Rate-limited and change-gated, exactly like the prefetch line.
@@ -1109,6 +1246,10 @@ class NodeEvictionController:
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys
         out["value_table_size"] = len(self._value_table)
+        # Which measurement window these numbers describe. Without it a
+        # scraped sample cannot be told apart from one taken during warmup.
+        out["metrics_epoch"] = self.metrics_epoch
+        out["epoch_age_s"] = self.epoch_age_s
         out["observe_only"] = self.config.observe_only
         out["prefetch_origination_enabled"] = self._wants is not None
         if self._wants is not None:

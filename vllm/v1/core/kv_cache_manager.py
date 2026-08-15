@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -640,3 +640,25 @@ class KVCacheManager:
         if self.node_eviction is None:
             return None
         return self.node_eviction.stats()
+
+    def reset_kv_metrics(
+        self,
+        label: str = "",
+        before_reset: Callable[[], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a new measurement epoch; leave the KV cache alone.
+
+        Reached from `POST /v1/kv_metrics/reset` over `call_utility`, so it
+        runs on the busy-loop thread that owns the scheduler — the same thread
+        that mutates these counters — and needs no lock.
+
+        `before_reset` is forwarded so the caller can flush the resident
+        blocks at exactly the same boundary; see `reset_measurement`.
+
+        A no-op result rather than an exception when the policy is off: the
+        harness posts this unconditionally at the end of its warmup, and a
+        baseline arm that answers `ok: false` is more useful to it than a 500.
+        """
+        if self.node_eviction is None:
+            return {"ok": False, "reason": "node_eviction_disabled"}
+        return self.node_eviction.reset_measurement(label, before_reset)
