@@ -575,10 +575,15 @@ async def prefetch_agent_cache(
                 request.agent_id,
             )
 
-    # Effective top_k: non-react forces 1 regardless of what the caller
-    # passed (the single-prefix invariant means there's nothing else to
-    # warm). React mode honours the request's prefetch_top_k as before.
-    if request.agent_kind == "non-react":
+    # Effective top_k. `non-react` forces 1 only when *this* call actually
+    # re-established the single-prefix invariant -- i.e. `text` was supplied,
+    # so `evict_agent` above dropped the agent's other entries and there is
+    # genuinely nothing else to warm. Unseeded (`text=None`) the registry is
+    # whatever ordinary chat traffic recorded, which for a node revisited
+    # across jobs is several distinct prefixes; forcing 1 there silently
+    # warmed the MRU one and dropped the rest. Everything else honours the
+    # request, whose default is None == warm all.
+    if request.agent_kind == "non-react" and seeded:
         effective_top_k: int | None = 1
     else:
         effective_top_k = request.prefetch_top_k
