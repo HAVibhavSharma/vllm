@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -117,39 +117,6 @@ class AgentPrefetchRequest(BaseModel):
         "result in the registry under ``agent_id`` before fanning out "
         "phantom prefetches. Omit to use whatever the registry already "
         "holds for the agent."
-    )
-    messages: list[dict[str, Any]] | None = Field(
-        default=None,
-        description="Optional seed as a full chat array, rendered exactly "
-        "like ``text`` but without the system-message wrap. Takes "
-        "precedence over ``text``.\n\n"
-        "``text`` can only ever warm a system-message head, because that is "
-        "what it renders to. A caller that already knows the upcoming "
-        "request verbatim -- a pinned trace replay, say -- can warm the "
-        "whole conversation prefix instead by sending that request's own "
-        "``messages`` here. Rendering still forces "
-        "``add_generation_prompt=False``, so the tokens stop where the "
-        "assistant turn would begin and stay a strict prefix of the real "
-        "call. Requests whose prompt carries no system message at all "
-        "(single-user-message calls) are unreachable through ``text`` and "
-        "are the reason this field exists."
-    )
-    chat_template_kwargs: dict[str, Any] | None = Field(
-        default=None,
-        description="Template kwargs the upcoming real request will send, "
-        "for templates whose output depends on them (Qwen3's "
-        "``enable_thinking``, for instance). Merged under the server's own "
-        "``add_generation_prompt=False``, which always wins -- the seed has "
-        "to stop before the assistant turn to stay a prefix. Ignored when "
-        "seeding from ``text``."
-    )
-    tools: list[dict[str, Any]] | None = Field(
-        default=None,
-        description="Tool definitions to render alongside ``messages``. "
-        "Required for a tool-calling request: chat templates splice the "
-        "tool JSON into the system block, so a seed rendered without them "
-        "produces different tokens than the real call and warms blocks "
-        "nothing will ever hit. Ignored when seeding from ``text``."
     )
     # --- node-eviction identity -------------------------------------
     #
