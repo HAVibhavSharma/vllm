@@ -312,24 +312,40 @@ def _resolve_chat_cache_salt(req: AgentChatCompletionRequest) -> str:
 
 
 def _resolve_prefetch_cache_salt(req: AgentPrefetchRequest) -> str:
-    return req.agent_cache_salt or f"agent::{req.agent_id}"
+    """The salt the seeded prefix is recorded and warmed under.
+
+    ``None`` means "unspecified" and keeps the historical ``agent::<id>``
+    default. An explicit empty string is **not** the same thing and must
+    survive: plain ``/v1/chat/completions`` traffic carries no
+    ``cache_salt``, so `auto_register` records it under ``""``, and a
+    phantom warming blocks for such a request has to use the same salt or
+    its LMCache key will not be the one the real request looks up. `or`
+    would fold that empty string back into the synthetic default.
+    """
+    if req.agent_cache_salt is None:
+        return f"agent::{req.agent_id}"
+    return req.agent_cache_salt
 
 
-async def _render_seed_text_to_token_ids(
+async def _render_seed_to_token_ids(
     chat_handler: "OpenAIServingChat",
     model_name: str,
-    text: str,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    label: str = "seed",
 ) -> list[int] | None:
-    """Wrap ``text`` as a system message and run it through the same
-    renderer path the chat endpoint uses, returning the token ids.
+    """Render ``messages`` through the chat endpoint's own renderer and
+    return the token ids.
 
     Critically, we go through ``chat_handler.render_chat_request`` (not
     the raw tokenizer) so the resulting tokens are byte-identical to
     what a real ``/v1/agents/chat/completions`` call would produce for
-    the same system content. ``add_generation_prompt=False`` is forced
-    via ``chat_template_kwargs`` so the render stops after the system
-    block — making the output a strict prefix of any chat whose first
-    message has the same system content.
+    the same messages. ``add_generation_prompt=False`` is forced
+    via ``chat_template_kwargs`` so the render stops where the assistant
+    turn would begin — making the output a strict prefix of any chat that
+    starts with these same messages.
     """
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
@@ -338,8 +354,17 @@ async def _render_seed_text_to_token_ids(
     try:
         inner = ChatCompletionRequest(
             model=model_name,
-            messages=[{"role": "system", "content": text}],
-            chat_template_kwargs={"add_generation_prompt": False},
+            messages=messages,
+            # Templates that support tool calling render the tool schemas
+            # into the prompt, so omitting them here would silently shift
+            # every token after the system block.
+            **({"tools": tools} if tools else {}),
+            # Caller's kwargs first, ours last: a seed that rendered the
+            # generation prompt would not be a prefix of anything.
+            chat_template_kwargs={
+                **(chat_template_kwargs or {}),
+                "add_generation_prompt": False,
+            },
         )
     except Exception:
         logger.exception(
@@ -351,14 +376,15 @@ async def _render_seed_text_to_token_ids(
         rendered = await chat_handler.render_chat_request(inner)
     except Exception:
         logger.exception(
-            "agent_prefetch: render_chat_request failed for seed text"
+            "agent_prefetch: render_chat_request failed for %s", label
         )
         return None
 
     if isinstance(rendered, ErrorResponse):
         logger.warning(
             "agent_prefetch: render_chat_request returned ErrorResponse "
-            "for seed text: %s",
+            "for %s: %s",
+            label,
             rendered.error.message if rendered.error else "<no message>",
         )
         return None
@@ -366,17 +392,19 @@ async def _render_seed_text_to_token_ids(
     _conversation, engine_inputs = rendered
     if not engine_inputs:
         logger.warning(
-            "agent_prefetch: render produced no engine inputs for seed text"
+            "agent_prefetch: render produced no engine inputs for %s", label
         )
         return None
 
     components = chat_handler._extract_prompt_components(engine_inputs[0])
     out = list(components.token_ids or [])
     logger.info(
-        "agent_prefetch: seed text rendered to %d tokens "
-        "(text_chars=%d, chunk_size=%d, path=render_chat_request)",
+        "agent_prefetch: %s rendered to %d tokens "
+        "(messages=%d, chars=%d, chunk_size=%d, path=render_chat_request)",
+        label,
         len(out),
-        len(text),
+        len(messages),
+        sum(len(str(m.get("content") or "")) for m in messages),
         DEFAULT_CHUNK_SIZE,
     )
     return out
@@ -534,23 +562,42 @@ async def prefetch_agent_cache(
     seeded = False
 
     logger.info(
-        "agent_prefetch: seed payload presence: text=%s (chars=%s)",
+        "agent_prefetch: seed payload presence: messages=%s (n=%s) "
+        "text=%s (chars=%s)",
+        request.messages is not None,
+        len(request.messages) if request.messages is not None else 0,
         request.text is not None,
         len(request.text) if request.text is not None else 0,
     )
 
-    # Optional registry seed from raw prefix text.
-    if request.text is not None:
-        token_ids = await _render_seed_text_to_token_ids(
+    # Optional registry seed. `messages` wins: it is the caller handing over
+    # the upcoming request verbatim, which renders to a strictly longer
+    # prefix than the system-only wrap `text` can produce.
+    seed_messages: list[dict[str, Any]] | None = None
+    seed_label = "seed"
+    if request.messages:
+        seed_messages = request.messages
+        seed_label = "seed messages"
+    elif request.text is not None:
+        seed_messages = [{"role": "system", "content": request.text}]
+        seed_label = "seed text"
+
+    if seed_messages is not None:
+        token_ids = await _render_seed_to_token_ids(
             chat_handler,
             chat_handler.model_config.model,
-            request.text,
+            messages=seed_messages,
+            tools=request.tools if request.messages else None,
+            chat_template_kwargs=(
+                request.chat_template_kwargs if request.messages else None
+            ),
+            label=seed_label,
         )
         if token_ids is None:
             return JSONResponse(
                 content=ErrorResponse(
                     type="BadRequest",
-                    message="Failed to render/tokenize seed text via chat "
+                    message=f"Failed to render/tokenize {seed_label} via chat "
                     "template.",
                     code=HTTPStatus.BAD_REQUEST.value,
                 ).model_dump(),
@@ -653,6 +700,13 @@ async def prefetch_agent_cache(
         ),
         "agent_kind": request.agent_kind,
         "seeded_from_text": seeded,
+        # Which seed form the server actually rendered: "messages" warms the
+        # caller's full upcoming prefix, "text" only a system-message head.
+        # A caller that sent `messages` and reads back "text" here is talking
+        # to a server that predates the field.
+        "seed_source": (
+            "messages" if request.messages else ("text" if request.text else None)
+        ),
         # "all" when no cap was provided; an int otherwise.
         "requested_top_k": top_k_repr,
         "available_prefixes": available,
