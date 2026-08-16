@@ -498,10 +498,10 @@ async def prefetch_agent_cache(
     that registers the prefix in APC. The request's ``prefetch_top_k`` is
     currently ignored; see the comment on ``effective_top_k`` below.
 
-    The response is always held until every phantom finishes, so the caller
-    can immediately follow up with a chat completion and expect APC hits.
-    The request's ``wait`` is currently ignored; see the
-    ``TODO(prefetch-jit)`` comment below.
+    When ``wait`` is True (default) the response is held until every
+    phantom finishes, so the caller can immediately follow up with a
+    chat completion and expect APC hits. When ``wait`` is False the
+    endpoint returns as soon as phantoms are submitted.
 
     Response body::
 
@@ -597,17 +597,22 @@ async def prefetch_agent_cache(
     available = registry.agent_size(lookup_agent_id)
     top_k_repr = "all" if effective_top_k is None else str(effective_top_k)
 
-    # TODO(prefetch-jit): remove this force and honour `request.wait` again
-    # once the warm can be issued far enough ahead of the real request to
-    # land asynchronously. Right now the client fires prefetch "just in
-    # time" -- on the q1 ODR run every call returned `submitted=1
-    # completed=0 elapsed~0.5ms` and the real POST /v1/chat/completions
-    # arrived in the same second, before the LMCache L1->HBM copy and the
-    # `cache_blocks()` that registers the blocks in APC had run. The real
-    # request then missed APC and did its own external load (the
-    # `Deferred: N reqs` lines). Blocking here trades prefetch-call latency
-    # for an APC hit that actually exists by the time it is queried.
-    effective_wait = True
+    # The caller's `wait` is honoured. A force-to-True was tried on the q1 ODR
+    # run (2026-08-16) to test whether the just-in-time fire-and-forget was
+    # racing the real request -- the client fires prefetch in the same second
+    # as the real POST /v1/chat/completions, so the LMCache L1->HBM copy and
+    # the `cache_blocks()` that registers the blocks in APC may not have run
+    # when the real request queries APC.
+    #
+    # It was not the problem. Blocking until every phantom completed left
+    # warm-run `hit_tokens` at exactly the LRU baseline's 7552 (vs 9536 with
+    # `wait=False`), while adding ~7s of synchronous prefetch latency to the
+    # caller's critical path across 13 requests. The `wait=False` run's
+    # apparent advantage was a constant 1984-token offset from a single
+    # request, i.e. noise at n=13, not a systematic effect. Blocking here buys
+    # nothing until the per-request stats show phantom-warmed blocks landing
+    # as local APC hits at all.
+    effective_wait = request.wait
 
     identity = _prefetch_identity(request)
 
