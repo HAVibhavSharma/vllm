@@ -493,10 +493,9 @@ async def prefetch_agent_cache(
 ):
     """Warm APC for ``agent_id`` by submitting phantom prefetches.
 
-    Pulls **every** prefix the registry holds for the agent and submits a
-    phantom request per prefix. Each phantom drives the LMCache -> GPU load
-    that registers the prefix in APC. The request's ``prefetch_top_k`` is
-    currently ignored; see the comment on ``effective_top_k`` below.
+    Pulls the agent's most recent ``prefetch_top_k`` prefixes from the
+    registry and submits a phantom request per prefix. Each phantom
+    drives the LMCache -> GPU load that registers the prefix in APC.
 
     When ``wait`` is True (default) the response is held until every
     phantom finishes, so the caller can immediately follow up with a
@@ -576,44 +575,19 @@ async def prefetch_agent_cache(
                 request.agent_id,
             )
 
-    # Effective top_k: warm every prefix the registry holds for the agent,
-    # i.e. k == available. `None` is the fan-out's "no truncation" sentinel
-    # (`_fan_out_prefetches` -> `registry.get_all`), so it is exactly that
-    # count without racing a concurrent `record()` between the size read and
-    # the fetch.
-    #
-    # Both the caller's `prefetch_top_k` and the non-react force-to-1 are
-    # deliberately ignored. Measured on the q1 ODR run (2026-08-16): the
-    # client sent `prefetch_top_k=1` while `langgraph:researcher` had
-    # `available=4`, so 3 of 4 recorded prefixes were never warmed. In a
-    # ReAct loop the single MRU prefix is the *previous* turn's, which is a
-    # prefix of the next turn only when the intervening tool output is
-    # byte-identical -- in open_deep_research it is not.
-    effective_top_k: int | None = None
+    # Effective top_k: non-react forces 1 regardless of what the caller
+    # passed (the single-prefix invariant means there's nothing else to
+    # warm). React mode honours the request's prefetch_top_k as before.
+    if request.agent_kind == "non-react":
+        effective_top_k: int | None = 1
+    else:
+        effective_top_k = request.prefetch_top_k
 
     # The id the fan-out actually reads from. Normally the requested one; see
     # `_resolve_registry_agent_id` for the single case where it is not.
     lookup_agent_id = _resolve_registry_agent_id(registry, request)
     available = registry.agent_size(lookup_agent_id)
     top_k_repr = "all" if effective_top_k is None else str(effective_top_k)
-
-    # The caller's `wait` is honoured. A force-to-True was tried on the q1 ODR
-    # run (2026-08-16) to test whether the just-in-time fire-and-forget was
-    # racing the real request -- the client fires prefetch in the same second
-    # as the real POST /v1/chat/completions, so the LMCache L1->HBM copy and
-    # the `cache_blocks()` that registers the blocks in APC may not have run
-    # when the real request queries APC.
-    #
-    # It was not the problem. Blocking until every phantom completed left
-    # warm-run `hit_tokens` at exactly the LRU baseline's 7552 (vs 9536 with
-    # `wait=False`), while adding ~7s of synchronous prefetch latency to the
-    # caller's critical path across 13 requests. The `wait=False` run's
-    # apparent advantage was a constant 1984-token offset from a single
-    # request, i.e. noise at n=13, not a systematic effect. Blocking here buys
-    # nothing until the per-request stats show phantom-warmed blocks landing
-    # as local APC hits at all.
-    effective_wait = request.wait
-
     identity = _prefetch_identity(request)
 
     logger.info(
@@ -624,7 +598,7 @@ async def prefetch_agent_cache(
         seeded,
         top_k_repr,
         available,
-        effective_wait,
+        request.wait,
         # Logged on every call, not once: which prefetches carry an identity
         # and which do not is a per-call property, and reading it off the log
         # is the only way to tell a warmed-and-protected prefix from a warmed
@@ -663,7 +637,7 @@ async def prefetch_agent_cache(
         submitter=submitter,
         agent_id=lookup_agent_id,
         k=effective_top_k,
-        wait=effective_wait,
+        wait=request.wait,
         identity=identity,
     )
 
@@ -684,7 +658,7 @@ async def prefetch_agent_cache(
         "available_prefixes": available,
         "submitted": submitted,
         "completed": completed,
-        "waited": effective_wait,
+        "waited": request.wait,
         "duration_ms": round(elapsed_ms, 2),
         # Echoed so a caller can assert it sent a usable identity without
         # having to read the server log.
