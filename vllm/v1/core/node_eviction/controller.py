@@ -372,6 +372,35 @@ class NodeEvictionController:
         phantom = request is not None and _is_prefetch_only(request)
         self.movement.on_cache_query(num_tokens, num_hits, phantom)
 
+    def on_external_cache_query(
+        self,
+        num_tokens: int,
+        num_local_hits: int,
+        num_external_hits: int,
+        request=None,
+    ) -> None:
+        """The second half of the same lookup, from `Scheduler.schedule`.
+
+        Split from `on_cache_query` because the two tiers resolve at
+        different points: the local hit is known inside
+        `KVCacheManager.get_computed_blocks`, the external one only after
+        `connector.get_num_new_matched_tokens` replies, several branches
+        later. Counting both here rather than plumbing the external figure
+        back into the manager keeps the connector out of the manager's
+        signature.
+
+        Must be gated by the caller on `Request.cold_tokens_counted` for the
+        same reason `on_cache_query` is gated on `cache_query_counted` — the
+        block it is called from re-runs on every step a request spends in the
+        waiting queue.
+        """
+        if not self.enabled:
+            return
+        phantom = request is not None and _is_prefetch_only(request)
+        self.movement.on_external_cache_query(
+            num_tokens, num_local_hits, num_external_hits, phantom
+        )
+
     def on_request_finished(self, request) -> None:
         """`KVCacheManager.free` — the request is done with its blocks.
 
@@ -816,6 +845,12 @@ class NodeEvictionController:
             f"ttft_n={self.ttft.count} "
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
+            # Of `query_tokens - hit_tokens`, the part LMCache could not serve
+            # either. Sits between the two so the line reads as a cascade:
+            # queried, held in HBM, and what still had to be prefilled. The
+            # remainder (query - hit - cold) is the external tier's
+            # contribution, which no eviction policy here governs.
+            f"cold_tokens={m.cold_tokens} "
             # Phantom traffic, excluded from every rate above. Reported so
             # the prefill origination bought is visible next to the hit rate
             # it was meant to raise, rather than hidden inside it.

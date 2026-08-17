@@ -830,6 +830,84 @@ def test_the_summary_line_prints_when_only_phantoms_ran():
     assert float(fields["hit_rate"]) == 1.0
 
 
+def test_cold_tokens_excludes_what_lmcache_served():
+    """The field exists precisely to stop `query - hit` being read as prefill.
+
+    HBM held 200 of 1,000 and the connector supplied another 700, so only
+    100 tokens ever reached the model — against a miss count of 800.
+    """
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=1_000, num_hits=200)
+    controller.on_external_cache_query(
+        num_tokens=1_000, num_local_hits=200, num_external_hits=700
+    )
+
+    m = controller.movement
+    assert m.query_tokens - m.hit_tokens == 800
+    assert m.cold_tokens == 100
+
+
+def test_cold_tokens_equals_the_miss_count_with_no_connector():
+    """No external tier means the two numbers must agree — otherwise the
+    field would quietly under-report prefill on a server without LMCache."""
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=500, num_hits=120)
+    controller.on_external_cache_query(
+        num_tokens=500, num_local_hits=120, num_external_hits=0
+    )
+
+    m = controller.movement
+    assert m.cold_tokens == m.query_tokens - m.hit_tokens == 380
+
+
+def test_cold_tokens_never_goes_negative():
+    """A connector reporting a span that overlaps the local hit would drive
+    the subtraction below zero; the counter is a volume, so it clamps."""
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=100, num_local_hits=80, num_external_hits=90
+    )
+    assert controller.movement.cold_tokens == 0
+
+
+def test_a_phantom_contributes_no_cold_tokens():
+    """Same rule as every other headline field: a phantom's prefill is work
+    the policy originated, and mixing it in would break the baseline diff."""
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=1_000,
+        num_local_hits=0,
+        num_external_hits=0,
+        request=make_request(prefetch_only=True),
+    )
+    assert controller.movement.cold_tokens == 0
+
+
+def test_cold_tokens_is_on_the_summary_line():
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=1_000, num_hits=200)
+    controller.on_external_cache_query(
+        num_tokens=1_000, num_local_hits=200, num_external_hits=700
+    )
+    fields = dict(
+        p.split("=", 1) for p in controller.hbm_summary().split() if "=" in p
+    )
+    assert fields["cold_tokens"] == "100"
+
+
+def test_a_measurement_reset_zeroes_cold_tokens():
+    """It is a count of things that happened, and a warmup exists so those
+    things happen unmeasured."""
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=1_000, num_local_hits=0, num_external_hits=0
+    )
+    assert controller.movement.cold_tokens == 1_000
+
+    controller.movement.reset_measurement()
+    assert controller.movement.cold_tokens == 0
+
+
 def test_a_first_time_prefix_is_not_movement():
     """The number must credit the policy only for work it made us redo. A
     prefix the server has never seen is not that."""

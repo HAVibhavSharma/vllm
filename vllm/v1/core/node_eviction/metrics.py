@@ -324,6 +324,9 @@ class CacheMovementTracker:
         # Phantom prefetch traffic, kept out of every rate above.
         self.phantom_hit_tokens = 0
         self.phantom_query_tokens = 0
+        # Prompt tokens neither HBM nor LMCache held — the only ones that
+        # actually reached the model as prefill. See `on_external_cache_query`.
+        self.cold_tokens = 0
 
     def on_cache_query(
         self,
@@ -341,6 +344,41 @@ class CacheMovementTracker:
         self.hit_tokens += num_hits
         self.window_query_tokens += num_tokens
         self.window_hit_tokens += num_hits
+
+    def on_external_cache_query(
+        self,
+        num_tokens: int,
+        num_local_hits: int,
+        num_external_hits: int,
+        phantom: bool = False,
+    ) -> None:
+        """The tokens that missed *both* tiers, accumulated into one counter.
+
+        `query_tokens - hit_tokens` is not the prefill volume, and reading it
+        as one is what makes the miss count look alarming. It counts every
+        token HBM did not hold, including the ones LMCache then served over
+        the connector for an async load instead of a forward pass. On the
+        2026-08-09 run that was ~51% of them (12 §1).
+
+        What is left after subtracting both tiers is the only quantity that
+        cost a real prefill: tokens the workload had never sent before, or
+        had sent under a prefix that has since diverged. Deliberately one
+        number rather than a second hit rate — the external tier is not
+        something the eviction policy governs, so a rate would invite a
+        comparison against `hit_rate` that means nothing. As an absolute it
+        answers the one question the line could not: of the missed tokens,
+        how many were genuinely cold.
+
+        Clamped at zero because the two tiers are counted at different
+        moments — local at `get_computed_blocks`, external after the
+        connector replies — and a connector that reports a span overlapping
+        the local hit would otherwise drive the total negative.
+        """
+        if phantom:
+            # Same rule as every other headline field: a phantom's prefill is
+            # work the policy originated, not demand the caches failed.
+            return
+        self.cold_tokens += max(num_tokens - num_local_hits - num_external_hits, 0)
 
     def on_block_cached(self, block_hash) -> None:
         self.blocks_cached += 1
@@ -463,6 +501,7 @@ class CacheMovementTracker:
             "hit_rate_window": self.window_hit_rate,
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
+            "cold_tokens": self.cold_tokens,
             "phantom_hit_rate": self.phantom_hit_rate,
             "phantom_hit_tokens": self.phantom_hit_tokens,
             "phantom_query_tokens": self.phantom_query_tokens,

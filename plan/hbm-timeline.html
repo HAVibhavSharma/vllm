@@ -216,7 +216,7 @@
 const NUMERIC_FIELDS = new Set([
   "regret","hit_rate",
   "ttft_ms","ttft_win_ms","ttft_p50_ms","ttft_p95_ms","ttft_n",
-  "hit_tokens","query_tokens","evicted_by_score","evicted",
+  "hit_tokens","query_tokens","cold_tokens","evicted_by_score","evicted",
 ]);
 
 // vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
@@ -1012,6 +1012,14 @@ function buildSummary() {
     // the policy, and a run that served more is not a run that did better.
     { key: "Tokens queried (query_tokens)", lowerBetter: null, showAbs: true,
       field: "query_tokens", get: r => num(last(r).query_tokens), fmt: v => fmtNum(v, 0) },
+    // The part of `query - hit` that LMCache could not serve either, i.e.
+    // what actually reached the model. Directly beneath the other two
+    // because the three only mean anything read together: a run can lose on
+    // `hit_tokens` and still prefill less, if the external tier caught the
+    // difference. Absent from logs written before the field existed, which
+    // `field` renders as "–" rather than a confident zero.
+    { key: "Tokens prefilled (cold_tokens)", lowerBetter: true, showAbs: true,
+      field: "cold_tokens", get: r => num(last(r).cold_tokens), fmt: v => fmtNum(v, 0) },
     { key: "Requests measured (ttft_n)", lowerBetter: null, showAbs: true,
       field: "ttft_n", get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
   ];
@@ -1072,7 +1080,11 @@ function buildSummary() {
       <code>query_tokens</code> matches, so read those two rows together.
       <code>hit_tokens</code> counts HBM-resident hits only — reuse served by
       an external connector (LMCache) is not in it, and on a run where the
-      external hit rate is high most of the reuse never appears here.
+      external hit rate is high most of the reuse never appears here. That is
+      what <code>cold_tokens</code> is for: it subtracts both tiers, so
+      <code>query − hit</code> is the miss count while <code>cold_tokens</code>
+      is the part that actually cost a prefill, and the gap between them is
+      LMCache's contribution.
       End-to-end rows come from the harness, not the engine: they carry
       front-end queueing, detokenization and tool calls, so they are the
       user-visible number and the one an eviction policy has the least

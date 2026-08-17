@@ -176,6 +176,13 @@ class Request:
         # needs no cleanup: it dies with the request.
         self.cache_query_counted = False
 
+        # The same guard for the *external* half of that lookup, which the
+        # scheduler counts separately once the KV connector has replied. A
+        # second flag rather than a reuse of the one above: `get_computed_
+        # blocks` sets that one before the connector is consulted, so by the
+        # time the scheduler knows the external figure it already reads True.
+        self.cold_tokens_counted = False
+
         # Wall clock at which this request produced its first output token,
         # i.e. the instant prefill finished. Engine-core side on purpose: the
         # front end's TTFT also carries front-end queueing and detokenization,

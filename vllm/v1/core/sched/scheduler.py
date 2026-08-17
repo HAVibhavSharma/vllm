@@ -860,6 +860,23 @@ class Scheduler(SchedulerInterface):
                     )
                     assert num_computed_tokens <= request.num_tokens
 
+                    # What neither tier held, for the `cold_tokens` field on
+                    # the kv_hbm line. Counted here because this is the first
+                    # point where both halves are final — after the connector
+                    # has replied and after the manual-KV branch above.
+                    # Gated once per request for the same reason the local
+                    # half is: this block re-runs on every step the request
+                    # spends in the waiting queue.
+                    node_eviction = self.kv_cache_manager.node_eviction
+                    if node_eviction is not None and not request.cold_tokens_counted:
+                        request.cold_tokens_counted = True
+                        node_eviction.on_external_cache_query(
+                            num_tokens=request.num_tokens,
+                            num_local_hits=num_new_local_computed_tokens,
+                            num_external_hits=num_external_computed_tokens,
+                            request=request,
+                        )
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
