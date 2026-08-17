@@ -89,6 +89,39 @@ def agent_id_for_extra_args(extra_args: dict[str, Any] | None) -> str | None:
     return f"{_agent_namespace()}:{node}"
 
 
+def agent_ids_for_extra_args(extra_args: dict[str, Any] | None) -> list[str]:
+    """Every agent id this request's prefix should be recorded under.
+
+    Three readers look up three different keys, and a prefix recorded under
+    only one of them is invisible to the other two:
+
+    - `{namespace}:{langgraph_node}` — what engine core builds a want from,
+      and the only key it can build: a `NodeKey` holds the bare node.
+    - the request's explicit `agent_id`, when LangGraph sent one. It is
+      `{namespace}:{job}:{graph path}[#{unit}]`, so a prefetch aimed at one
+      parallel researcher gets that researcher's own prefixes back instead of
+      whichever sibling last touched a shared bucket.
+    - that id with the `#{unit}` suffix removed, for a prefetch that knows the
+      path but not the unit — a prediction made *above* the fan-out, before
+      the units it is warming for exist.
+
+    Deduped, order preserved. The cost is one extra registry entry per key per
+    prefix; entries are chunk-aligned token tuples under a per-agent LRU cap,
+    so the ceiling is bounded by `max_per_agent`, not by traffic.
+    """
+    ids: list[str] = []
+    node_id = agent_id_for_extra_args(extra_args)
+    if node_id:
+        ids.append(node_id)
+    if extra_args:
+        explicit = extra_args.get("agent_id")
+        if isinstance(explicit, str) and explicit:
+            for candidate in (explicit, explicit.rsplit("#", 1)[0]):
+                if candidate and candidate not in ids:
+                    ids.append(candidate)
+    return ids
+
+
 def maybe_record_chat_prefix(
     app_state,
     *,
@@ -114,8 +147,8 @@ def maybe_record_chat_prefix(
         # registry at startup, and it only runs when the drain flag is set.
         return False
 
-    agent_id = agent_id_for_extra_args(extra_args)
-    if agent_id is None:
+    agent_ids = agent_ids_for_extra_args(extra_args)
+    if not agent_ids:
         return False
 
     if not prompt_token_ids:
@@ -126,23 +159,22 @@ def maybe_record_chat_prefix(
         if not aligned:
             return False
         salt = cache_salt or ""
-        registry.record(
-            agent_id,
-            PrefixDescriptor(
-                token_ids=tuple(aligned),
-                prefix_hash=compute_prefix_hash(model_name, salt, aligned),
-                cache_salt=salt,
-            ),
+        descriptor = PrefixDescriptor(
+            token_ids=tuple(aligned),
+            prefix_hash=compute_prefix_hash(model_name, salt, aligned),
+            cache_salt=salt,
         )
+        for agent_id in agent_ids:
+            registry.record(agent_id, descriptor)
     except Exception:
         logger.exception(
-            "agent_prefetch: failed to auto-record prefix for %s", agent_id
+            "agent_prefetch: failed to auto-record prefix for %s", agent_ids
         )
         return False
 
     logger.debug(
         "agent_prefetch: auto-recorded %d-token prefix for %s",
         len(aligned),
-        agent_id,
+        agent_ids,
     )
     return True
