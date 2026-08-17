@@ -1322,3 +1322,249 @@ def test_observe_only_forces_the_switches_that_define_the_arm():
     # A baseline that originates prefills is not a baseline.
     assert cfg.prefetch_wants_enabled is False
     cfg.validate()
+
+
+# -- the forecast side of the line: budget and volume ---------------------
+
+
+def _sized_controller(pool, rows=None, **overrides):
+    """A controller that can price KV. 1 MiB pages and 16 tokens per block,
+    so a block is a round number in both units."""
+    config = NodeEvictionConfig(enabled=True, tick_period_ms=0.0, **overrides)
+    return NodeEvictionController(
+        block_pool=pool,
+        config=config,
+        snapshot_source=StaticSnapshotSource(rows or {}),
+        block_size_bytes=1_000_000,
+        block_size_tokens=16,
+    )
+
+
+def _fields(line: str) -> dict[str, str]:
+    return dict(p.split("=", 1) for p in line.split() if "=" in p)
+
+
+def test_parsed_to_next_node_summarises_the_forecast_rows():
+    """The gap the Redis reader parses off PROB — mean, median and the
+    minimum, which is the one that decides whether a prefetch can land."""
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.9, time_to_next_call_ms=1_000.0),
+            SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=3_000.0),
+            NodeKey("run-42", "writer", "draft"): dict(
+                prob=0.9, time_to_next_call_ms=5_000.0
+            ),
+        }
+    )
+    controller = _sized_controller(FakePool(), rows)
+    controller.maybe_tick()
+
+    fields = _fields(controller.hbm_summary())
+    assert float(fields["parsed_to_next_node_ms"]) == 3_000.0
+    assert float(fields["parsed_to_next_node_p50_ms"]) == 3_000.0
+    assert float(fields["parsed_to_next_node_min_ms"]) == 1_000.0
+    assert fields["parsed_to_next_node_n"] == "3"
+
+
+def test_unmeasured_gaps_are_excluded_rather_than_averaged_in():
+    """A publisher with no gap yet emits 0. Averaging those in reads as "the
+    budget is tiny" — a conclusion drawn from missing data, and the opposite
+    of what the rows that *do* carry a gap say."""
+    rows = fresh_rows(
+        {
+            RESEARCH: dict(prob=0.9, time_to_next_call_ms=4_000.0),
+            SUPERVISOR: dict(prob=0.9, time_to_next_call_ms=0.0),
+        }
+    )
+    controller = _sized_controller(FakePool(), rows)
+    controller.maybe_tick()
+
+    fields = _fields(controller.hbm_summary())
+    assert float(fields["parsed_to_next_node_ms"]) == 4_000.0
+    assert float(fields["parsed_to_next_node_min_ms"]) == 4_000.0
+    assert fields["parsed_to_next_node_n"] == "1"
+
+
+def test_an_empty_forecast_reports_no_rows_rather_than_a_zero_budget():
+    controller = _sized_controller(FakePool())
+    controller.maybe_tick()
+
+    fields = _fields(controller.hbm_summary())
+    assert fields["parsed_to_next_node_n"] == "0"
+    assert float(fields["parsed_to_next_node_ms"]) == 0.0
+
+
+def test_prefetch_gb_prices_the_non_resident_forecast():
+    """The volume half. `research` was resident and got evicted, so its prefix
+    length is known and the KV it would take to put it back is priceable —
+    which is the case the ownership index cannot answer, because it deletes
+    the entry when the last block goes."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)}
+    )
+    controller = _sized_controller(pool, rows)
+
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+    for block_id in (1, 2, 3):
+        controller.on_block_evicted(block_id)
+    assert controller.index.get_entry(RESEARCH) is None
+
+    controller.maybe_tick()
+    fields = _fields(controller.hbm_summary())
+    assert fields["prefetch_keys"] == "1"
+    assert fields["prefetch_blocks"] == "3"
+    assert fields["prefetch_tokens"] == "48"
+    assert float(fields["prefetch_gb"]) == 0.003
+    assert fields["prefetch_unsized"] == "0"
+
+
+def test_a_resident_prefix_is_not_counted_as_demand():
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)}
+    )
+    controller = _sized_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+
+    controller.maybe_tick()
+    fields = _fields(controller.hbm_summary())
+    assert fields["prefetch_keys"] == "0"
+    assert fields["prefetch_blocks"] == "0"
+    assert float(fields["prefetch_gb"]) == 0.0
+
+
+def test_a_never_seen_prefix_counts_as_unsized_not_as_zero():
+    """`prefetch_gb` is a floor when a key's prefix length was never observed.
+    Silently pricing it at zero would report a demand of 0 GB for a forecast
+    that is entirely about prefixes this server has never held."""
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)}
+    )
+    controller = _sized_controller(FakePool(), rows)
+    controller.maybe_tick()
+
+    fields = _fields(controller.hbm_summary())
+    assert fields["prefetch_keys"] == "1"
+    assert fields["prefetch_unsized"] == "1"
+    assert fields["prefetch_blocks"] == "0"
+
+
+def test_the_baseline_arm_reports_demand_too():
+    """A field that only exists on one arm cannot be diffed, and the whole
+    point of the line is a field-by-field comparison. Observe-only has no
+    want-list, so this is the path where the demand walk runs with
+    `self._wants is None`."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)}
+    )
+    controller = _sized_controller(pool, rows, observe_only=True)
+    index_prefix(controller, pool, RESEARCH, [1, 2])
+    for block_id in (1, 2):
+        controller.on_block_evicted(block_id)
+
+    controller.maybe_tick()
+    fields = _fields(controller.hbm_summary())
+    assert fields["variant"] == "baseline"
+    assert fields["prefetch_blocks"] == "2"
+    assert float(fields["prefetch_gb"]) == 0.002
+
+
+def test_prefetch_gb_is_zero_when_the_page_size_is_unknown():
+    """Same rule as `remat_mb`: reported rather than guessed. The block count
+    still stands, so the absence is visible instead of looking like no
+    demand."""
+    pool = FakePool(num_blocks=16)
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)}
+    )
+    controller = make_controller(pool, rows)
+    index_prefix(controller, pool, RESEARCH, [1, 2])
+    for block_id in (1, 2):
+        controller.on_block_evicted(block_id)
+
+    controller.maybe_tick()
+    fields = _fields(controller.hbm_summary())
+    assert fields["prefetch_blocks"] == "2"
+    assert float(fields["prefetch_gb"]) == 0.0
+    # No token size either, for the same reason.
+    assert fields["prefetch_tokens"] == "0"
+
+
+def test_the_remembered_prefix_length_is_the_longest_ever_seen():
+    """Pricing on the surviving fraction would say a prefix costs less to
+    restore the more of it has been evicted, which is backwards."""
+    pool = FakePool(num_blocks=16)
+    controller = _sized_controller(pool)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3, 4])
+    controller.on_block_evicted(4)
+    index_prefix(controller, pool, RESEARCH, [1, 2])
+
+    assert controller._prefix_blocks[RESEARCH] == 4
+
+
+def test_the_prefix_size_map_is_bounded():
+    """A long-lived server sees a new `job_id` per workflow run forever."""
+    from vllm.v1.core.node_eviction import controller as controller_mod
+
+    pool = FakePool(num_blocks=16)
+    controller = _sized_controller(pool)
+    limit = controller_mod.PREFIX_SIZE_CACHE_MAX_KEYS
+    for i in range(limit + 50):
+        controller._note_prefix_size(NodeKey(f"job-{i}", "research", ""), 10)
+
+    assert len(controller._prefix_blocks) == limit
+    # Oldest out, newest in.
+    assert NodeKey("job-0", "research", "") not in controller._prefix_blocks
+    last = NodeKey(f"job-{limit + 49}", "research", "")
+    assert controller._prefix_blocks[last] == 10
+
+
+def test_demand_change_alone_earns_a_summary_line():
+    """The change gate exists so an idle server prints nothing. A moving
+    prefetch demand is not idle — it is the input to every decision the policy
+    then makes, and suppressing it leaves a timeline with a gap exactly where
+    the interesting thing happened.
+
+    Starts from an empty forecast and publishes one *after* the evictions are
+    already in the counters, so the only field that moves between the
+    suppressed line and the printed one is the demand. `_rebuild_want_list`
+    is driven directly rather than through `maybe_tick`, because the tick
+    logs a line of its own and would reset the gate this test is measuring.
+    """
+    import time
+
+    pool = FakePool(num_blocks=16)
+    controller = _sized_controller(pool, hbm_summary_period_ms=10_000.0)
+    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
+    for block_id in (1, 2, 3):
+        controller.on_block_evicted(block_id)
+
+    assert controller._maybe_log_hbm_summary(1_000_000.0) is not None
+    assert controller._maybe_log_hbm_summary(2_000_000.0) is None
+
+    rows = fresh_rows({RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)})
+    controller._rebuild_want_list(
+        StaticSnapshotSource(rows).get_snapshot(),
+        time.monotonic(),
+        time.time() * 1000.0,
+    )
+
+    line = controller._maybe_log_hbm_summary(3_000_000.0)
+    assert line is not None
+    assert _fields(line)["prefetch_blocks"] == "3"
+
+
+def test_stats_carries_the_forecast_fields():
+    rows = fresh_rows(
+        {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_500.0)}
+    )
+    controller = _sized_controller(FakePool(), rows)
+    controller.maybe_tick()
+
+    stats = controller.stats()
+    assert stats["parsed_to_next_node_ms"] == 2_500.0
+    assert stats["parsed_to_next_node_n"] == 1
+    assert stats["prefetch_keys"] == 1
+    assert stats["block_size_tokens"] == 16

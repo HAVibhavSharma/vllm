@@ -25,6 +25,7 @@ behaviour (01 §6.5).
 
 import heapq
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -58,6 +59,13 @@ logger = init_logger(__name__)
 # disables call-type keying because the flattening turned out not to be
 # deterministic for the same physical prefix (03 §1, requirement 2).
 DEFAULT_CALL_TYPE = ""
+
+# How many `(job, node, call_type)` prefix sizes to remember. Sized against
+# `index_hard_drop_age_ms`-worth of keys rather than tuned: the map is one
+# small int per key and only exists so a fully-evicted prefix can still be
+# priced, so over-retaining costs bytes while under-retaining costs the
+# `prefetch_gb` figure accuracy.
+PREFIX_SIZE_CACHE_MAX_KEYS = 16_384
 
 
 def node_key_for_request(
@@ -111,10 +119,13 @@ class NodeEvictionController:
         snapshot_source: SnapshotSource | None = None,
         num_kv_cache_groups: int = 1,
         block_size_bytes: int = 0,
+        block_size_tokens: int = 0,
     ) -> None:
         config.validate()
         self.config = config
         self.block_pool = block_pool
+        self.block_size_bytes = block_size_bytes
+        self.block_size_tokens = block_size_tokens
         self.index = BlockOwnershipIndex()
         self.snapshot_source = snapshot_source
         self.observer = EvictionObserver(
@@ -168,6 +179,35 @@ class NodeEvictionController:
         self._last_hbm_log_monotonic = 0.0
         self._last_hbm_fingerprint: tuple[int, ...] | None = None
         self._evictions_by_key: dict[str, int] = {}
+
+        # Largest prefix ever seen under each key, in blocks. Kept *outside*
+        # the ownership index on purpose: `BlockOwnershipIndex` deletes an
+        # entry the moment its last block is evicted (`index.py:133`), which
+        # is precisely the state a key is in when it becomes something to
+        # prefetch — so the index can never answer "how big is the thing we
+        # are about to pull back in". Bounded LRU rather than unbounded: a
+        # long-lived server sees a new `job_id` per workflow run forever.
+        self._prefix_blocks: OrderedDict[NodeKey, int] = OrderedDict()
+
+        # Gauges recomputed on the tick and read by `hbm_summary`, which runs
+        # before the snapshot is consulted and must not do the walk itself.
+        # `_ptn_*` summarise `time_to_next_call_ms` — the field the Redis
+        # reader parses off `PROB` (`snapshot.py:257`), and the same quantity
+        # the workload harness calls `t3_parsed_to_next_start_ns`: the wall
+        # clock between a routing decision being parsed and the next node
+        # starting, i.e. the budget a prefetch has to land inside.
+        self._ptn_snapshot: ImportanceSnapshot | None = None
+        self._ptn_n = 0
+        self._ptn_mean_ms = 0.0
+        self._ptn_p50_ms = 0.0
+        self._ptn_min_ms = 0.0
+        # Non-resident forecast demand: how much KV the forecast says will be
+        # needed and HBM does not hold. `_unsized` is the honesty field —
+        # keys whose prefix length was never observed contribute nothing to
+        # the blocks total, so a large one means the GB figure is a floor.
+        self._demand_keys = 0
+        self._demand_blocks = 0
+        self._demand_unsized = 0
 
         # Measurement epoch. Bumped by `reset_measurement`, which the
         # benchmark harness calls over `POST /v1/kv_metrics/reset` once its
@@ -257,6 +297,7 @@ class NodeEvictionController:
         existing = self.index.get_entry(key)
         blocks_before = len(existing.positions) if existing is not None else 0
         entry = self.index.add_blocks(key, pairs, now, speculative=speculative)
+        self._note_prefix_size(key, entry.run_len)
         if speculative:
             counters = self.observer.counters
             if existing is None:
@@ -481,17 +522,24 @@ class NodeEvictionController:
         counters = self.observer.counters
         counters.ticks_total += 1
 
-        # Above the early returns below: HBM occupancy and the splice volume
-        # are exactly what needs reporting when the tick is skipping, since
-        # a tick that never reaches the splice is the failure mode the line
-        # is meant to expose.
-        self._maybe_log_hbm_summary(now)
-
         snapshot = (
             self.snapshot_source.get_snapshot()
             if self.snapshot_source is not None
             else EMPTY_SNAPSHOT
         )
+        # Hoisted above the summary line, not left with the rest of the
+        # snapshot handling below it: the line reports these gauges, and the
+        # early returns underneath can skip a tick entirely, so computing
+        # them after would publish a `parsed_to_next_node` belonging to a
+        # snapshot that has already been superseded. Identity-gated inside,
+        # so a tick where Redis published nothing costs one comparison.
+        self._update_forecast_gauges(snapshot)
+
+        # Above the early returns below: HBM occupancy and the splice volume
+        # are exactly what needs reporting when the tick is skipping, since
+        # a tick that never reaches the splice is the failure mode the line
+        # is meant to expose.
+        self._maybe_log_hbm_summary(now)
 
         # Skip when nothing can have changed: same snapshot object *and* no
         # eviction since the last tick means the ranking and the free queue
@@ -563,6 +611,67 @@ class NodeEvictionController:
             block = block.next_free_block
         return seen
 
+    def _note_prefix_size(self, key: NodeKey, run_len: int) -> None:
+        """Remember how long this key's prefix got, in blocks.
+
+        Monotonic per key, matching `NodeEntry.max_position`: the question
+        this answers is "how much KV would putting this prefix back cost",
+        and that is set by the longest form of the prefix the key ever had,
+        not by whatever fraction happens to survive right now.
+        """
+        if run_len <= 0:
+            return
+        cache = self._prefix_blocks
+        previous = cache.get(key)
+        if previous is None or run_len > previous:
+            cache[key] = run_len
+        cache.move_to_end(key)
+        while len(cache) > PREFIX_SIZE_CACHE_MAX_KEYS:
+            cache.popitem(last=False)
+
+    def _blocks_to_gb(self, blocks: int) -> float:
+        """Blocks of KV as GB of HBM, or 0.0 when the page size is unknown.
+
+        Same rule as `remat_mb`: reported rather than guessed. A fabricated
+        byte count is worse than an absent one when the number's whole job is
+        to be diffed between two runs.
+        """
+        return blocks * self.block_size_bytes / 1e9
+
+    def _update_forecast_gauges(self, snapshot: ImportanceSnapshot) -> None:
+        """Summarise `time_to_next_call_ms` over the rows Redis published.
+
+        Guarded on snapshot identity because the tick runs four times a
+        second and the snapshot only moves when a publisher writes; the walk
+        is O(rows) and the median sort O(rows log rows), neither of which
+        belongs on every step.
+
+        Zero-valued rows are excluded rather than averaged in. A publisher
+        that has not measured a gap yet emits `time_to_next_call: 0`, and a
+        mean pulled toward zero by unmeasured rows reads as "the prefetch
+        budget is tiny" — the exact wrong conclusion, drawn from missing data
+        rather than from the workload.
+        """
+        if snapshot is self._ptn_snapshot:
+            return
+        self._ptn_snapshot = snapshot
+        values = sorted(
+            row.time_to_next_call_ms
+            for row in snapshot.rows.values()
+            if row.time_to_next_call_ms > 0.0
+        )
+        self._ptn_n = len(values)
+        if not values:
+            self._ptn_mean_ms = 0.0
+            self._ptn_p50_ms = 0.0
+            self._ptn_min_ms = 0.0
+            return
+        self._ptn_mean_ms = sum(values) / len(values)
+        self._ptn_p50_ms = values[len(values) // 2]
+        # The tightest budget any predicted call is working with, which is
+        # the one that decides whether prefetching can win at all.
+        self._ptn_min_ms = values[0]
+
     def _is_resident(self, key: NodeKey) -> bool:
         """Is this key's prefix in HBM to the degree that warming it would
         buy nothing?
@@ -620,12 +729,21 @@ class NodeEvictionController:
         warming is protected by its own score or not at all.
         """
         wants = self._wants
-        if wants is None:
-            return
-
         counters = self.observer.counters
-        dropped_pending, dropped_outstanding = wants.expire(now)
-        counters.prefetch_wants_expired += dropped_pending + dropped_outstanding
+        if wants is not None:
+            dropped_pending, dropped_outstanding = wants.expire(now)
+            counters.prefetch_wants_expired += (
+                dropped_pending + dropped_outstanding
+            )
+
+        # Demand accounting runs whether or not origination is on, because a
+        # baseline arm with no want-list still has to report *how much* KV the
+        # forecast said would be needed and HBM did not hold — that is the
+        # quantity the policy arm is claiming to have moved, and a field that
+        # only exists on one side cannot be diffed.
+        demand_keys = 0
+        demand_blocks = 0
+        demand_unsized = 0
 
         cfg = self.config
         for key, row in snapshot.rows.items():
@@ -634,10 +752,8 @@ class NodeEvictionController:
                 # phantom's completion means it works no matter who put the
                 # prefix there — the phantom, a real request, or a co-owning
                 # node's identical preamble.
-                if wants.note_satisfied(key):
+                if wants is not None and wants.note_satisfied(key):
                     counters.prefetch_wants_satisfied += 1
-                continue
-            if wants.is_tracked(key):
                 continue
             if not cfg.prefetch_ignore_staleness and is_stale(
                 row, now_ms, cfg.staleness_cutoff_ms
@@ -659,6 +775,21 @@ class NodeEvictionController:
             ):
                 continue
 
+            # Past every admission gate: the forecast says this prefix will
+            # be wanted and HBM does not have it. Counted here rather than
+            # after `offer` so a want that was merely deduplicated against an
+            # in-flight one still shows up as outstanding demand — the KV has
+            # to move either way.
+            demand_keys += 1
+            blocks = self._prefix_blocks.get(key, 0)
+            if blocks > 0:
+                demand_blocks += blocks
+            else:
+                demand_unsized += 1
+
+            if wants is None or wants.is_tracked(key):
+                continue
+
             # `num_blocks=1` makes this `prob * decay * E_miss`: expected ms
             # saved, not ms saved per block. The density form is right for
             # ranking blocks already held against each other; for choosing
@@ -678,6 +809,12 @@ class NodeEvictionController:
             else:
                 counters.prefetch_wants_dropped += 1
 
+        self._demand_keys = demand_keys
+        self._demand_blocks = demand_blocks
+        self._demand_unsized = demand_unsized
+
+        if wants is None:
+            return
         counters.prefetch_wants_pending = wants.num_pending
         counters.prefetch_wants_outstanding = wants.num_outstanding
 
@@ -825,6 +962,24 @@ class NodeEvictionController:
             f"remat_mb={m.remat_mb:.1f} "
             f"remat_ratio={m.remat_ratio:.4f} "
             f"blocks_cached={m.blocks_cached} "
+            # The prefetch budget, straight off the forecast rows the Redis
+            # reader parsed. `min` is the field that decides feasibility: a
+            # prefetch that takes longer than the shortest gap to the next
+            # call cannot land in time no matter how good the ranking is.
+            f"parsed_to_next_node_ms={self._ptn_mean_ms:.1f} "
+            f"parsed_to_next_node_p50_ms={self._ptn_p50_ms:.1f} "
+            f"parsed_to_next_node_min_ms={self._ptn_min_ms:.1f} "
+            f"parsed_to_next_node_n={self._ptn_n} "
+            # And what has to move inside that budget. GB is the headline —
+            # it is the one form comparable against HBM capacity and against
+            # L1->HBM bandwidth, which is what decides whether the budget
+            # above is enough. `unsized` is how many of those keys had no
+            # observed prefix length, i.e. how much of a floor the GB is.
+            f"prefetch_gb={self._blocks_to_gb(self._demand_blocks):.3f} "
+            f"prefetch_blocks={self._demand_blocks} "
+            f"prefetch_tokens={self._demand_blocks * self.block_size_tokens} "
+            f"prefetch_keys={self._demand_keys} "
+            f"prefetch_unsized={self._demand_unsized} "
             f"index_keys={self.index.num_keys} "
             f"index_blocks={self.index.num_blocks} "
             # Which measurement epoch these numbers belong to, and how long it
@@ -981,6 +1136,13 @@ class NodeEvictionController:
             self.movement.remat_blocks,
             # A window where only latency moved is still worth a line.
             self.ttft.count,
+            # A window where only the forecast moved is too: outstanding
+            # prefetch demand changing is the input to every decision the
+            # policy then makes, and an idle-looking cache with a moving
+            # demand figure is exactly the state worth seeing on a timeline.
+            # The integer block count, not the float GB or the ttnc mean —
+            # those jitter on rounding and would defeat the gate.
+            self._demand_blocks,
         )
         if fingerprint == self._last_hbm_fingerprint:
             return None
@@ -1246,6 +1408,16 @@ class NodeEvictionController:
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys
         out["value_table_size"] = len(self._value_table)
+        out["parsed_to_next_node_ms"] = self._ptn_mean_ms
+        out["parsed_to_next_node_p50_ms"] = self._ptn_p50_ms
+        out["parsed_to_next_node_min_ms"] = self._ptn_min_ms
+        out["parsed_to_next_node_n"] = self._ptn_n
+        out["prefetch_gb"] = self._blocks_to_gb(self._demand_blocks)
+        out["prefetch_blocks"] = self._demand_blocks
+        out["prefetch_tokens"] = self._demand_blocks * self.block_size_tokens
+        out["prefetch_keys"] = self._demand_keys
+        out["prefetch_unsized"] = self._demand_unsized
+        out["block_size_tokens"] = self.block_size_tokens
         # Which measurement window these numbers describe. Without it a
         # scraped sample cannot be told apart from one taken during warmup.
         out["metrics_epoch"] = self.metrics_epoch

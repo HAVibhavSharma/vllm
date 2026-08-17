@@ -166,6 +166,16 @@ class KVCacheManager:
                 g.kv_cache_spec.page_size_bytes
                 for g in kv_cache_config.kv_cache_groups
             ),
+            # *Not* summed: every group pages the same token range, so one
+            # block id covers `block_size` tokens no matter how many groups
+            # there are. Read off group 0 because the policy disables itself
+            # above one group anyway, and 0 when there are none — a
+            # fabricated token count is worse than an absent one.
+            block_size_tokens=(
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+                if kv_cache_config.kv_cache_groups
+                else 0
+            ),
         )
         if self.node_eviction is not None:
             self.block_pool.attach_node_eviction(self.node_eviction)
