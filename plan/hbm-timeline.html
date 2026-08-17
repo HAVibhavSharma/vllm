@@ -71,11 +71,6 @@
             color: var(--warn-fg); padding: 10px 14px; border-radius: 8px;
             margin-bottom: 16px; font-size: 13px; }
   .banner b { font-weight: 600; }
-  /* Neutral variant: says something the reader needs before quoting a
-     number, without claiming the result is compromised. Every banner
-     looking like a warning is how real warnings stop being read. */
-  .banner.note { border-color: var(--line); background: var(--panel);
-                 color: var(--fg); }
 
   /* --- summary ------------------------------------------------------ */
   #summary { margin-bottom: 22px; }
@@ -121,9 +116,7 @@
   <h1>KV eviction — HBM timeline</h1>
   <p class="sub">
     Drop the <code>kv_hbm</code> lines from both runs — prefix cache hit rate,
-    engine-side TTFT (mean, median, p95), regret, and the forecast side: how
-    much KV is still to prefetch (<code>prefetch_gb</code>) against how long
-    there is to move it (<code>parsed_to_next_node</code>). Optionally add each arm's
+    engine-side TTFT (mean, median, p95), regret. Optionally add each arm's
     harness report
     (<code>armD_rep1.jsonl</code> / <code>armE_rep1.jsonl</code>) for
     client-measured end-to-end latency, paired per trace key. Everything is
@@ -220,21 +213,10 @@
 // `evicted_by_score` is here only as regret's denominator: regret prints
 // 0.000 when nothing scored has been evicted yet, and that zero is an absence
 // of data, not a policy with no regret.
-// Plus the forecast side. `parsed_to_next_node_*` is the gap the Redis reader
-// parses off each PROB row (`time_to_next_call`), i.e. how long a prefetch has
-// to land in; `prefetch_gb` is how much KV would have to move inside it.
-// Panels 6 and 7 are the two halves of one question, so both are whitelisted
-// together: a GB figure with no budget beside it cannot say whether the
-// transfer was ever feasible. `prefetch_unsized` is not a metric — it is the
-// caveat on `prefetch_gb`, and panel 7 refuses to draw without it.
 const NUMERIC_FIELDS = new Set([
   "regret","hit_rate",
   "ttft_ms","ttft_win_ms","ttft_p50_ms","ttft_p95_ms","ttft_n",
   "hit_tokens","query_tokens","evicted_by_score","evicted",
-  "parsed_to_next_node_ms","parsed_to_next_node_p50_ms",
-  "parsed_to_next_node_min_ms","parsed_to_next_node_n",
-  "prefetch_gb","prefetch_blocks","prefetch_tokens","prefetch_keys",
-  "prefetch_unsized",
 ]);
 
 // vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
@@ -295,8 +277,7 @@ function parseRun(text) {
   // `ttft_p50_ms` is here so a log written before the median was added says so
   // instead of drawing panel 3 empty and leaving the reader to guess whether
   // the median was zero or absent.
-  const missing = ["hit_rate", "ttft_ms", "ttft_p50_ms", "regret",
-                   "prefetch_gb", "parsed_to_next_node_ms"]
+  const missing = ["hit_rate", "ttft_ms", "ttft_p50_ms", "regret"]
     .filter(k => rows[0][k] === undefined);
   return { variant, rows, syntheticTime: !haveStamps, missingFields: missing };
 }
@@ -598,14 +579,6 @@ function fmtPct(v) { return Number.isFinite(v) ? (v * 100).toFixed(1) + "%" : "�
 function fmtMs(v) {
   if (!Number.isFinite(v)) return "–";
   return Math.abs(v) >= 1000 ? (v / 1000).toFixed(2) + " s" : v.toFixed(0) + " ms";
-}
-// KV volume. Sub-GB figures drop to MB rather than printing "0.00 GB": a
-// prefetch of 40 MB and a prefetch of nothing are different findings, and the
-// axis on panel 6 is auto-fitted, so the label is the only thing separating
-// them.
-function fmtGb(v) {
-  if (!Number.isFinite(v)) return "–";
-  return Math.abs(v) < 1 ? (v * 1000).toFixed(0) + " MB" : v.toFixed(2) + " GB";
 }
 function fmtTime(sec) {
   const s = Math.max(0, Math.round(sec));
@@ -1041,21 +1014,6 @@ function buildSummary() {
       field: "query_tokens", get: r => num(last(r).query_tokens), fmt: v => fmtNum(v, 0) },
     { key: "Requests measured (ttft_n)", lowerBetter: null, showAbs: true,
       field: "ttft_n", get: r => num(last(r).ttft_n), fmt: v => fmtNum(v, 0) },
-    // Outstanding forecast demand at the *last* line, not a run total: it is
-    // a gauge, and the delta column reads as "the policy arm ended with this
-    // much less KV still to fetch". Lower is better only in that sense —
-    // demand also falls because the forecast went quiet, which is why the
-    // budget row sits beside it rather than being quoted alone.
-    { key: "KV left to prefetch (prefetch_gb)", lowerBetter: true,
-      field: "prefetch_gb", get: r => num(last(r).prefetch_gb), fmt: fmtGb },
-    // Neutral: the workload's shape sets it, not the cache. It is here as the
-    // denominator of the feasibility question panel 6 poses.
-    { key: "Prefetch budget mean (parsed_to_next_node)", lowerBetter: null,
-      field: "parsed_to_next_node_ms",
-      get: r => num(last(r).parsed_to_next_node_ms), fmt: fmtMs },
-    { key: "Prefetch budget min", lowerBetter: null,
-      field: "parsed_to_next_node_min_ms",
-      get: r => num(last(r).parsed_to_next_node_min_ms), fmt: fmtMs },
   ];
 
   // `num()` maps an absent field to 0, which is right for the engine's own
@@ -1130,9 +1088,9 @@ function buildSummary() {
 function buildBanners() {
   const host = document.getElementById("banners");
   host.innerHTML = "";
-  const add = (html, kind) => {
+  const add = html => {
     const d = document.createElement("div");
-    d.className = kind ? `banner ${kind}` : "banner";
+    d.className = "banner";
     d.innerHTML = html;
     host.appendChild(d);
   };
@@ -1237,35 +1195,6 @@ function buildBanners() {
         `Panels 2 and 3 will be flat.`);
   }
 
-  // `prefetch_gb` prices a key at the longest prefix ever observed under it,
-  // so a key the engine has never had resident prices at nothing. Above a
-  // third unsized the GB figure is more floor than measurement, and quoting
-  // it as "the policy had to move X GB" is the mistake this catches.
-  for (const r of loaded.map(s => S.runs[s])) {
-    const l = last(r);
-    const keys = num(l.prefetch_keys), unsized = num(l.prefetch_unsized);
-    if (keys > 0 && unsized / keys > 0.33) {
-      add(`<b>${labelFor(r.slot)}: ${(unsized / keys * 100).toFixed(0)}% of ` +
-          `prefetch demand is unsized</b> — ${fmtNum(unsized, 0)} of ` +
-          `${fmtNum(keys, 0)} forecast keys have no observed prefix length, ` +
-          `so they price at zero. Read panel 6 as a lower bound.`);
-    }
-  }
-
-  // The whole point of panels 6 and 7 together. Stated as a ratio rather than
-  // a verdict because the bandwidth is the reader's to supply — but a demand
-  // that is orders of magnitude off the budget is worth saying out loud.
-  for (const r of loaded.map(s => S.runs[s])) {
-    const l = last(r);
-    const gb = num(l.prefetch_gb), budget = num(l.parsed_to_next_node_min_ms);
-    if (l.prefetch_gb === undefined || !(gb > 0) || !(budget > 0)) continue;
-    add(`<b>${labelFor(r.slot)}: ${fmtGb(gb)} of KV to move inside a ` +
-        `${fmtMs(budget)} tightest gap</b> — that is ` +
-        `${fmtNum(gb / (budget / 1000), 2)} GB/s of sustained L1→HBM ` +
-        `transfer to land it all in time. Compare against the link before ` +
-        `reading a prefetch miss as a forecast error.`, "note");
-  }
-
   for (const r of loaded.map(s => S.runs[s])) {
     if (r.syntheticTime) {
       add(`<b>${labelFor(r.slot)}: no parsable timestamps</b> — the x-axis ` +
@@ -1323,35 +1252,6 @@ function panelDefs() {
     kind: "line", clampLo: 0, clampHi: 1, fmtY: v => v.toFixed(3), policyOnly: true,
     series: run => [{ points: levelSeries(run.rows, "regret", "evicted_by_score") }],
     readout: s => num(s.regret).toFixed(3),
-  },
-  { id: "prefetchGb",
-    title: "6 · KV to prefetch (GB)",
-    why: "<code>prefetch_gb</code> — the KV tensor space behind every prefix the forecast says will be called and HBM does not currently hold, priced at this model's page size (<code>prefetch_blocks x page_size_bytes</code>, summed over KV cache groups). This is the transfer the policy is proposing, in the one unit comparable against HBM capacity and against L1→HBM bandwidth. <b>Zero here is the good state</b>, not missing data: it means every predicted call is already resident. Read it against panel 7 — GB alone cannot say whether the transfer fits in the time available. It is a gauge of outstanding demand at each line, not a cumulative total, so it falls when prefixes land as well as when the forecast moves on.",
-    kind: "line", clampLo: 0, fmtY: fmtGb,
-    series: run => [{ points: levelSeries(run.rows, "prefetch_gb") }],
-    readout: s => {
-      const un = num(s.prefetch_unsized);
-      // The floor caveat travels with the number. A key whose prefix length
-      // was never observed contributes 0 GB, so an unsized count is the
-      // difference between "1.2 GB" and "at least 1.2 GB" — and the second
-      // is the honest reading whenever it is non-zero.
-      return (un > 0 ? "≥ " : "") + fmtGb(num(s.prefetch_gb)) +
-             "  (" + fmtNum(num(s.prefetch_blocks), 0) + " blocks, " +
-             fmtNum(num(s.prefetch_tokens), 0) + " tokens, over " +
-             fmtNum(num(s.prefetch_keys), 0) + " keys" +
-             (un > 0 ? `; ${fmtNum(un, 0)} unsized` : "") + ")";
-    },
-  },
-  { id: "ptn",
-    title: "7 · Prefetch budget — parsed_to_next_node",
-    why: "How long a prefetch has to land in. <code>time_to_next_call</code> off the PROB rows the Redis reader parses — the same interval the workload harness measures as <code>t3_parsed_to_next_start_ns</code>: routing decision parsed → next node starts. Three lines per run would be unreadable, so the <b>mean</b> is drawn and the median and minimum sit in the crosshair readout. <b>The minimum is the one that decides feasibility</b>: it is the tightest gap any predicted call is working with, and a transfer of panel 6's size that does not fit inside it cannot help no matter how well the forecast ranks. Windows where no row carried a gap are breaks — the engine prints <code>0.0</code> there, which is an absence, not a zero-length budget.",
-    kind: "line", clampLo: 0, fmtY: fmtMs,
-    series: run => [{ points: levelSeries(run.rows, "parsed_to_next_node_ms",
-                                          "parsed_to_next_node_n") }],
-    readout: s => "mean " + fmtMs(num(s.parsed_to_next_node_ms)) +
-                  "  p50 " + fmtMs(num(s.parsed_to_next_node_p50_ms)) +
-                  "  min " + fmtMs(num(s.parsed_to_next_node_min_ms)) +
-                  "  (" + fmtNum(num(s.parsed_to_next_node_n), 0) + " rows)",
   },
   ];
 }
@@ -1619,14 +1519,6 @@ document.getElementById("demo").addEventListener("click", () => {
       const nWin = Math.round(14 * load);
       ttftN += nWin; ttftSum += ttftWin * nWin;
       if (i >= evictFrom) evicted += Math.round(220 * load);
-      // Outstanding prefetch demand. The policy arm keeps more of what the
-      // forecast wants resident, so fewer keys survive the residency test
-      // and its demand curve sits lower — the shape the panel exists to show.
-      const demandScale = variant === "baseline" ? 1.0
-                        : variant === "continuum" ? 0.72 : 0.48;
-      const demandKeys = Math.max(0,
-        Math.round((9 + 5 * Math.sin(i / 6 + seed)) * demandScale));
-      const demandBlocks = demandKeys * Math.round(320 + 90 * Math.sin(i / 9));
       const stamp = `INFO 08-07 ${String(t.getUTCHours()).padStart(2,"0")}:` +
                     `${String(t.getUTCMinutes()).padStart(2,"0")}:` +
                     `${String(t.getUTCSeconds()).padStart(2,"0")} [controller.py:600]`;
@@ -1642,18 +1534,7 @@ document.getElementById("demo").addEventListener("click", () => {
         // right-skewed latency actually has.
         `ttft_p50_ms=${(ttftWin*0.82).toFixed(1)} ` +
         `ttft_p95_ms=${(ttftWin*1.9).toFixed(1)} ttft_n=${ttftN} ` +
-        `hit_tokens=${hitT} query_tokens=${qT} ` +
-        // The forecast side. Demand is a gauge, so it oscillates rather than
-        // accumulating, and the policy arm carries less of it: warmed
-        // prefixes are resident and drop out of the walk.
-        `parsed_to_next_node_ms=${(2400 + 900*Math.sin(i/5 + seed)).toFixed(1)} ` +
-        `parsed_to_next_node_p50_ms=${(2100 + 800*Math.sin(i/5 + seed)).toFixed(1)} ` +
-        `parsed_to_next_node_min_ms=${(430 + 180*Math.sin(i/3 + seed)).toFixed(1)} ` +
-        `parsed_to_next_node_n=${18 + Math.round(6*load)} ` +
-        `prefetch_gb=${(demandBlocks * 1.31e6 / 1e9).toFixed(3)} ` +
-        `prefetch_blocks=${demandBlocks} ` +
-        `prefetch_tokens=${demandBlocks * 16} ` +
-        `prefetch_keys=${demandKeys} prefetch_unsized=${Math.round(demandKeys*0.15)}`
+        `hit_tokens=${hitT} query_tokens=${qT}`
       );
     }
     return lines.join("\n");

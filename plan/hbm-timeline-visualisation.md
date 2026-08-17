@@ -29,12 +29,6 @@ the page.
    that turns "the hit rate got worse" into "the forecast for `research` is
    wrong".
 7. **Was it right?** Regret over time, policy run only.
-8. **Could the prefetch ever have landed?** `prefetch_gb` against
-   `parsed_to_next_node_min_ms` — how much KV the forecast says is missing,
-   next to how long there is to move it. Both arms emit both. This is the one
-   pair that can separate a wrong forecast from a transfer that never fit in
-   the time available, and getting that backwards sends you tuning scores when
-   the problem is bandwidth.
 
 ---
 
@@ -263,8 +257,6 @@ separate columns — the eye cannot align two columns across a scroll.
 | 13 | **Attribution — baseline** | Same, same colours, same y-scale as panel 11. Locking the y-scale across the two is what makes them comparable at a glance. |
 | 14 | **Regret** | `regret`, policy only. Line, 0–1. Baseline emits a constant `0.000` — do not plot it; a flat line at zero reads as "no regret" rather than "not measured". |
 | 15 | **Scored coverage** | `evictedByScore / evicted`, policy only. Near zero means the policy is running but has no opinion on what it evicts — degraded to LRU without saying so. |
-| 16 | **KV to prefetch** | `prefetch_gb`, one line per arm, GB. A **gauge**, not a cumulative total: it falls when prefixes land as well as when the forecast moves on, and zero is the good state. Never break the line on zero — that is the state worth seeing. Break it only when the field is absent. Carry `prefetch_unsized` into the readout: non-zero means the number is a floor, and the page must say `≥` rather than quote it flat. |
-| 17 | **Prefetch budget** | `parsed_to_next_node_ms`, one line per arm, ms, with p50 and **min** in the crosshair readout rather than as extra lines — three series per arm is unreadable and the mean is the one that sets the shape. Break the line where `parsed_to_next_node_n` is zero: the engine prints `0.0` there, and a budget of zero and no rows are different findings. Panels 16 and 17 belong adjacent; the derived `prefetch_gb / (min_ms / 1000)` GB/s belongs in a banner above the fold. |
 
 ### Summary header
 

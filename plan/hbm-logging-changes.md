@@ -51,11 +51,7 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
   queue=5658 splices=41 spliced_blocks=1312 evicted=8431 evicted_by_score=6120
   regret=0.083 hit_rate=0.7412 hit_rate_win=0.8033 hit_tokens=9182304
   query_tokens=12388291 remat_blocks=4118 remat_mb=8236.0 remat_ratio=0.1902
-  blocks_cached=21650 parsed_to_next_node_ms=2411.6
-  parsed_to_next_node_p50_ms=2180.0 parsed_to_next_node_min_ms=612.0
-  parsed_to_next_node_n=23 prefetch_gb=3.771 prefetch_blocks=2878
-  prefetch_tokens=46048 prefetch_keys=9 prefetch_unsized=1
-  index_keys=112 index_blocks=9130
+  blocks_cached=21650 index_keys=112 index_blocks=9130
   top_evicted=run-42:research=210,run-42:supervisor=180
 ```
 
@@ -88,15 +84,6 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
 | `remat_mb` | The same in MB of KV rebuilt | same |
 | `remat_ratio` | `remat_blocks / blocks_cached` | same |
 | `blocks_cached` | Every block ever given a hash | same |
-| `parsed_to_next_node_ms` | **Prefetch budget.** Mean `time_to_next_call` over the forecast rows the Redis reader parsed | same |
-| `parsed_to_next_node_p50_ms` | Median of the same | same |
-| `parsed_to_next_node_min_ms` | The tightest gap any predicted call is working with | same |
-| `parsed_to_next_node_n` | Rows that carried a gap at all — the population behind the three above | same |
-| `prefetch_gb` | **Prefetch volume.** KV behind every predicted-and-absent prefix, priced at this model's page size | same |
-| `prefetch_blocks` | The same in blocks | same |
-| `prefetch_tokens` | The same in tokens (`blocks x block_size`) | same |
-| `prefetch_keys` | Forecast keys past every admission gate and not resident | same |
-| `prefetch_unsized` | Of those, ones with no observed prefix length — they price at zero, so this is how much of a floor `prefetch_gb` is | same |
 | `index_keys` | Distinct `job:node` keys with resident blocks | derived from the ownership map |
 | `index_blocks` | Blocks currently claimed by some key | same |
 | `top_evicted` | `job_id:node=<count>`, ranked, top 5 **this window** | same |
@@ -247,51 +234,6 @@ claim an improvement.
 guessing. A fabricated byte count is worse than an absent one when the whole
 point is comparing two runs.
 
-### 2.3 `parsed_to_next_node` and `prefetch_gb` are one reading, not two
-
-`remat_*` says what the eviction decision cost after the fact. These two say
-whether the *prefetch* decision could ever have paid — and neither half means
-anything alone.
-
-**`parsed_to_next_node_*` is the budget.** It summarises `time_to_next_call`
-over the `PROB` rows the Redis reader parsed (`snapshot.py:_decode_one`), which
-is the same interval the workload harness measures as
-`t3_parsed_to_next_start_ns`: routing decision parsed → next node starts. Rows
-that carry no gap yet publish `0` and are **excluded rather than averaged in** —
-a mean dragged to zero by unmeasured rows reads as "there is no time to
-prefetch", which is a conclusion about missing data, not about the workload.
-`parsed_to_next_node_n` is the surviving population, so a small `n` is visible
-next to the number it produced.
-
-**`prefetch_gb` is the volume.** Every forecast key past the admission gates
-(`_is_resident`, staleness, `prefetch_min_prob`, `prefetch_horizon_ms`) that
-HBM does not hold, priced at the summed `page_size_bytes`. It is a **gauge, not
-a total**: it falls when prefixes land as well as when the forecast moves on,
-and `0.000` is the good state — everything predicted is already resident.
-
-Read together they are a bandwidth question: `prefetch_gb / (min_ms / 1000)` is
-the sustained L1→HBM rate needed to land the whole demand inside the tightest
-gap. Above the link's rate, a prefetch miss is a *physics* result, not a
-forecast error, and no amount of ranking work will fix it. The timeline page
-prints that ratio as a banner for exactly this reason.
-
-Two honesty caveats, both deliberate:
-
-- **A key is priced at the longest prefix ever observed under it**, held in a
-  bounded LRU outside the ownership index. The index cannot answer this: it
-  deletes an entry when the last block is evicted (`index.py:133`), which is
-  precisely the state a key is in when it becomes something to prefetch.
-  Pricing on the surviving fraction would say a prefix gets cheaper to restore
-  the more of it has been thrown away.
-- **A key never observed resident prices at zero** and is counted in
-  `prefetch_unsized`. `prefetch_gb` is therefore a *lower bound* whenever that
-  field is non-zero, and the page refuses to quote it as a measurement past a
-  third of the keys.
-
-Both fields are emitted on the **baseline** arm too, with no want-list in
-play. A field that exists on only one side cannot be diffed, and the baseline's
-demand curve is the counterfactual the policy arm's claim is made against.
-
 ### Why policy-only fields are zero rather than omitted
 
 LRU never reorders the free queue, so `splices` is meaningless on the
@@ -376,45 +318,16 @@ Repo: `/Users/vibhavsharma/Projects/vllm` (branch `vllm-v2`)
 - `stats()` gained `hbm_total_blocks`, `hbm_free_blocks`, `hbm_used_blocks`,
   `hbm_usage`, `free_queue_len`, and everything in
   `CacheMovementTracker.as_dict()`.
-- `_prefix_blocks: OrderedDict[NodeKey, int]` — the longest prefix ever seen
-  per key, in blocks, capped at `PREFIX_SIZE_CACHE_MAX_KEYS`. Written from
-  `on_blocks_cached` via `_note_prefix_size`. It has to live outside the
-  ownership index because that index deletes an entry when its last block
-  goes, which is exactly when the key becomes something to prefetch.
-- `_update_forecast_gauges(snapshot)` — the `parsed_to_next_node_*` summary,
-  gated on snapshot *identity* so a tick where nothing was published costs one
-  comparison. Hoisted **above** `_maybe_log_hbm_summary` in `maybe_tick`: the
-  line reports these gauges and the early returns below can skip a tick
-  entirely, so computing them after would publish a budget belonging to a
-  snapshot that had already been superseded.
-- `_rebuild_want_list()` now runs its residency/admission walk whether or not
-  origination is on, accumulating `_demand_keys` / `_demand_blocks` /
-  `_demand_unsized`. Previously it returned immediately when `self._wants is
-  None`, which would have left the baseline arm with no demand figure to diff
-  against. `wants.is_tracked` moved *below* the gates so a want deduplicated
-  against an in-flight one still counts as outstanding demand — the KV has to
-  move either way.
-- `_blocks_to_gb()` — same "report rather than guess" rule as `remat_mb`.
-- `_demand_blocks` joins the `_maybe_log_hbm_summary` fingerprint, so a window
-  where only the forecast moved still prints. The integer block count and not
-  the float GB or the ttnc mean, which jitter on rounding and would defeat the
-  gate.
 
 ### `vllm/v1/core/node_eviction/__init__.py`
 
-`maybe_build_controller()` takes and forwards `block_size_bytes` and
-`block_size_tokens`.
+`maybe_build_controller()` takes and forwards `block_size_bytes`.
 
 ### `vllm/v1/core/kv_cache_manager.py`
 
 - Passes `block_size_bytes` — **summed over KV cache groups**. One block id
   covers a page in every group, so the KV rebuilt when that id is evicted and
   re-cached is the sum, not any single group's page.
-- Passes `block_size_tokens` — **not** summed, read off group 0. Every group
-  pages the same token range, so one block id covers `block_size` tokens no
-  matter how many groups exist; and the policy disables itself above one group
-  anyway. Zero when there are no groups, for the same reason `remat_mb` is
-  zero without a page size.
 - `get_computed_blocks()` calls `node_eviction.on_cache_query()` alongside the
   existing `prefix_cache_stats.record()`.
 
@@ -539,8 +452,6 @@ The headline comparison is the last line of each file:
 | `remat_mb` | **KV rebuilt** | | lower is better — this is the claim |
 | `remat_ratio` | share of caching that was redoing | | lower is better |
 | `evicted` | churn volume | | context for the above |
-| `prefetch_gb` | KV the forecast still wants and HBM lacks | | lower is better — but see `prefetch_unsized` before quoting it |
-| `parsed_to_next_node_min_ms` | tightest gap to move it in | | neutral; the workload sets it, and it is what makes `prefetch_gb` feasible or not |
 
 A run where `hit_rate` is flat but `remat_mb` dropped is still a win: the same
 requests were served with less KV rebuilt. A run where `remat_mb` dropped only
