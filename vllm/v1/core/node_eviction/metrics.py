@@ -600,6 +600,63 @@ class TTFTTracker:
         }
 
 
+class GapStats:
+    """Wall gaps between chat completions, in ms.
+
+    The measured counterpart to the forecast's `time_to_next_call`. That field
+    is whatever the publisher claims; this is what the server watched happen,
+    so the two can be diffed and the forecast's error read straight off the
+    summary line.
+
+    Mean is cumulative and exact; the median and the minimum come from a
+    bounded ring. The minimum is the field that decides feasibility — a
+    prefetch slower than the shortest gap cannot land in time however good the
+    ranking is — and it survives the ring because a run's tightest gap is
+    almost always recent enough to still be in it.
+    """
+
+    def __init__(self, ring_size: int = 4096) -> None:
+        self.ring_size = max(int(ring_size), 1)
+        self._recent: deque = deque(maxlen=self.ring_size)
+        self.count = 0
+        self.total_ms = 0.0
+
+    def record(self, gap_ms: float) -> None:
+        if gap_ms < 0.0:
+            # Concurrency, or a non-monotonic clock: the next call arrived
+            # before the previous one finished. Not a gap, and clamping it to
+            # zero would report a budget of zero that no prefetch could ever
+            # meet.
+            return
+        self.count += 1
+        self.total_ms += gap_ms
+        self._recent.append(gap_ms)
+
+    @property
+    def mean_ms(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total_ms / self.count
+
+    @property
+    def p50_ms(self) -> float:
+        if not self._recent:
+            return 0.0
+        ordered = sorted(self._recent)
+        return ordered[len(ordered) // 2]
+
+    @property
+    def min_ms(self) -> float:
+        if not self._recent:
+            return 0.0
+        return min(self._recent)
+
+    def reset_measurement(self) -> None:
+        self._recent.clear()
+        self.count = 0
+        self.total_ms = 0.0
+
+
 class EvictionObserver:
     """Counters, the regret ring buffer, and the optional decision log."""
 

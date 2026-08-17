@@ -1610,3 +1610,114 @@ def test_stats_carries_the_forecast_fields():
     assert stats["parsed_to_next_node_n"] == 1
     assert stats["prefetch_keys"] == 1
     assert stats["block_size_tokens"] == 16
+
+
+def _arriving_request(arrival: float, node="research", prefetch_only=False):
+    req = make_request(node=node, prefetch_only=prefetch_only)
+    req.arrival_time = arrival
+    req.first_token_ts = None
+    req.ttft_recorded = False
+    return req
+
+
+def _finish(controller, req, at: float, monkeypatch):
+    """Finish `req` at wall time `at` — the clock `arrival_time` is on."""
+    monkeypatch.setattr(
+        "vllm.v1.core.node_eviction.controller.time.time", lambda: at
+    )
+    controller.on_request_finished(req)
+
+
+def test_call_gap_measures_the_idle_window_between_completions(monkeypatch):
+    """The prefetch budget as observed, rather than as published: one chat
+    completion releasing its blocks to the next one arriving."""
+    controller = make_controller(FakePool())
+
+    first = _arriving_request(arrival=100.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=first)
+    _finish(controller, first, at=101.0, monkeypatch=monkeypatch)
+
+    second = _arriving_request(arrival=103.5)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=second)
+
+    assert controller.call_gap.count == 1
+    assert controller.call_gap.min_ms == pytest.approx(2500.0)
+    fields = _fields(controller.hbm_summary())
+    assert float(fields["call_gap_p50_ms"]) == pytest.approx(2500.0)
+    assert fields["call_gap_n"] == "1"
+
+
+def test_key_gap_measures_the_interval_between_calls_of_one_key(monkeypatch):
+    """The measured counterpart of `time_to_next_call`: same key, arrival to
+    arrival. A different key in between must not shorten it."""
+    controller = make_controller(FakePool())
+
+    for arrival, node in ((100.0, "research"), (102.0, "supervisor"), (110.0, "research")):
+        req = _arriving_request(arrival=arrival, node=node)
+        controller.on_cache_query(num_tokens=10, num_hits=0, request=req)
+
+    assert controller.key_gap.count == 1
+    assert controller.key_gap.min_ms == pytest.approx(10_000.0)
+
+
+def test_phantom_traffic_is_kept_out_of_both_gaps(monkeypatch):
+    """A phantom arrives back-to-back with whatever triggered it. Counting it
+    would report that prefetch has no time to work *because* prefetch is
+    working."""
+    controller = make_controller(FakePool())
+
+    real = _arriving_request(arrival=100.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=real)
+    _finish(controller, real, at=101.0, monkeypatch=monkeypatch)
+
+    phantom = _arriving_request(arrival=101.01, prefetch_only=True)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=phantom)
+    _finish(controller, phantom, at=101.2, monkeypatch=monkeypatch)
+
+    later = _arriving_request(arrival=105.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=later)
+
+    # Measured from the real request's finish, not the phantom's.
+    assert controller.call_gap.count == 1
+    assert controller.call_gap.min_ms == pytest.approx(4000.0)
+    assert controller.key_gap.count == 1
+    assert controller.key_gap.min_ms == pytest.approx(5000.0)
+
+
+def test_overlapping_calls_are_dropped_not_clamped(monkeypatch):
+    """A call that arrived while the previous one was still running is
+    concurrency, not a zero-length budget."""
+    controller = make_controller(FakePool())
+
+    first = _arriving_request(arrival=100.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=first)
+    _finish(controller, first, at=105.0, monkeypatch=monkeypatch)
+
+    overlapping = _arriving_request(arrival=101.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=overlapping)
+
+    assert controller.call_gap.count == 0
+    assert float(_fields(controller.hbm_summary())["call_gap_ms"]) == 0.0
+
+
+def test_measured_gaps_are_epoch_scoped(monkeypatch):
+    """Unlike the forecast gauges, a warmup's idle windows must not be
+    reported as the measured run's budget."""
+    controller = make_controller(FakePool())
+
+    first = _arriving_request(arrival=100.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=first)
+    _finish(controller, first, at=101.0, monkeypatch=monkeypatch)
+    second = _arriving_request(arrival=140.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=second)
+    assert controller.call_gap.count == 1
+
+    controller.reset_measurement(label="cold_done")
+
+    fields = _fields(controller.hbm_summary())
+    assert fields["call_gap_n"] == "0"
+    assert fields["key_gap_n"] == "0"
+    # And the first call of the new epoch does not measure the reset itself.
+    third = _arriving_request(arrival=200.0)
+    controller.on_cache_query(num_tokens=10, num_hits=0, request=third)
+    assert controller.call_gap.count == 0

@@ -35,6 +35,7 @@ from vllm.v1.core.node_eviction.index import BlockOwnershipIndex
 from vllm.v1.core.node_eviction.metrics import (
     CacheMovementTracker,
     EvictionObserver,
+    GapStats,
     TTFTTracker,
 )
 from vllm.v1.core.node_eviction.scoring import (
@@ -244,6 +245,22 @@ class NodeEvictionController:
         )
         # What a miss actually costs, next to how often it happened.
         self.ttft = TTFTTracker()
+
+        # The prefetch budget as *measured*, next to the published forecast.
+        # `call_gap` is the server's idle window — one chat completion
+        # finishing to the next arriving — which is the wall time a warm has
+        # to land inside. `key_gap` is the same clock applied per eviction
+        # key: how long between two calls of the same (job, node, call_type),
+        # i.e. the quantity `time_to_next_call` is predicting.
+        #
+        # Phantom prefetches are excluded from both. They are traffic this
+        # policy originated, arrive back-to-back with whatever triggered them,
+        # and would collapse the measured gap toward zero — reporting that
+        # prefetch has no time to work *because* prefetch is working.
+        self.call_gap = GapStats()
+        self.key_gap = GapStats()
+        self._last_finish_wall: float | None = None
+        self._last_arrival_by_key: OrderedDict[NodeKey, float] = OrderedDict()
         if (
             config.prefetch_wants_enabled
             and self.enabled
@@ -424,6 +441,39 @@ class NodeEvictionController:
             return
         phantom = request is not None and _is_prefetch_only(request)
         self.movement.on_cache_query(num_tokens, num_hits, phantom)
+        if request is not None and not phantom:
+            # This hook is the one place a request is seen exactly once
+            # (`kv_cache_manager.py:268` gates it on `cache_query_counted`),
+            # which is what makes it the arrival edge. `on_prefix_hit` and
+            # `on_blocks_cached` both fire repeatedly per request.
+            self._note_call_arrival(request)
+
+    def _note_call_arrival(self, request) -> None:
+        """Close both gap clocks against this request's arrival.
+
+        `arrival_time` is wall seconds set when the engine took the request
+        (`request.py:94`), the same clock `on_request_finished` stamps, so the
+        subtraction is meaningful across the two hooks.
+
+        A negative result is dropped rather than clamped (`GapStats.record`):
+        it means the next call arrived while the previous was still running,
+        which is concurrency, not a budget of zero.
+        """
+        arrival = getattr(request, "arrival_time", None)
+        if arrival is None:
+            return
+        if self._last_finish_wall is not None:
+            self.call_gap.record((arrival - self._last_finish_wall) * 1000.0)
+        key = node_key_for_request(request, self.config.use_call_type)
+        if key is None:
+            return
+        previous = self._last_arrival_by_key.get(key)
+        if previous is not None:
+            self.key_gap.record((arrival - previous) * 1000.0)
+        self._last_arrival_by_key[key] = arrival
+        self._last_arrival_by_key.move_to_end(key)
+        while len(self._last_arrival_by_key) > PREFIX_SIZE_CACHE_MAX_KEYS:
+            self._last_arrival_by_key.popitem(last=False)
 
     def on_request_finished(self, request) -> None:
         """`KVCacheManager.free` — the request is done with its blocks.
@@ -433,7 +483,14 @@ class NodeEvictionController:
         `first_token_ts`, so counting it twice would weight slow requests by
         how often they were preempted.
         """
-        if not self.enabled or request.ttft_recorded:
+        if not self.enabled:
+            return
+        # Before the TTFT guards below: the gap clock closes when the request
+        # releases its blocks whether or not it produced a token, and a
+        # preempted request re-finishing only moves the mark forward.
+        if not _is_prefetch_only(request):
+            self._last_finish_wall = time.time()
+        if request.ttft_recorded:
             return
         first = getattr(request, "first_token_ts", None)
         if first is None:
@@ -1009,6 +1066,21 @@ class NodeEvictionController:
             f"parsed_to_next_node_p50_ms={self._ptn_p50_ms:.1f} "
             f"parsed_to_next_node_min_ms={self._ptn_min_ms:.1f} "
             f"parsed_to_next_node_n={self._ptn_n} "
+            # The same budget, measured instead of published. `call_gap` is
+            # the idle window between one chat completion finishing and the
+            # next arriving; `key_gap` is the interval between two calls of
+            # the same eviction key, which is what the forecast above is
+            # predicting. Phantoms excluded from both. Unlike the forecast
+            # gauges, these are epoch-scoped, so a warmup's gaps never leak
+            # into the measured run.
+            f"call_gap_ms={self.call_gap.mean_ms:.1f} "
+            f"call_gap_p50_ms={self.call_gap.p50_ms:.1f} "
+            f"call_gap_min_ms={self.call_gap.min_ms:.1f} "
+            f"call_gap_n={self.call_gap.count} "
+            f"key_gap_ms={self.key_gap.mean_ms:.1f} "
+            f"key_gap_p50_ms={self.key_gap.p50_ms:.1f} "
+            f"key_gap_min_ms={self.key_gap.min_ms:.1f} "
+            f"key_gap_n={self.key_gap.count} "
             # And what the *forecast* says has to move inside that budget —
             # unlike the phantom fields above, this is demand nobody has acted
             # on yet. MB is the comparable form: against HBM capacity, and
@@ -1097,6 +1169,14 @@ class NodeEvictionController:
         self.movement.reset_measurement()
         self.ttft.reset_measurement()
         self._evictions_by_key.clear()
+        # Measured gaps are epoch-scoped: a warmup's idle windows are not the
+        # measured run's budget. The last-seen marks go too, so the first gap
+        # of the new epoch is not the boundary itself — which would be the
+        # reset's own duration, including an HBM flush.
+        self.call_gap.reset_measurement()
+        self.key_gap.reset_measurement()
+        self._last_finish_wall = None
+        self._last_arrival_by_key.clear()
 
         self.metrics_epoch += 1
         self._epoch_started_monotonic = time.monotonic()
@@ -1448,6 +1528,14 @@ class NodeEvictionController:
         out["index_blocks"] = self.index.num_blocks
         out["index_speculative_keys"] = self.index.num_speculative_keys
         out["value_table_size"] = len(self._value_table)
+        out["call_gap_ms"] = self.call_gap.mean_ms
+        out["call_gap_p50_ms"] = self.call_gap.p50_ms
+        out["call_gap_min_ms"] = self.call_gap.min_ms
+        out["call_gap_n"] = self.call_gap.count
+        out["key_gap_ms"] = self.key_gap.mean_ms
+        out["key_gap_p50_ms"] = self.key_gap.p50_ms
+        out["key_gap_min_ms"] = self.key_gap.min_ms
+        out["key_gap_n"] = self.key_gap.count
         out["parsed_to_next_node_ms"] = self._ptn_mean_ms
         out["parsed_to_next_node_p50_ms"] = self._ptn_p50_ms
         out["parsed_to_next_node_min_ms"] = self._ptn_min_ms
