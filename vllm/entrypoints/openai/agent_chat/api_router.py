@@ -319,17 +319,23 @@ async def _render_seed_text_to_token_ids(
     chat_handler: "OpenAIServingChat",
     model_name: str,
     text: str,
+    role: str = "system",
 ) -> list[int] | None:
-    """Wrap ``text`` as a system message and run it through the same
+    """Wrap ``text`` as a message of ``role`` and run it through the same
     renderer path the chat endpoint uses, returning the token ids.
 
     Critically, we go through ``chat_handler.render_chat_request`` (not
     the raw tokenizer) so the resulting tokens are byte-identical to
     what a real ``/v1/agents/chat/completions`` call would produce for
-    the same system content. ``add_generation_prompt=False`` is forced
-    via ``chat_template_kwargs`` so the render stops after the system
+    the same content. ``add_generation_prompt=False`` is forced
+    via ``chat_template_kwargs`` so the render stops after that first
     block — making the output a strict prefix of any chat whose first
-    message has the same system content.
+    message is the same.
+
+    ``role`` has to match the upcoming real request: the template wraps a
+    system block in different control tokens than a user block, so seeding
+    a user prompt as ``system`` records a prefix that shares no block
+    boundary with the request it was meant to warm.
     """
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
@@ -338,7 +344,7 @@ async def _render_seed_text_to_token_ids(
     try:
         inner = ChatCompletionRequest(
             model=model_name,
-            messages=[{"role": "system", "content": text}],
+            messages=[{"role": role, "content": text}],
             chat_template_kwargs={"add_generation_prompt": False},
         )
     except Exception:
@@ -545,6 +551,7 @@ async def prefetch_agent_cache(
             chat_handler,
             chat_handler.model_config.model,
             request.text,
+            role=request.text_role,
         )
         if token_ids is None:
             return JSONResponse(

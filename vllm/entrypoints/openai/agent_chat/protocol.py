@@ -110,13 +110,24 @@ class AgentPrefetchRequest(BaseModel):
     text: str | None = Field(
         default=None, min_length=1, max_length=1_048_576,
         description="Optional raw prefix text. When provided, the server "
-        "wraps it as a system message, applies the served model's chat "
-        "template (with ``add_generation_prompt=False`` so the tokens are "
-        "a clean prefix of any real chat that starts with the same "
-        "system content), tokenizes, and records the chunk-aligned "
+        "wraps it as a message of role ``text_role``, applies the served "
+        "model's chat template (with ``add_generation_prompt=False`` so the "
+        "tokens are a clean prefix of any real chat that starts with the same "
+        "first message), tokenizes, and records the chunk-aligned "
         "result in the registry under ``agent_id`` before fanning out "
         "phantom prefetches. Omit to use whatever the registry already "
         "holds for the agent."
+    )
+    text_role: Literal["system", "user"] = Field(
+        default="system",
+        description="Role to wrap ``text`` in before rendering. The chat "
+        "template emits different control tokens per role, so a seed "
+        "rendered as ``system`` is not a prefix of a real request whose "
+        "first message is a ``user`` one — it warms blocks nothing hits. "
+        "Set this to the role the upcoming real request actually sends: "
+        "``user`` for a single-prompt call such as a tool-internal "
+        "summarization, ``system`` (the default) for an agent whose prompt "
+        "opens with a system block."
     )
     # --- node-eviction identity -------------------------------------
     #
