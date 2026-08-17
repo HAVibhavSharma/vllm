@@ -1394,7 +1394,7 @@ def test_an_empty_forecast_reports_no_rows_rather_than_a_zero_budget():
     assert float(fields["parsed_to_next_node_ms"]) == 0.0
 
 
-def test_prefetch_gb_prices_the_non_resident_forecast():
+def test_prefetch_demand_mb_prices_the_non_resident_forecast():
     """The volume half. `research` was resident and got evicted, so its prefix
     length is known and the KV it would take to put it back is priceable —
     which is the case the ownership index cannot answer, because it deletes
@@ -1414,8 +1414,8 @@ def test_prefetch_gb_prices_the_non_resident_forecast():
     fields = _fields(controller.hbm_summary())
     assert fields["prefetch_keys"] == "1"
     assert fields["prefetch_blocks"] == "3"
-    assert fields["prefetch_tokens"] == "48"
-    assert float(fields["prefetch_gb"]) == 0.003
+    assert fields["prefetch_demand_tokens"] == "48"
+    assert float(fields["prefetch_demand_mb"]) == 3.0
     assert fields["prefetch_unsized"] == "0"
 
 
@@ -1431,13 +1431,13 @@ def test_a_resident_prefix_is_not_counted_as_demand():
     fields = _fields(controller.hbm_summary())
     assert fields["prefetch_keys"] == "0"
     assert fields["prefetch_blocks"] == "0"
-    assert float(fields["prefetch_gb"]) == 0.0
+    assert float(fields["prefetch_demand_mb"]) == 0.0
 
 
 def test_a_never_seen_prefix_counts_as_unsized_not_as_zero():
-    """`prefetch_gb` is a floor when a key's prefix length was never observed.
-    Silently pricing it at zero would report a demand of 0 GB for a forecast
-    that is entirely about prefixes this server has never held."""
+    """`prefetch_demand_mb` is a floor when a key's prefix length was never
+    observed. Silently pricing it at zero would report a demand of 0 MB for a
+    forecast that is entirely about prefixes this server has never held."""
     rows = fresh_rows(
         {RESEARCH: dict(prob=0.9, time_to_next_call_ms=2_000.0)}
     )
@@ -1468,10 +1468,10 @@ def test_the_baseline_arm_reports_demand_too():
     fields = _fields(controller.hbm_summary())
     assert fields["variant"] == "baseline"
     assert fields["prefetch_blocks"] == "2"
-    assert float(fields["prefetch_gb"]) == 0.002
+    assert float(fields["prefetch_demand_mb"]) == 2.0
 
 
-def test_prefetch_gb_is_zero_when_the_page_size_is_unknown():
+def test_prefetch_demand_mb_is_zero_when_the_page_size_is_unknown():
     """Same rule as `remat_mb`: reported rather than guessed. The block count
     still stands, so the absence is visible instead of looking like no
     demand."""
@@ -1487,9 +1487,51 @@ def test_prefetch_gb_is_zero_when_the_page_size_is_unknown():
     controller.maybe_tick()
     fields = _fields(controller.hbm_summary())
     assert fields["prefetch_blocks"] == "2"
-    assert float(fields["prefetch_gb"]) == 0.0
+    assert float(fields["prefetch_demand_mb"]) == 0.0
     # No token size either, for the same reason.
-    assert fields["prefetch_tokens"] == "0"
+    assert fields["prefetch_demand_tokens"] == "0"
+
+
+def test_phantom_movement_is_priced_per_token_on_this_model():
+    """What the phantoms cost. `expected` is every token origination asked to
+    have resident; `moved` is only the part that missed and had to be built.
+    Neither can be read off blocks: a hit is counted before any block is
+    allocated to the request."""
+    controller = _sized_controller(FakePool())
+    # 1 MiB pages over 16 tokens => 62_500 bytes of KV per token.
+    assert controller.kv_bytes_per_token == 62_500.0
+
+    # 100 tokens asked for, 60 already resident: 40 tokens actually move.
+    controller.movement.on_cache_query(num_tokens=100, num_hits=60, phantom=True)
+
+    fields = _fields(controller.hbm_summary())
+    assert fields["phantom_query_tokens"] == "100"
+    assert fields["phantom_moved_tokens"] == "40"
+    assert float(fields["phantom_kv_expected_mb"]) == 6.2
+    assert float(fields["phantom_kv_moved_mb"]) == 2.5
+
+
+def test_real_traffic_never_enters_the_phantom_movement_figures():
+    """The fields exist to price origination alone. Folding demand traffic in
+    would make them grow with the workload rather than with the prefetch."""
+    controller = _sized_controller(FakePool())
+    controller.movement.on_cache_query(num_tokens=1_000, num_hits=0)
+
+    fields = _fields(controller.hbm_summary())
+    assert fields["phantom_moved_tokens"] == "0"
+    assert float(fields["phantom_kv_moved_mb"]) == 0.0
+    assert float(fields["phantom_kv_expected_mb"]) == 0.0
+
+
+def test_phantom_bytes_are_absent_not_guessed_without_a_page_size():
+    """Same rule as `remat_mb`: the token counts still stand, so the missing
+    price is visible instead of reading as no movement."""
+    controller = make_controller(FakePool())
+    controller.movement.on_cache_query(num_tokens=100, num_hits=60, phantom=True)
+
+    fields = _fields(controller.hbm_summary())
+    assert fields["phantom_moved_tokens"] == "40"
+    assert float(fields["phantom_kv_moved_mb"]) == 0.0
 
 
 def test_the_remembered_prefix_length_is_the_longest_ever_seen():

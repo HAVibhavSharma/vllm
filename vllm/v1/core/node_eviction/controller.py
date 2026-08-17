@@ -64,7 +64,7 @@ DEFAULT_CALL_TYPE = ""
 # `index_hard_drop_age_ms`-worth of keys rather than tuned: the map is one
 # small int per key and only exists so a fully-evicted prefix can still be
 # priced, so over-retaining costs bytes while under-retaining costs the
-# `prefetch_gb` figure accuracy.
+# `prefetch_demand_mb` figure accuracy.
 PREFIX_SIZE_CACHE_MAX_KEYS = 16_384
 
 
@@ -120,12 +120,24 @@ class NodeEvictionController:
         num_kv_cache_groups: int = 1,
         block_size_bytes: int = 0,
         block_size_tokens: int = 0,
+        kv_bytes_per_token: float = 0.0,
     ) -> None:
         config.validate()
         self.config = config
         self.block_pool = block_pool
         self.block_size_bytes = block_size_bytes
         self.block_size_tokens = block_size_tokens
+        # KV bytes one token of context costs on *this* model, summed over
+        # cache groups. Supplied by the caller, which reads it off the model's
+        # own `KVCacheSpec` (page bytes / block tokens per group) rather than
+        # inferring it from the two block figures above — those collapse a
+        # hybrid model's differing block sizes into one number and would price
+        # its tokens wrong. Falls back to that ratio when the caller has
+        # nothing better, and to 0.0 when even that is unknown, in which case
+        # every byte figure derived from it reports 0.0 rather than a guess.
+        if kv_bytes_per_token <= 0.0 and block_size_bytes and block_size_tokens:
+            kv_bytes_per_token = block_size_bytes / block_size_tokens
+        self.kv_bytes_per_token = max(kv_bytes_per_token, 0.0)
         self.index = BlockOwnershipIndex()
         self.snapshot_source = snapshot_source
         self.observer = EvictionObserver(
@@ -629,14 +641,23 @@ class NodeEvictionController:
         while len(cache) > PREFIX_SIZE_CACHE_MAX_KEYS:
             cache.popitem(last=False)
 
-    def _blocks_to_gb(self, blocks: int) -> float:
-        """Blocks of KV as GB of HBM, or 0.0 when the page size is unknown.
+    def _blocks_to_mb(self, blocks: int) -> float:
+        """Blocks of KV as MB of HBM, or 0.0 when the page size is unknown.
 
         Same rule as `remat_mb`: reported rather than guessed. A fabricated
         byte count is worse than an absent one when the number's whole job is
         to be diffed between two runs.
         """
-        return blocks * self.block_size_bytes / 1e9
+        return blocks * self.block_size_bytes / 1e6
+
+    def _tokens_to_mb(self, tokens: int) -> float:
+        """Tokens of context as MB of KV on this model.
+
+        The conversion the block figures cannot do: phantom traffic is
+        measured in tokens queried and tokens hit, never in blocks, because a
+        request's hit is counted before any block is allocated to it.
+        """
+        return tokens * self.kv_bytes_per_token / 1e6
 
     def _update_forecast_gauges(self, snapshot: ImportanceSnapshot) -> None:
         """Summarise `time_to_next_call_ms` over the rows Redis published.
@@ -958,6 +979,24 @@ class NodeEvictionController:
             # it was meant to raise, rather than hidden inside it.
             f"phantom_hit_rate={m.phantom_hit_rate:.4f} "
             f"phantom_query_tokens={m.phantom_query_tokens} "
+            # What the phantoms actually cost in KV movement, priced on this
+            # model's per-token KV footprint.
+            #
+            #   expected = every token the phantoms asked to have resident,
+            #              i.e. the movement if HBM had held none of it. The
+            #              ceiling the warm was worth at most.
+            #   moved    = the tokens that missed and therefore had to be
+            #              built, which is the KV that really crossed into
+            #              HBM. Their difference is warming already-resident
+            #              blocks: work the prefetch paid for and got nothing
+            #              back from.
+            #
+            # Both are phantom-only. Real requests are excluded from every
+            # phantom counter upstream (`metrics.py:334`), so these never
+            # double-count demand traffic.
+            f"phantom_kv_expected_mb={self._tokens_to_mb(m.phantom_query_tokens):.1f} "
+            f"phantom_kv_moved_mb={self._tokens_to_mb(m.phantom_moved_tokens):.1f} "
+            f"phantom_moved_tokens={m.phantom_moved_tokens} "
             f"remat_blocks={m.remat_blocks} "
             f"remat_mb={m.remat_mb:.1f} "
             f"remat_ratio={m.remat_ratio:.4f} "
@@ -970,14 +1009,15 @@ class NodeEvictionController:
             f"parsed_to_next_node_p50_ms={self._ptn_p50_ms:.1f} "
             f"parsed_to_next_node_min_ms={self._ptn_min_ms:.1f} "
             f"parsed_to_next_node_n={self._ptn_n} "
-            # And what has to move inside that budget. GB is the headline —
-            # it is the one form comparable against HBM capacity and against
-            # L1->HBM bandwidth, which is what decides whether the budget
-            # above is enough. `unsized` is how many of those keys had no
-            # observed prefix length, i.e. how much of a floor the GB is.
-            f"prefetch_gb={self._blocks_to_gb(self._demand_blocks):.3f} "
+            # And what the *forecast* says has to move inside that budget —
+            # unlike the phantom fields above, this is demand nobody has acted
+            # on yet. MB is the comparable form: against HBM capacity, and
+            # against L1->HBM bandwidth, which is what decides whether the
+            # budget above is enough. `unsized` is how many of those keys had
+            # no observed prefix length, i.e. how much of a floor the MB is.
+            f"prefetch_demand_mb={self._blocks_to_mb(self._demand_blocks):.1f} "
+            f"prefetch_demand_tokens={self._demand_blocks * self.block_size_tokens} "
             f"prefetch_blocks={self._demand_blocks} "
-            f"prefetch_tokens={self._demand_blocks * self.block_size_tokens} "
             f"prefetch_keys={self._demand_keys} "
             f"prefetch_unsized={self._demand_unsized} "
             f"index_keys={self.index.num_keys} "
@@ -1412,12 +1452,26 @@ class NodeEvictionController:
         out["parsed_to_next_node_p50_ms"] = self._ptn_p50_ms
         out["parsed_to_next_node_min_ms"] = self._ptn_min_ms
         out["parsed_to_next_node_n"] = self._ptn_n
-        out["prefetch_gb"] = self._blocks_to_gb(self._demand_blocks)
+        out["prefetch_demand_mb"] = self._blocks_to_mb(self._demand_blocks)
+        out["prefetch_demand_tokens"] = (
+            self._demand_blocks * self.block_size_tokens
+        )
         out["prefetch_blocks"] = self._demand_blocks
-        out["prefetch_tokens"] = self._demand_blocks * self.block_size_tokens
         out["prefetch_keys"] = self._demand_keys
         out["prefetch_unsized"] = self._demand_unsized
+        # Phantom KV movement, priced per token on this model. `expected` is
+        # every token the phantoms asked for, `moved` only the ones that
+        # missed and had to be built.
+        out["phantom_kv_expected_mb"] = self._tokens_to_mb(
+            self.movement.phantom_query_tokens
+        )
+        out["phantom_kv_moved_mb"] = self._tokens_to_mb(
+            self.movement.phantom_moved_tokens
+        )
         out["block_size_tokens"] = self.block_size_tokens
+        # The model's per-token KV footprint, so every MB figure above can be
+        # rederived from the token counts without knowing the model.
+        out["kv_bytes_per_token"] = self.kv_bytes_per_token
         # Which measurement window these numbers describe. Without it a
         # scraped sample cannot be told apart from one taken during warmup.
         out["metrics_epoch"] = self.metrics_epoch

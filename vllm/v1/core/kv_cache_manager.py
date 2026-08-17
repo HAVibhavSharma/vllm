@@ -176,6 +176,21 @@ class KVCacheManager:
                 if kv_cache_config.kv_cache_groups
                 else 0
             ),
+            # What one token of context costs this model in KV bytes, read off
+            # the same specs: `page_size_bytes` already carries the model's
+            # geometry (2 x layers x kv heads x head size x dtype width, over
+            # the group's block), so dividing by that group's block size gives
+            # bytes per token and summing covers every group.
+            #
+            # Computed per group rather than as
+            # `sum(page_size_bytes) / block_size[0]`: a hybrid model's groups
+            # can page different token counts, and pricing them all at group
+            # 0's block size misstates every byte figure derived from it.
+            kv_bytes_per_token=sum(
+                g.kv_cache_spec.page_size_bytes / g.kv_cache_spec.block_size
+                for g in kv_cache_config.kv_cache_groups
+                if g.kv_cache_spec.block_size
+            ),
         )
         if self.node_eviction is not None:
             self.block_pool.attach_node_eviction(self.node_eviction)

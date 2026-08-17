@@ -424,6 +424,17 @@ class CacheMovementTracker:
         return self.phantom_hit_tokens / self.phantom_query_tokens
 
     @property
+    def phantom_moved_tokens(self) -> int:
+        """Phantom tokens that missed, i.e. KV the warm actually had to build.
+
+        `phantom_query_tokens` is what origination *asked* to have resident;
+        the hits among those were already in HBM and cost no movement. The
+        difference is the only part that crossed into HBM, and the only part
+        whose bytes are worth pricing.
+        """
+        return max(self.phantom_query_tokens - self.phantom_hit_tokens, 0)
+
+    @property
     def remat_mb(self) -> float:
         """The movement number, in MB of KV actually rebuilt.
 
@@ -466,6 +477,7 @@ class CacheMovementTracker:
             "phantom_hit_rate": self.phantom_hit_rate,
             "phantom_hit_tokens": self.phantom_hit_tokens,
             "phantom_query_tokens": self.phantom_query_tokens,
+            "phantom_moved_tokens": self.phantom_moved_tokens,
             "remat_blocks": self.remat_blocks,
             "remat_mb": self.remat_mb,
             "remat_ratio": self.remat_ratio,
