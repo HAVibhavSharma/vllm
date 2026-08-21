@@ -33,5 +33,6 @@ Related shipped entrypoint packages (no standalone doc yet — read the code):
 | [`l0_eviction.md`](l0_eviction.md) | L0 / APC eviction behavior. | Reference. |
 | [`prefill_computation.md`](prefill_computation.md) | Prefill token-split computation. | Recent (tracks current commits). |
 | [`num_computed_tokens_output.md`](num_computed_tokens_output.md) | `num_computed_tokens` accounting / job stats. | Recent (tracks current commits). |
+| [`kv_reuse_provenance.md`](kv_reuse_provenance.md) | Inter-question KV reuse: which job's prefill paid for the blocks a request hits (`VLLM_KV_PROVENANCE`, `kv_reuse` line, `GET /v1/kv_metrics`). | **As-built.** |
 | [`prefix_token_sweep.md`](prefix_token_sweep.md) | Prefix token sweep experiment. | Reference. |
 | [`commands.md`](commands.md) | Run/serve commands used during development. | Verify flags against current CLI. |

@@ -33,6 +33,7 @@ from collections.abc import Callable
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_provenance import KVReuseProvenance
 
 logger = init_logger(__name__)
 
@@ -132,6 +133,12 @@ class HBMSummaryLogger:
         # is exact and cumulative, the percentile comes from a bounded ring
         # because retaining every sample is unbounded under load.
         self._ttft_recent: deque = deque(maxlen=4096)
+        # Which job produced the prefix each request hits. Independently
+        # gated (`VLLM_KV_PROVENANCE`) because it is a second question with a
+        # second cost: this logger is meant to be on for every arm, and
+        # provenance is not. `None` when off, and every call site below is a
+        # no-op in that case.
+        self.provenance = KVReuseProvenance.maybe_build()
         self.ttft_count = 0
         self.ttft_total_ms = 0.0
         self.ttft_window_count = 0
@@ -182,15 +189,24 @@ class HBMSummaryLogger:
         self.phantom_hit_tokens = 0
         self.phantom_query_tokens = 0
 
-    def configure(self, block_size_bytes: int) -> None:
+    def configure(
+        self, block_size_bytes: int, hash_block_size: int | None = None
+    ) -> None:
         """Told the KV page size after construction.
 
         `BlockPool` builds this and does not know the byte size of a block —
         only `KVCacheManager` holds the `KVCacheConfig`. Left at 0 the MB
         figure reports 0 rather than a guess: a fabricated byte count is
         worse than an absent one when the point is comparing two runs.
+
+        `hash_block_size` is the *token* granularity of
+        `Request.block_hashes`, which provenance needs to turn a hit token
+        count into a range of block hashes. Same reason it arrives here and
+        not in the constructor: `BlockPool` does not have it either.
         """
         self.block_size_bytes = block_size_bytes
+        if hash_block_size and self.provenance is not None:
+            self.provenance.configure(hash_block_size)
 
     @classmethod
     def maybe_build(cls, block_pool) -> "HBMSummaryLogger | None":
@@ -227,14 +243,27 @@ class HBMSummaryLogger:
 
     # -- hooks from BlockPool ---------------------------------------------
 
-    def on_blocks_cached(self, request, blocks) -> None:
+    def on_blocks_cached(
+        self, request, blocks, block_hashes=None, block_size: int = 0
+    ) -> None:
         label = node_label_for_request(request) or UNTRACKED
-        for block in blocks:
+        track = self.provenance is not None and block_hashes is not None
+        # `block_hashes` is positionally aligned with `blocks`, so the zip
+        # below keeps a null block from claiming its neighbour's hash.
+        claimed = [] if track else None
+        for index, block in enumerate(blocks):
             if block.is_null:
                 continue
             self._owner[block.block_id] = label
             self.blocks_cached_total += 1
             self._note_cached(block.block_hash)
+            if track and index < len(block_hashes):
+                claimed.append(block_hashes[index])
+        if track and claimed:
+            # The bare hashes, not `block.block_hash`: the latter is
+            # group-qualified and the lookup side reads
+            # `Request.block_hashes`, which is not.
+            self.provenance.claim(request, claimed, block_size)
 
     def on_block_evicted(self, block_id: int) -> None:
         label = self._owner.pop(block_id, UNTRACKED)
@@ -278,6 +307,31 @@ class HBMSummaryLogger:
         if not preempted:
             self.query_tokens_fresh += num_tokens
             self.hit_tokens_fresh += num_hits
+
+    def on_prefill_scheduled(
+        self,
+        request,
+        num_local_cached_tokens: int,
+        num_external_cached_tokens: int,
+        external_runs=None,
+    ) -> None:
+        """Both tiers' hit counts for one request, from `Scheduler.schedule`.
+
+        Not folded into `on_cache_query`: that hook fires inside
+        `KVCacheManager.get_computed_blocks`, which knows only what HBM held.
+        The connector is consulted afterwards, and for cross-question reuse
+        the connector is where the answer usually is — HBM churns inside a
+        single job, while the CPU tier survives between them.
+        """
+        if self.provenance is None:
+            return
+        self.provenance.record_prefill(
+            request,
+            num_local_cached_tokens=num_local_cached_tokens,
+            num_external_cached_tokens=num_external_cached_tokens,
+            external_runs=external_runs,
+            phantom=is_prefetch_only(request),
+        )
 
     def on_request_finished(self, request) -> None:
         """`KVCacheManager.free` — the request is done with its blocks.
@@ -578,6 +632,8 @@ class HBMSummaryLogger:
         # matter is the last one before the boundary.
         discarded_line = self.summary()
         logger.info("%s", discarded_line)
+        if self.provenance is not None:
+            logger.info("%s", self.provenance.summary())
 
         discarded = self.stats()
         previous_epoch = self.metrics_epoch
@@ -603,6 +659,12 @@ class HBMSummaryLogger:
         self.ttft_window_total_ms = 0.0
 
         self.metrics_epoch += 1
+        if self.provenance is not None:
+            # Aggregates only. The claim map deliberately survives: the warm
+            # phase is *supposed* to hit what the warmup left behind, and
+            # forgetting who wrote those blocks would report the reuse this
+            # run exists to measure as `unknown`.
+            self.provenance.reset(self.metrics_epoch, label or "reset")
         self._epoch_started_monotonic = time.monotonic()
         self._epoch_started_wall = time.time()
         self._epoch_label = label or "reset"
@@ -681,6 +743,11 @@ class HBMSummaryLogger:
         self._last_fingerprint = fingerprint
         line = self.summary()
         logger.info("%s", line)
+        if self.provenance is not None:
+            # Its own line rather than more fields on `kv_hbm`: that line is
+            # kept byte-compatible with the policy branch's so a field-by-
+            # field diff lines up, and provenance exists on neither branch.
+            logger.info("%s", self.provenance.summary())
         # Per window, so the next line names who is evicting *now* and shows
         # the hit rate *now*.
         self._evictions_by_key.clear()
@@ -690,11 +757,17 @@ class HBMSummaryLogger:
         self.ttft_window_total_ms = 0.0
         return line
 
-    def stats(self) -> dict[str, float | int]:
+    def stats(self) -> dict[str, Any]:
         pool = self.block_pool
         total = pool.num_gpu_blocks
         free = pool.get_num_free_blocks()
+        # Merged in rather than returned separately: every caller of this
+        # (the periodic logger, `/v1/kv_metrics`, the reset response) wants
+        # the reuse numbers from the same instant as the hit rate they
+        # explain, and two calls cannot promise that.
+        reuse = self.provenance.stats() if self.provenance is not None else {}
         return {
+            **reuse,
             "hbm_total_blocks": total,
             "hbm_free_blocks": free,
             "hbm_used_blocks": total - free,

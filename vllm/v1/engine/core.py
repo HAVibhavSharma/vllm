@@ -649,6 +649,35 @@ class EngineCore:
         )
         return result
 
+    def get_kv_metrics(self) -> dict[str, Any]:
+        """Snapshot the `kv_hbm` / `kv_reuse` numbers without ending an epoch.
+
+        `reset_kv_metrics` already returns everything measured, but only by
+        discarding it. A run that wants the cross-question reuse matrix while
+        the workload is still going — or at the end, without opening an epoch
+        it will never use — has no other structured way to get it: the
+        `kv_reuse` line is rate-limited *and* change-gated, so the last window
+        of a run may never print one.
+
+        A `call_utility` target for the same reason as the reset: it reads
+        counters the scheduler writes on every step, so it belongs on the
+        busy-loop thread that owns them.
+        """
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return {"ok": False, "reason": "no_kv_cache_manager"}
+        stats = kv_cache_manager.get_hbm_summary_stats()
+        if stats is None:
+            return {"ok": False, "reason": "hbm_summary_disabled"}
+        return {
+            "ok": True,
+            "variant": "baseline",
+            "stats": stats,
+            "kv_connector_configured": (
+                getattr(self.vllm_config, "kv_transfer_config", None) is not None
+            ),
+        }
+
     def _flush_hbm_blocks(self) -> bool:
         """Drop every resident block from the GPU prefix cache, keep the tier.
 

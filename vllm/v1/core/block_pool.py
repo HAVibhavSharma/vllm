@@ -282,8 +282,16 @@ class BlockPool:
 
         if self.hbm_summary is not None:
             # Claim the blocks for this request's node, so the eviction that
-            # eventually destroys them can name who lost the hit.
-            self.hbm_summary.on_blocks_cached(request, new_full_blocks)
+            # eventually destroys them can name who lost the hit. The hashes
+            # ride along for provenance: `blk.block_hash` is qualified with
+            # the group id, and the lookup side reads the bare hashes off
+            # `Request.block_hashes`.
+            self.hbm_summary.on_blocks_cached(
+                request,
+                new_full_blocks,
+                block_hashes=new_block_hashes,
+                block_size=block_size,
+            )
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:

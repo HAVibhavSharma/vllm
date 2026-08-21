@@ -829,6 +829,24 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+
+                    # Attribute this request's cache hit to the jobs that
+                    # produced the blocks. Here rather than in
+                    # `get_computed_blocks` because only this point has both
+                    # tiers: local is HBM, external is the connector, and a
+                    # cross-question hit is usually the second one. Guarded
+                    # per request for the same reason `cache_query_counted`
+                    # is — the block above re-runs on every step the request
+                    # spends in the waiting queue.
+                    hbm_summary = self.kv_cache_manager.block_pool.hbm_summary
+                    if hbm_summary is not None and not request.reuse_provenance_counted:
+                        request.reuse_provenance_counted = True
+                        hbm_summary.on_prefill_scheduled(
+                            request,
+                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            num_external_cached_tokens=num_external_computed_tokens,
+                            external_runs=self._external_runs.get(request.request_id),
+                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.

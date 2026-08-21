@@ -103,5 +103,35 @@ async def reset_kv_metrics(
     return JSONResponse(content=result)
 
 
+@router.get("/v1/kv_metrics")
+async def get_kv_metrics(raw_request: Request):
+    """Read the KV measurements in place, epoch untouched.
+
+    Includes the cross-question reuse matrix when `VLLM_KV_PROVENANCE=1`:
+    `reuse_by_source_job` (tokens each job supplied to other jobs),
+    `reuse_by_consumer_job` (tokens each job took from other jobs) and
+    `reuse_top_pairs` (the largest source -> consumer flows). The per-request
+    detail behind those totals goes to `VLLM_KV_PROVENANCE_PATH` as JSONL;
+    this endpoint is the rollup.
+
+    Separate from the reset because reading and discarding are different
+    acts: a harness that wants the numbers halfway through a run must not
+    have to end the measurement window to see them.
+    """
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    snapshot = getattr(engine_client, "get_kv_metrics", None)
+    if snapshot is None:
+        return JSONResponse(
+            content={
+                "ok": False,
+                "reason": "engine_client_unsupported",
+                "engine_client": type(engine_client).__name__,
+            },
+            status_code=501,
+        )
+    result: dict[str, Any] = await snapshot()
+    return JSONResponse(content=result)
+
+
 def attach_router(app: FastAPI) -> None:
     app.include_router(router)

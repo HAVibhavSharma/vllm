@@ -161,7 +161,11 @@ class KVCacheManager:
                 block_size_bytes=sum(
                     g.kv_cache_spec.page_size_bytes
                     for g in kv_cache_config.kv_cache_groups
-                )
+                ),
+                # Token granularity of `Request.block_hashes`, which reuse
+                # provenance needs to turn a hit token count into a range of
+                # hashes. Not the same as any group's block size in general.
+                hash_block_size=hash_block_size,
             )
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
@@ -592,7 +596,7 @@ class KVCacheManager:
             # clock read and a comparison on the thread that owns BlockPool.
             self.block_pool.hbm_summary.maybe_log()
 
-    def get_hbm_summary_stats(self) -> dict[str, float | int] | None:
+    def get_hbm_summary_stats(self) -> dict[str, Any] | None:
         """The same numbers as the log line, for a caller that wants them
         structured rather than parsed back out of the line."""
         if self.block_pool.hbm_summary is None:

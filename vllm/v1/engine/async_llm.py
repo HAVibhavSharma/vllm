@@ -913,6 +913,16 @@ class AsyncLLM(EngineClient):
         """
         return await self.engine_core.reset_kv_metrics_async(label, flush_hbm)
 
+    async def get_kv_metrics(self) -> dict[str, Any]:
+        """Read the KV measurements, including the reuse matrix, in place.
+
+        Served by `GET /v1/kv_metrics`. Unlike the reset it changes nothing,
+        so a harness can poll it mid-run — which is the only way to see how
+        cross-question reuse builds up as questions accumulate, rather than
+        one number at the end.
+        """
+        return await self.engine_core.get_kv_metrics_async()
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

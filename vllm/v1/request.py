@@ -176,6 +176,13 @@ class Request:
         # needs no cleanup: it dies with the request.
         self.cache_query_counted = False
 
+        # Same once-per-request guard for KV reuse provenance, which is
+        # recorded from the scheduler rather than from `get_computed_blocks`
+        # and so cannot share the flag above: the two hooks fire at different
+        # points and a request that is admitted counts for both, while one
+        # that is only queried counts for neither.
+        self.reuse_provenance_counted = False
+
         # Wall clock at which this request produced its first output token,
         # i.e. the instant prefill finished. Engine-core side on purpose: the
         # front end's TTFT also carries front-end queueing and detokenization,

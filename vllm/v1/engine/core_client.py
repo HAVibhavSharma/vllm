@@ -245,6 +245,16 @@ class EngineCoreClient(ABC):
         """
         return {"ok": False, "reason": "unsupported_client"}
 
+    async def get_kv_metrics_async(self) -> dict[str, Any]:
+        """Read the `kv_hbm` / `kv_reuse` numbers without ending an epoch.
+
+        Degrades the same way `reset_kv_metrics_async` does, and for the same
+        reason: the caller is instrumentation, and instrumentation that
+        cannot reach the engine should say so in its own output rather than
+        take the run down with it.
+        """
+        return {"ok": False, "reason": "unsupported_client"}
+
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -339,6 +349,9 @@ class InprocClient(EngineCoreClient):
         # exposed as the `_async` name so callers need not know which client
         # they hold.
         return self.engine_core.reset_kv_metrics(label, flush_hbm)
+
+    async def get_kv_metrics_async(self) -> dict[str, Any]:
+        return self.engine_core.get_kv_metrics()
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -1118,6 +1131,9 @@ class AsyncMPClient(MPClient):
         self, label: str = "", flush_hbm: bool = False
     ) -> dict[str, Any]:
         return await self.call_utility_async("reset_kv_metrics", label, flush_hbm)
+
+    async def get_kv_metrics_async(self) -> dict[str, Any]:
+        return await self.call_utility_async("get_kv_metrics")
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)
