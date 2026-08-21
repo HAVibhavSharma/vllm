@@ -908,6 +908,79 @@ def test_a_measurement_reset_zeroes_cold_tokens():
     assert controller.movement.cold_tokens == 0
 
 
+def test_external_hit_tokens_counts_what_lmcache_served():
+    """The complement of `cold_tokens` from the same subtraction: of the 800
+    tokens HBM missed, the connector supplied 700."""
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=1_000, num_hits=200)
+    controller.on_external_cache_query(
+        num_tokens=1_000, num_local_hits=200, num_external_hits=700
+    )
+
+    m = controller.movement
+    assert m.external_hit_tokens == 700
+    assert m.hit_tokens + m.external_hit_tokens + m.cold_tokens == m.query_tokens
+
+
+def test_external_hit_tokens_is_capped_by_what_hbm_missed():
+    """An overlapping span must cost the external tier its excess rather
+    than drive `cold_tokens` negative — the two still sum to the misses."""
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=100, num_local_hits=80, num_external_hits=90
+    )
+
+    m = controller.movement
+    assert m.external_hit_tokens == 20
+    assert m.cold_tokens == 0
+
+
+def test_external_hit_tokens_is_zero_with_no_connector():
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=500, num_local_hits=120, num_external_hits=0
+    )
+
+    m = controller.movement
+    assert m.external_hit_tokens == 0
+    assert m.cold_tokens == 380
+
+
+def test_a_phantom_contributes_no_external_hit_tokens():
+    """Warming work the policy originated, not demand a tier served."""
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=1_000,
+        num_local_hits=0,
+        num_external_hits=900,
+        request=make_request(prefetch_only=True),
+    )
+    assert controller.movement.external_hit_tokens == 0
+
+
+def test_external_hit_tokens_is_on_the_summary_line():
+    controller = make_controller(FakePool())
+    controller.on_cache_query(num_tokens=1_000, num_hits=200)
+    controller.on_external_cache_query(
+        num_tokens=1_000, num_local_hits=200, num_external_hits=700
+    )
+    fields = dict(
+        p.split("=", 1) for p in controller.hbm_summary().split() if "=" in p
+    )
+    assert fields["external_hit_tokens"] == "700"
+
+
+def test_a_measurement_reset_zeroes_external_hit_tokens():
+    controller = make_controller(FakePool())
+    controller.on_external_cache_query(
+        num_tokens=1_000, num_local_hits=0, num_external_hits=600
+    )
+    assert controller.movement.external_hit_tokens == 600
+
+    controller.movement.reset_measurement()
+    assert controller.movement.external_hit_tokens == 0
+
+
 def test_a_first_time_prefix_is_not_movement():
     """The number must credit the policy only for work it made us redo. A
     prefix the server has never seen is not that."""

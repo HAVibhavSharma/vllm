@@ -327,6 +327,10 @@ class CacheMovementTracker:
         # Prompt tokens neither HBM nor LMCache held — the only ones that
         # actually reached the model as prefill. See `on_external_cache_query`.
         self.cold_tokens = 0
+        # The other half of that same subtraction: tokens the connector
+        # served instead of the model. Kept beside `cold_tokens` so
+        # `hit + external + cold == query` holds field by field.
+        self.external_hit_tokens = 0
 
     def on_cache_query(
         self,
@@ -369,6 +373,12 @@ class CacheMovementTracker:
         answers the one question the line could not: of the missed tokens,
         how many were genuinely cold.
 
+        The external half is banked as `external_hit_tokens` rather than
+        thrown away, for the same reason and in the same shape: an absolute,
+        not a rate. It is what the cascade's remainder used to have to be
+        computed by hand, and computing it by hand is wrong whenever the
+        clamp below fires.
+
         Clamped at zero because the two tiers are counted at different
         moments — local at `get_computed_blocks`, external after the
         connector replies — and a connector that reports a span overlapping
@@ -378,7 +388,14 @@ class CacheMovementTracker:
             # Same rule as every other headline field: a phantom's prefill is
             # work the policy originated, not demand the caches failed.
             return
-        self.cold_tokens += max(num_tokens - num_local_hits - num_external_hits, 0)
+        missed = max(num_tokens - num_local_hits, 0)
+        # Credited against what the local tier left and never beyond it, so
+        # the overlap described above costs the external tier its excess
+        # instead of pushing `cold_tokens` below zero. Clamping once, here,
+        # is what keeps the two counters summing back to the miss count.
+        external = min(max(num_external_hits, 0), missed)
+        self.external_hit_tokens += external
+        self.cold_tokens += missed - external
 
     def on_block_cached(self, block_hash) -> None:
         self.blocks_cached += 1
@@ -502,6 +519,7 @@ class CacheMovementTracker:
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
             "cold_tokens": self.cold_tokens,
+            "external_hit_tokens": self.external_hit_tokens,
             "phantom_hit_rate": self.phantom_hit_rate,
             "phantom_hit_tokens": self.phantom_hit_tokens,
             "phantom_query_tokens": self.phantom_query_tokens,

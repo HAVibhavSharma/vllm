@@ -75,6 +75,103 @@ result. The paired E2E figure is computed once per non-reference arm, each
 against the reference on the keys those two have in common; the matched-key
 count differs per pair and is printed on its own row.
 
+**The report is the only input that is not warm-only by default, and the page
+has to say so.** A run is two phases —
+`cold phase -> POST /v1/kv_metrics/reset -> warm phase`
+(`run_evaluate_node_eviction.py`) — and the reset is what makes every `kv_hbm`
+field describe the warm phase alone. Nothing equivalent happens to the harness
+report: `ODR_TRACE_REPORT` resolves once in `TraceTransport.__init__`, the
+httpx client is a module-level singleton, so both phases append to one file
+with no timestamp and no phase marker on the record.
+
+Last-occurrence-wins already recovers most of it, because the cold phase runs
+the same keys first and the warm record overwrites it. What leaks is a key the
+cold phase ran and the warm phase never reached — the warm loop can stop on
+`all_queries_satisfied()` and cancel in-flight instances — and that record is a
+pure cold latency sitting in the total.
+
+The default cut is **positional: the back half of each report**. Both phases
+replay the same pinned trace, so a report that ran both holds every key twice
+and the warm pass is the second half of the file — 24 records means the 12
+warm calls. It needs nothing from the record beyond its order, so it works on
+a report written before `job_id` existed, and it is a rule a reader can check
+by eye against the line count.
+
+It is an assumption, not a measurement, and the page says so on every load:
+the halves line up only when both phases ran the same trace to completion. The
+warm loop can stop on `all_queries_satisfied()` and cancel in-flight
+instances, and then the cold phase is the longer of the two and the overhang
+survives the cut. An odd record count is that case showing on the surface, so
+the banner names the arms it applies to.
+
+`job_id` is the exact discriminator when the halves are not trustworthy, and
+it is on every record (`trace_store.py`). The harness hands job ids out from
+one `itertools.count(1)` in start order and the cold phase completes before
+the warm phase begins, so cold owns `1..N` and everything above is warm.
+Typing a **first warm `job_id`** overrides the halves rule; the value applies
+to all slots — per-arm cuts would let two different phases be compared to
+each other. `N` is `instances_per_query x examples`, or read the lowest
+`job_id` in the warm `job_instance_e2e_latency.csv`. Emptying the box falls
+back to the halves rule rather than to no cut at all, so clearing an override
+never quietly puts the cold phase back in the totals.
+
+**Both phases** is the third setting, for looking at the warmup deliberately.
+
+Filtering is a rebuild from the retained raw records, not a mutation, so
+switching between the three settings is lossless in both directions and
+**Both phases** restores the original figures exactly. Under a `job_id` cut,
+records with no `job_id` are kept and counted separately rather than dropped,
+so an older report format does not silently empty the block. The E2E block
+states which phase it is showing and how many cold records the cut removed.
+
+**Both phases does not collapse repeated keys, and that is the whole reason
+the setting is legible.** A cut mode collapses first — within one phase a
+repeated key is a re-appended run, and averaging those together is the mistake
+the collapsing exists to prevent. Applying it under **Both phases** would keep
+only the warm record of every key the warm phase also ran, so the page would
+report the warm phase under a label saying both, and on a symmetric run the
+two settings would print byte-identical figures. Observed exactly that on a
+44-record report: 22 calls and the same mean in both settings, which reads as
+a broken control. Uncollapsed, the same file gives 22 calls at 5.5 s warm
+against 44 calls at 7.9 s across both phases, and the cold inflation is on
+screen where it can be argued with.
+
+`byKey` stays deduped in every mode regardless, because the paired comparison
+needs exactly one record per key per arm.
+
+A **Records used of file** row sits under the call count in every mode. Without
+it a cut that halved the file and a cut that did nothing print the same call
+count whenever the phases were symmetric, and there is no way to see from the
+table that the setting took effect.
+
+### Phase
+
+A run is two phases —
+`cold phase -> POST /v1/kv_metrics/reset -> warm phase` — and only the second
+is being measured. `reset_measurement()` zeroes every counter, increments
+`epoch` and restarts `epoch_age_s`; it does not remove the cold lines from the
+log. So **the run to report on is the highest `epoch` present**, and the page
+shows that alone by default.
+
+This matters unevenly across the page, which is why it was easy to miss:
+
+- The **summary table** was already warm-only for free. It reads the last line,
+  and the counters restarted at the reset.
+- The **panels** were not. Plotting every line draws the cold ramp and the warm
+  series on one axis, with a discontinuity where the counters were zeroed that
+  reads as a collapse in hit rate rather than a reset.
+
+Toggling back to both phases is offered for looking at the warmup deliberately,
+and banners say which phase is on screen. A log with no `epoch` field predates
+the reset endpoint; the filter cannot apply and the page says so rather than
+silently showing everything as if it were warm.
+
+The **time axis is rebased per phase**: in the warm view `t=0` is the reset,
+not server boot. Leaving the origin at boot would put the warm phase at
+`t=40min` on an axis whose first 40 minutes are blank, and the two arms' resets
+do not land at the same offset, so the arms would be misaligned against each
+other as well as against zero.
+
 Each line carries the log's own timestamp prefix followed by the `kv_hbm`
 payload. The payload is flat `key=value` pairs separated by single spaces,
 identical field order on both sides — see the field table in

@@ -845,11 +845,14 @@ class NodeEvictionController:
             f"ttft_n={self.ttft.count} "
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
-            # Of `query_tokens - hit_tokens`, the part LMCache could not serve
-            # either. Sits between the two so the line reads as a cascade:
-            # queried, held in HBM, and what still had to be prefilled. The
-            # remainder (query - hit - cold) is the external tier's
-            # contribution, which no eviction policy here governs.
+            # The rest of `query_tokens - hit_tokens`, split in two so the
+            # line reads as a cascade: queried, held in HBM, served by
+            # LMCache, and what still had to be prefilled. The external
+            # figure is reported rather than left to be derived because the
+            # derivation is wrong whenever the tiers' spans overlap and the
+            # clamp fires; neither is a rate, because no eviction policy
+            # here governs the external tier.
+            f"external_hit_tokens={m.external_hit_tokens} "
             f"cold_tokens={m.cold_tokens} "
             # Phantom traffic, excluded from every rate above. Reported so
             # the prefill origination bought is visible next to the hit rate

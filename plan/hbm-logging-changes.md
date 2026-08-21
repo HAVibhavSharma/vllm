@@ -50,7 +50,7 @@ One line, emitted by both branches, in `key=value` form:
 kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
   queue=5658 splices=41 spliced_blocks=1312 evicted=8431 evicted_by_score=6120
   regret=0.083 hit_rate=0.7412 hit_rate_win=0.8033 hit_tokens=9182304
-  query_tokens=12388291 cold_tokens=1571204
+  query_tokens=12388291 external_hit_tokens=1634783 cold_tokens=1571204
   remat_blocks=4118 remat_mb=8236.0 remat_ratio=0.1902
   blocks_cached=21650 index_keys=112 index_blocks=9130
   top_evicted=run-42:research=210,run-42:supervisor=180
@@ -79,6 +79,7 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
 | `ttft_p95_ms` | 95th percentile over the last 4096 samples | same |
 | `ttft_n` | Samples taken, i.e. requests that produced a token | same |
 | `hit_tokens` / `query_tokens` | The raw numerator and denominator | same |
+| `external_hit_tokens` | Of the missed tokens, those LMCache served over the connector (§2.1.1) | same |
 | `cold_tokens` | Of the missed tokens, those LMCache could not serve either — the only ones that cost a real prefill (§2.2) | same |
 | `phantom_hit_rate` | Hit rate of prefetch phantoms only, excluded from every rate above | always `0.0000` |
 | `phantom_query_tokens` | Tokens looked up by phantoms — the prefill origination bought | always `0` |
@@ -127,7 +128,7 @@ two to disagree, and by a wide margin under queueing.
 dominated by whatever the workload did in its first ten minutes. When the
 question is "is it better *now*", the cumulative figure cannot answer it.
 
-### 2.1.1 `cold_tokens` — the misses that actually cost a prefill
+### 2.1.1 `external_hit_tokens` / `cold_tokens` — splitting the misses
 
 `query_tokens - hit_tokens` is not prefill volume, and reading it as one is
 what makes the miss count look alarming. It counts every token HBM did not
@@ -136,19 +137,29 @@ the connector as an async load, not a forward pass. On the 2026-08-09 run
 that was ~51% of them (`new-eviction/12-first-run-findings.md` §1), so half
 the apparent misses were never prefills at all.
 
-`cold_tokens` subtracts both tiers:
+The two fields split that miss count in one subtraction:
 
 ```
-cold_tokens += max(num_tokens - num_local_hits - num_external_hits, 0)
+missed   = max(num_tokens - num_local_hits, 0)
+external = min(max(num_external_hits, 0), missed)   # -> external_hit_tokens
+cold     = missed - external                        # -> cold_tokens
 ```
 
-What survives is the only quantity that reached the model: tokens the
-workload had never sent, or had sent under a prefix that has since diverged.
-Read the three fields as a cascade — `query_tokens` asked, `hit_tokens` came
-from HBM, `cold_tokens` was prefilled, and the remainder
-(`query - hit - cold`) is LMCache's contribution.
+What survives as `cold_tokens` is the only quantity that reached the model:
+tokens the workload had never sent, or had sent under a prefix that has since
+diverged. Read the four fields as a cascade — `query_tokens` asked,
+`hit_tokens` came from HBM, `external_hit_tokens` came from LMCache,
+`cold_tokens` was prefilled — and by construction the last three sum to
+`query_tokens`.
 
-**One counter, not a second hit rate.** The external tier is not something
+**Why the external half is reported and not derived.** `query - hit - cold`
+looks like it already gives it, and does until the clamp fires; the moment a
+connector reports a span overlapping the local hit, that arithmetic and the
+counter disagree, and the arithmetic is the one that is wrong. Emitting it
+also means a reader never has to know `hit_tokens` and the local half here
+are gated on two different flags at two different points.
+
+**Absolutes, not a second hit rate.** The external tier is not something
 this eviction policy governs, so a rate would invite a comparison against
 `hit_rate` that means nothing, and folding external hits into `hit_rate`
 itself would destroy the baseline diff the line exists for — an external hit
@@ -165,10 +176,13 @@ several branches later in `Scheduler.schedule`. Gated once per request on
 sets `cache_query_counted` before the connector is consulted — for the same
 queueing-delay reason as §2.1. Phantoms are excluded, like everywhere else.
 Clamped at zero: the tiers are counted at different moments, so a connector
-reporting a span that overlaps the local hit must not drive it negative.
+reporting a span that overlaps the local hit must not drive it negative — the
+clamp charges that overlap to `external_hit_tokens`, which is the tier whose
+report was optimistic.
 
-With no connector configured, `cold_tokens == query_tokens - hit_tokens`
-exactly, which is the correct degenerate case.
+With no connector configured, `external_hit_tokens == 0` and
+`cold_tokens == query_tokens - hit_tokens` exactly, which is the correct
+degenerate case.
 
 ### 2.1.0 `ttft_*` — what the miss cost
 

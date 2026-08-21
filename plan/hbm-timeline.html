@@ -108,6 +108,12 @@
   .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
              margin-bottom: 14px; }
   .toolbar .spacer { flex: 1; }
+  .toolbar input[type=number] { font: inherit; width: 88px; padding: 5px 8px;
+             border: 1px solid var(--line); border-radius: 6px;
+             background: var(--bg); color: var(--fg);
+             font-family: ui-monospace, Menlo, Consolas, monospace;
+             font-size: 12px; }
+  .toolbar .cut { color: var(--muted); font-size: 12px; }
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 </style>
 </head>
@@ -119,8 +125,11 @@
     engine-side TTFT (mean, median, p95), regret. Optionally add each arm's
     harness report
     (<code>armD_rep1.jsonl</code> / <code>armE_rep1.jsonl</code>) for
-    client-measured end-to-end latency, paired per trace key. Everything is
-    computed in the page; nothing leaves your machine.
+    client-measured end-to-end latency, paired per trace key. The report is
+    the one input that is not warm-only by default — the reset zeroes the
+    engine counters but the harness keeps appending across it, so the E2E
+    block reports on the back half of each report (the warm phase) and says
+    so. Everything is computed in the page; nothing leaves your machine.
   </p>
   <p class="sub">
     Up to <b>three</b> arms at once, held in slots, not in fixed variants:
@@ -186,6 +195,16 @@
     <button data-solo="B" id="soloB" type="button">Run B only</button>
     <button data-solo="C" id="soloC" type="button">Run C only</button>
     <span class="spacer"></span>
+    <!-- The E2E phase cut. It lives in the toolbar rather than in the summary
+         table because the table is rebuilt with innerHTML on every render,
+         which would drop focus out of the field between keystrokes. -->
+    <span id="cutWrap" hidden>
+      <span class="cut">E2E phase</span>
+      <button data-cut="half" class="on" type="button">Last half</button>
+      <button data-cut="all" type="button">Both phases</button>
+      <label class="cut" for="warmCut">or from <code>job_id</code></label>
+      <input type="number" id="warmCut" min="1" step="1" placeholder="—">
+    </span>
     <span class="hint" id="zoomHint">Drag on any panel to zoom · double-click to reset</span>
     <button id="theme" type="button">Theme</button>
   </div>
@@ -216,7 +235,8 @@
 const NUMERIC_FIELDS = new Set([
   "regret","hit_rate",
   "ttft_ms","ttft_win_ms","ttft_p50_ms","ttft_p95_ms","ttft_n",
-  "hit_tokens","query_tokens","cold_tokens","evicted_by_score","evicted",
+  "hit_tokens","query_tokens","cold_tokens","external_hit_tokens",
+  "evicted_by_score","evicted",
 ]);
 
 // vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
@@ -308,11 +328,76 @@ function parseReport(text) {
     try { o = JSON.parse(s); } catch { bad++; continue; }
     const ns = Number(o.live_latency_ns);
     if (!Number.isFinite(ns) || ns <= 0) continue;
+    // `job_id` is the phase discriminator (`trace_store.py`): the harness
+    // hands ids out from one `itertools.count(1)` in start order and the cold
+    // phase completes before the warm phase begins, so cold owns `1..N` and
+    // everything above is warm. A missing or non-numeric id is stored as
+    // null, not coerced to 0 — an older report format has no ids at all, and
+    // coercing would make every one of its records look cold and filter the
+    // block down to nothing.
+    const jid = Number(o.job_id);
     recs.push({
       key: String(o.key === undefined ? "" : o.key),
       ns,
       tokens: Number(o.live_completion_tokens) || 0,
+      jobId: Number.isFinite(jid) ? jid : null,
     });
+  }
+  if (!recs.length) return null;
+  // Raw records are retained rather than collapsed here, so the phase cut is
+  // a rebuild and not a mutation: clearing it restores the original figures
+  // exactly. `aggregateReport` does the collapsing.
+  return { recs, badLines: bad };
+}
+
+/**
+ * Collapse one report's raw records into the figures the summary prints,
+ * optionally cutting the cold phase off the front.
+ *
+ * The report is the only input on this page that is not warm-only by default.
+ * A run is `cold phase -> POST /v1/kv_metrics/reset -> warm phase`, and the
+ * reset is what makes every `kv_hbm` field describe the warm phase alone.
+ * Nothing equivalent happens to the harness report: `ODR_TRACE_REPORT`
+ * resolves once in `TraceTransport.__init__` and the httpx client is a
+ * module-level singleton, so both phases append to one file with no timestamp
+ * and no phase marker on the record.
+ *
+ * Last-occurrence-wins already recovers most of it, because the cold phase
+ * runs the same keys first and the warm record overwrites it. What leaks is a
+ * key the cold phase ran and the warm phase never reached — the warm loop can
+ * stop on `all_queries_satisfied()` and cancel in-flight instances — and that
+ * record is a pure cold latency sitting in the total. `warmFrom` cuts it.
+ */
+function aggregateReport(raw, mode, warmFrom) {
+  const all = raw.recs;
+  let recs, coldDropped = 0, noJobId = 0, cut = null;
+
+  if (mode === "job") {
+    // Explicit boundary: the reader read the lowest `job_id` out of the warm
+    // `job_instance_e2e_latency.csv` and typed it, which beats any inference
+    // the page can make from the record stream alone.
+    cut = Number.isFinite(warmFrom) && warmFrom > 0 ? warmFrom : null;
+    recs = [];
+    for (const r of all) {
+      // Records with no `job_id` are kept and counted separately rather than
+      // dropped, so an older report format does not silently empty the block.
+      if (r.jobId === null) noJobId++;
+      else if (cut !== null && r.jobId < cut) { coldDropped++; continue; }
+      recs.push(r);
+    }
+  } else if (mode === "half") {
+    // The default. The two phases replay the same pinned trace, so a report
+    // that ran both holds each key twice and the warm pass is the back half
+    // of the file — 24 records means 12 warm calls. Positional, not
+    // `job_id`-derived: it needs nothing from the record beyond its order,
+    // so it works on a report written before `job_id` existed.
+    const at = Math.floor(all.length / 2);
+    coldDropped = at;
+    recs = all.slice(at);
+    noJobId = recs.filter(r => r.jobId === null).length;
+  } else {
+    recs = all.slice();
+    noJobId = recs.filter(r => r.jobId === null).length;
   }
   if (!recs.length) return null;
 
@@ -325,16 +410,31 @@ function parseReport(text) {
   const byKey = new Map();
   for (const r of recs) byKey.set(r.key, r);
   const kept = [...byKey.values()];
-  const sorted = kept.map(r => r.ns).sort((a, b) => a - b);
-  const total = kept.reduce((a, r) => a + r.ns, 0);
+
+  // What the mean and median are taken over. A cut mode collapses by key
+  // first, because within one phase a repeated key is a re-appended run and
+  // averaging it in is the mistake above. "Both phases" does not collapse:
+  // collapsing there would keep only the warm record of every key the warm
+  // phase also ran, so it would quietly report the warm phase under a label
+  // that says both — and then the two settings print identical figures on a
+  // symmetric run and the cut looks broken. Both phases means both phases.
+  const stat = mode === "all" ? recs : kept;
+  const sorted = stat.map(r => r.ns).sort((a, b) => a - b);
+  const total = stat.reduce((a, r) => a + r.ns, 0);
   return {
-    byKey,
-    calls: kept.length,
+    byKey,                        // always deduped: the pairing needs one per key
+    calls: stat.length,           // what the figures below are over
+    keys: kept.length,
     rawRecords: recs.length,
+    allRecords: raw.recs.length,
     duplicates: recs.length - byKey.size,
-    badLines: bad,
+    badLines: raw.badLines,
+    coldDropped,
+    noJobId,
+    mode,
+    warmFrom: cut,
     totalNs: total,
-    meanNs: total / kept.length,
+    meanNs: total / stat.length,
     medianNs: sorted[Math.floor(sorted.length / 2)],
   };
 }
@@ -510,11 +610,51 @@ const SLOTS = ["A", "B", "C"];
 
 const S = {
   runs: {},                 // slot -> parsed run
-  reports: {},              // slot -> parsed end-to-end report
+  reportsRaw: {},           // slot -> retained raw report records
+  reports: {},              // slot -> aggregated end-to-end report
+  // Which phase the E2E block reports on. "half" is the default and takes
+  // the back half of each report; "all" takes everything; "job" takes a
+  // `job_id` the reader typed. One setting for every slot, never per-arm: a
+  // per-arm cut would let two different phases be compared to each other,
+  // which is worse than showing both phases in both arms.
+  warmMode: "half",
+  warmFrom: null,           // first warm `job_id`, only read in "job" mode
+  cutEmptied: [],           // slots the cut left with no records
   domain: null,             // [t0, t1] or null for full extent
   solo: "all",
   panels: [],               // render handles for crosshair
 };
+
+/** Re-collapse every loaded report under the current cut. */
+function rebuildReports() {
+  S.cutEmptied = [];
+  for (const slot of SLOTS) {
+    const raw = S.reportsRaw[slot];
+    if (!raw) { delete S.reports[slot]; continue; }
+    const agg = aggregateReport(raw, S.warmMode, S.warmFrom);
+    if (agg) S.reports[slot] = agg;
+    else { delete S.reports[slot]; S.cutEmptied.push(slot); }
+  }
+}
+
+/**
+ * Set the E2E phase cut and re-derive every report under it.
+ *
+ * A rebuild from the retained raw records, never a mutation of them, so
+ * switching between the modes is lossless in both directions and "Both
+ * phases" restores the original figures exactly.
+ */
+function setWarmMode(mode, value) {
+  const v = Number(value);
+  S.warmFrom = Number.isFinite(v) && v > 0 ? v : null;
+  S.warmMode = mode === "job" && S.warmFrom === null ? "half" : mode;
+  const box = document.getElementById("warmCut");
+  if (box) box.value = S.warmMode === "job" ? String(S.warmFrom) : "";
+  for (const b of document.querySelectorAll("[data-cut]")) {
+    b.classList.toggle("on", b.dataset.cut === S.warmMode);
+  }
+  rebuildReports();
+}
 
 // Known variants get a fuller name; anything else is printed as it names
 // itself, so a new arm needs no change here to be legible.
@@ -918,11 +1058,26 @@ function e2eRows(slots, ref) {
   });
 
   const span = 1 + slots.length + others.length;
+  // The block says which phase it is showing, always — an E2E figure that
+  // silently included the cold pass is the failure this whole cut exists to
+  // prevent, and a reader screenshotting the table has to be able to tell.
+  const noJob = reps.reduce((a, r) => a + (r ? r.noJobId : 0), 0);
+  // The per-arm counts live in the "Records used of file" row below, so the
+  // caption names the rule and not a total nobody can attribute to an arm.
+  const phase =
+    S.warmMode === "all"
+      ? `<b>both phases</b> — every record in the file, cold and warm, ` +
+        `averaged without collapsing repeated keys`
+      : S.warmMode === "half"
+        ? `<b>warm phase only</b> — the back half of each report`
+        : `<b>warm phase only</b> — <code>job_id</code> &ge; ${S.warmFrom}` +
+          (noJob ? `, plus ${noJob} record(s) with no <code>job_id</code>` : ``);
   let out =
     `<tr><td colspan="${span}" style="padding-top:14px;color:var(--muted);
       border-bottom:none;font-size:12px">
       End-to-end, client-measured (<code>live_latency_ns</code> from the
-      harness report) — includes everything the engine line excludes
+      harness report) — includes everything the engine line excludes.
+      Showing ${phase}.
     </td></tr>` +
     summaryRow("E2E total", reps.map(r => cell(r, x => x.totalNs)),
                deltaRow(r => r.totalNs), true) +
@@ -930,13 +1085,20 @@ function e2eRows(slots, ref) {
                deltaRow(r => r.meanNs)) +
     summaryRow("E2E median per call", reps.map(r => cell(r, x => x.medianNs)),
                deltaRow(r => r.medianNs)) +
-    summaryRow("Calls in report", reps.map(r => (r ? String(r.calls) : "–")),
+    summaryRow("Calls averaged", reps.map(r => (r ? String(r.calls) : "–")),
                others.map(s => {
                  const rp = S.reports[s];
                  if (!rr || !rp) return ["–", ""];
                  const d = rp.calls - rr.calls;
                  return [`${d > 0 ? "+" : ""}${d}`, ""];
-               }));
+               })) +
+    // Which records those calls came out of, always on screen: without it a
+    // cut that halved the file and one that did nothing print the same
+    // "calls" number whenever the phases were symmetric, and the reader has
+    // no way to tell the setting took effect.
+    summaryRow("Records used of file",
+               reps.map(r => (r ? `${r.rawRecords} of ${r.allRecords}` : "–")),
+               others.map(() => ["", ""]));
 
   // The paired figures: one row per non-reference arm, each paired against
   // the reference on the keys the two have in common. Shown last so the
@@ -1018,6 +1180,14 @@ function buildSummary() {
     // `hit_tokens` and still prefill less, if the external tier caught the
     // difference. Absent from logs written before the field existed, which
     // `field` renders as "–" rather than a confident zero.
+    // Between the two on purpose, so the four rows read top to bottom as the
+    // cascade the line emits: queried, held in HBM, served by LMCache, and
+    // what still had to be prefilled. Not `lowerBetter`, and not a win on
+    // its own — a run leaning harder on the external tier is a run whose HBM
+    // policy did less, which is the comparison `hit_tokens` above is for.
+    { key: "Tokens from LMCache (external_hit_tokens)", lowerBetter: null, showAbs: true,
+      field: "external_hit_tokens", get: r => num(last(r).external_hit_tokens),
+      fmt: v => fmtNum(v, 0) },
     { key: "Tokens prefilled (cold_tokens)", lowerBetter: true, showAbs: true,
       field: "cold_tokens", get: r => num(last(r).cold_tokens), fmt: v => fmtNum(v, 0) },
     { key: "Requests measured (ttft_n)", lowerBetter: null, showAbs: true,
@@ -1081,10 +1251,10 @@ function buildSummary() {
       <code>hit_tokens</code> counts HBM-resident hits only — reuse served by
       an external connector (LMCache) is not in it, and on a run where the
       external hit rate is high most of the reuse never appears here. That is
-      what <code>cold_tokens</code> is for: it subtracts both tiers, so
-      <code>query − hit</code> is the miss count while <code>cold_tokens</code>
-      is the part that actually cost a prefill, and the gap between them is
-      LMCache's contribution.
+      what the next two rows are for: <code>external_hit_tokens</code> is
+      LMCache's share of those misses and <code>cold_tokens</code> is the part
+      that actually cost a prefill, so <code>query − hit</code> is the miss
+      count and the two rows split it.
       End-to-end rows come from the harness, not the engine: they carry
       front-end queueing, detokenization and tool calls, so they are the
       user-visible number and the one an eviction policy has the least
@@ -1113,17 +1283,68 @@ function buildBanners() {
     const rep = S.reports[v];
     if (!rep) continue;
     if (rep.duplicates > 0) {
+      // In a cut mode this is a re-appended run showing through and the
+      // collapsing sentence applies. Under "Both phases" nothing is
+      // collapsed, so saying it would be a lie — there the repeats *are* the
+      // cold phase and they are in the figures on purpose.
+      const fix = S.warmMode === "all"
+        ? `Nothing is collapsed here: the repeats are in the figures above, ` +
+          `and most of them are the cold phase, which the reset does not ` +
+          `remove from the report. Switch <b>E2E phase</b> to ` +
+          `<b>Last half</b> for the warm figures.`
+        : `The last record per key is used and the earlier ones discarded, ` +
+          `on top of the ${S.warmMode === "half"
+            ? "back-half"
+            : `<code>job_id</code> &ge; ${S.warmFrom}`} cut — so the warm ` +
+          `phase itself holds repeats. Rotate the report path per run to ` +
+          `make this unambiguous.`;
       add(`<b>${labelFor(v)} report holds more than one run</b> — ` +
-          `${rep.rawRecords} records over ${rep.calls} distinct keys ` +
-          `(${rep.duplicates} collapsed). <code>ODR_TRACE_REPORT</code> is ` +
-          `append-only and carries no timestamp, so the last record per key ` +
-          `is used and the earlier runs are discarded. Rotate the report ` +
-          `path per run to make this unambiguous.`);
+          `${rep.rawRecords} records over ${rep.keys} distinct keys ` +
+          `(${rep.duplicates} repeats). <code>ODR_TRACE_REPORT</code> is ` +
+          `append-only and carries no timestamp. ${fix}`);
+    }
+    if (S.warmMode === "job" && rep.noJobId > 0) {
+      add(`<b>${labelFor(v)} report: ${rep.noJobId} record(s) carry no ` +
+          `<code>job_id</code></b> — kept, not dropped, because a report ` +
+          `written before <code>job_id</code> was added would otherwise ` +
+          `filter down to nothing. Their phase is unknown, so a cold one can ` +
+          `still be in the totals.`);
     }
     if (rep.badLines > 0) {
       add(`<b>${labelFor(v)} report: ${rep.badLines} unparsable line(s)</b> — ` +
           `skipped. Expected one JSON object per line.`);
     }
+  }
+
+  // How the cut was arrived at, once for the page — one setting is applied to
+  // every slot, so saying it per slot would read as three separate decisions.
+  // The halves rule is assumed, not measured, and the page has to say so:
+  // it is right when both phases ran the same trace to completion, and wrong
+  // by exactly the overhang when they did not.
+  if (S.warmMode === "half") {
+    const odd = SLOTS.filter(v => S.reportsRaw[v] && S.reportsRaw[v].recs.length % 2);
+    add(`<b>Warm phase assumed to be the back half</b> — the E2E block drops ` +
+        `the first half of each report on the assumption that the cold ` +
+        `phase ran the same trace and finished. If the warm loop stopped ` +
+        `early on <code>all_queries_satisfied()</code> the halves do not ` +
+        `line up and cold records survive the cut` +
+        (odd.length
+          ? `; ${odd.map(labelFor).join(", ")} ` +
+            `${odd.length === 1 ? "has" : "have"} an odd record count, which ` +
+            `is that case`
+          : ``) +
+        `. Type the first warm <code>job_id</code> to cut exactly — it is ` +
+        `the lowest <code>job_id</code> in the warm ` +
+        `<code>job_instance_e2e_latency.csv</code>, or ` +
+        `<code>instances_per_query × examples</code> + 1.`);
+  }
+  for (const v of S.cutEmptied) {
+    // Only reachable in "job" mode: the halves cut takes `slice(floor(n/2))`,
+    // which is never empty for a report that parsed at all.
+    add(`<b>${labelFor(v)} report is empty under the current cut</b> — no ` +
+        `record has <code>job_id</code> &ge; ${S.warmFrom}, so the arm is ` +
+        `absent from the E2E block entirely. Lower the value, or switch to ` +
+        `<b>Last half</b>.`);
   }
   const ref = referenceSlot();
   // One key-coverage check per non-reference arm. A third arm that replayed a
@@ -1277,17 +1498,28 @@ function render() {
   host.innerHTML = "";
   S.panels = [];
 
+  const haveReports = SLOTS.some(s => S.reportsRaw[s]);
+  // The cut control only means something once a report is loaded, and it has
+  // to stay reachable when reports are the *only* input — the panels need
+  // `kv_hbm` lines, the E2E block does not.
+  document.getElementById("cutWrap").hidden = !haveReports;
+
   const runs = runList();
   if (!runs.length) {
     host.innerHTML = `<div class="empty">` +
-      (SLOTS.some(s => S.reports[s])
+      (haveReports
         ? `End-to-end report loaded. Add the <code>kv_hbm</code> lines for the panels.`
         : `No data loaded yet.`) + `</div>`;
-    document.getElementById("toolbar").hidden = true;
+    document.getElementById("toolbar").hidden = !haveReports;
+    document.getElementById("zoomHint").hidden = true;
+    for (const slot of SLOTS) document.getElementById("solo" + slot).hidden = true;
+    document.querySelector('[data-solo="all"]').hidden = true;
     buildSummary();   // the E2E table stands on its own
     return;
   }
   document.getElementById("toolbar").hidden = false;
+  document.getElementById("zoomHint").hidden = false;
+  document.querySelector('[data-solo="all"]').hidden = false;
   // The solo buttons name the arms actually loaded, so "Run C only" reads
   // "continuum only" once a continuum log is in — and a slot with no run
   // hides its button rather than offering a filter that empties the page.
@@ -1450,7 +1682,8 @@ for (const [id, variant] of [["reportA", "A"], ["reportB", "B"], ["reportC", "C"
               "with a `live_latency_ns` field (the ODR_TRACE_REPORT format).");
         return;
       }
-      S.reports[variant] = rep;
+      S.reportsRaw[variant] = rep;
+      rebuildReports();
       afterLoad();
     };
     fr.readAsText(f);
@@ -1472,7 +1705,9 @@ document.getElementById("parsePaste").addEventListener("click", () => {
 
 document.getElementById("clear").addEventListener("click", () => {
   S.runs = {};
+  S.reportsRaw = {};
   S.reports = {};
+  setWarmMode("half", null);
   // A stale solo would filter the next pair of logs down to one arm with no
   // visible cause — the toolbar is hidden while nothing is loaded.
   S.solo = "all";
@@ -1495,6 +1730,23 @@ for (const btn of document.querySelectorAll("[data-solo]")) {
     render();
   });
 }
+
+for (const btn of document.querySelectorAll("[data-cut]")) {
+  btn.addEventListener("click", () => {
+    setWarmMode(btn.dataset.cut, null);
+    afterLoad();
+  });
+}
+
+// `change`, not `input`: rebuilding the whole summary on every keystroke
+// would repaint the table mid-type, and a half-typed `1` would briefly cut
+// the report to a boundary nobody asked for. Emptying the box falls back to
+// the halves rule rather than to no cut at all — clearing a typed override
+// should not quietly put the cold phase back in the totals.
+document.getElementById("warmCut").addEventListener("change", ev => {
+  setWarmMode("job", ev.target.value);
+  afterLoad();
+});
 
 document.getElementById("theme").addEventListener("click", () => {
   const cur = document.documentElement.getAttribute("data-theme");
@@ -1558,25 +1810,36 @@ document.getElementById("demo").addEventListener("click", () => {
   // A matching pair of harness reports, so the paired E2E block is
   // inspectable too. Same keys in both arms, which is what pinned replay
   // guarantees and what the pairing needs.
+  //
+  // Both phases, because that is what a real report holds: 14 keys cold with
+  // ids 1..14, then the same 14 keys warm with ids 15..28. The cold half is
+  // deliberately much slower, so the back-half cut visibly pulls every E2E
+  // row down and "Both phases" puts the inflation back — which is the point
+  // the phase control exists to make.
   const mkReport = (scale, jitter) => {
     const lines = [];
-    for (let i = 0; i < 14; i++) {
-      const base = 3.0e9 + 4.0e9 * Math.abs(Math.sin(i * 1.7));
-      const ns = Math.round(base * scale * (1 + jitter * Math.sin(i * 3.1)));
-      lines.push(JSON.stringify({
-        key: `k${String(i).padStart(2, "0")}`,
-        job_id: "1",
-        reason: "pinned",
-        live_status: 200,
-        live_latency_ns: ns,
-        live_completion_tokens: 120 + i * 7,
-      }));
-    }
+    const pass = (phase, mult, count) => {
+      for (let i = 0; i < count; i++) {
+        const base = 3.0e9 + 4.0e9 * Math.abs(Math.sin(i * 1.7));
+        const ns = Math.round(base * scale * mult * (1 + jitter * Math.sin(i * 3.1)));
+        lines.push(JSON.stringify({
+          key: `k${String(i).padStart(2, "0")}`,
+          job_id: String(phase * 14 + i + 1),
+          reason: "pinned",
+          live_status: 200,
+          live_latency_ns: ns,
+          live_completion_tokens: 120 + i * 7,
+        }));
+      }
+    };
+    pass(0, 1.85, 14);   // cold: nothing in the cache yet
+    pass(1, 1.0, 14);    // warm: the phase being measured
     return lines.join("\n");
   };
-  S.reports.A = parseReport(mkReport(1.0, 0.05));
-  S.reports.B = parseReport(mkReport(0.78, 0.07));
-  S.reports.C = parseReport(mkReport(0.89, 0.06));
+  S.reportsRaw.A = parseReport(mkReport(1.0, 0.05));
+  S.reportsRaw.B = parseReport(mkReport(0.78, 0.07));
+  S.reportsRaw.C = parseReport(mkReport(0.89, 0.06));
+  rebuildReports();
 
   afterLoad();
 });
