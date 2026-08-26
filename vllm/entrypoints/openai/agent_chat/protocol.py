@@ -129,6 +129,31 @@ class AgentPrefetchRequest(BaseModel):
         "summarization, ``system`` (the default) for an agent whose prompt "
         "opens with a system block."
     )
+    prefill_on_miss: bool = Field(
+        default=False,
+        description="Let this call's phantoms run a real prefill when "
+        "LMCache has nothing for the prefix, instead of being aborted.\n\n"
+        "The default (False) is the normal contract: a phantom is a "
+        "promotion from LMCache L1 into HBM, so a prefix the cache does not "
+        "hold cannot be warmed and the request is finished without ever "
+        "reaching the model. That keeps a mispredicted warm from spending a "
+        "full prompt's prefill ahead of real traffic.\n\n"
+        "Set this to True for a **seeding** call -- one that has just "
+        "recorded a prefix via `text` that no request has ever computed, so "
+        "it is guaranteed absent from LMCache. The phantom then prefills "
+        "once, and the store path writes the result into LMCache as a side "
+        "effect, so every later prefetch for that prefix is a real L1->HBM "
+        "promotion. Without it, seeding fills the registry but leaves the "
+        "cache empty and each prefix is still prefilled by the first real "
+        "request that wants it.\n\n"
+        "Costs one prefill per warmed prefix, serialized ahead of real "
+        "traffic. Scope it to a warmup phase; never set it on a "
+        "prediction-driven prefetch, where a wrong guess would spend that "
+        "prefill for nothing.\n\n"
+        "No effect when LMCache *does* hold the prefix: that path never "
+        "reaches the abort, and the phantom terminates before prefill as "
+        "usual."
+    )
     # --- node-eviction identity -------------------------------------
     #
     # `(job_id, langgraph_node, call_type)` is the key the node-aware

@@ -159,6 +159,7 @@ async def _fan_out_prefetches(
     k: int | None,
     wait: bool,
     identity: dict[str, str] | None = None,
+    prefill_on_miss: bool = False,
 ) -> tuple[int, int]:
     """Submit phantom prefetches for ``agent_id``.
 
@@ -166,6 +167,9 @@ async def _fan_out_prefetches(
     agent is warmed (no top-K truncation). When ``k`` is a positive
     int, only the ``k`` most-recently-used prefixes are warmed; ``k``
     <= 0 is a no-op.
+
+    ``prefill_on_miss`` is forwarded verbatim to every phantom; see
+    :attr:`AgentPrefetchRequest.prefill_on_miss` for when it is appropriate.
 
     ``identity`` rides into ``sampling_params.extra_args`` and is what makes
     the warmed blocks visible to the node-eviction policy; see
@@ -193,6 +197,7 @@ async def _fan_out_prefetches(
             prefix_hash=desc.prefix_hash,
             cache_salt=desc.cache_salt,
             identity=identity,
+            prefill_on_miss=prefill_on_miss,
         )
         if task is not None:
             tasks.append(task)
@@ -646,6 +651,7 @@ async def prefetch_agent_cache(
         k=effective_top_k,
         wait=request.wait,
         identity=identity,
+        prefill_on_miss=request.prefill_on_miss,
     )
 
     elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
@@ -660,6 +666,10 @@ async def prefetch_agent_cache(
         ),
         "agent_kind": request.agent_kind,
         "seeded_from_text": seeded,
+        # Echoed because it changes what a phantom costs: with it set, a miss
+        # is a full prefill rather than an abort, and a caller that set it by
+        # accident has no other way to tell from the outside.
+        "prefill_on_miss": request.prefill_on_miss,
         # "all" when no cap was provided; an int otherwise.
         "requested_top_k": top_k_repr,
         "available_prefixes": available,

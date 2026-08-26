@@ -755,6 +755,7 @@ class Scheduler(SchedulerInterface):
                         if (
                             ext_tokens == 0
                             and self._is_prefetch_only_request(request)
+                            and not self._prefetch_may_prefill_on_miss(request)
                         ):
                             # LMCache had nothing for this prefix. A phantom
                             # is a promotion from L1 into HBM, not a
@@ -766,6 +767,19 @@ class Scheduler(SchedulerInterface):
                             # eventually wants it pays the same prefill
                             # anyway, and pays it only if the prediction was
                             # right.
+                            #
+                            # `prefill_on_miss` opts out, and is the one case
+                            # where falling through is the point: a seeding
+                            # call has just recorded a prefix nothing has
+                            # ever computed, so it is *necessarily* absent
+                            # from LMCache and aborting here would make the
+                            # seed a no-op forever. Letting it prefill once
+                            # puts the prefix in LMCache — the store path
+                            # (`GetStoreMetadata`) is driven by the request
+                            # being scheduled and is not gated on
+                            # `prefetch_only` — so every later prefetch for
+                            # it is a real promotion. See
+                            # `AgentPrefetchRequest.prefill_on_miss`.
                             #
                             # Deliberately below the `ext_tokens is None`
                             # branch above: None means "ask me again", not
@@ -2381,6 +2395,18 @@ class Scheduler(SchedulerInterface):
     def _is_prefetch_only_request(request: Request) -> bool:
         params = request.kv_transfer_params
         return bool(params and params.get("prefetch_only"))
+
+    @staticmethod
+    def _prefetch_may_prefill_on_miss(request: Request) -> bool:
+        """Whether this phantom is allowed to prefill on an LMCache miss.
+
+        Off by default, so the miss path stays an abort for every
+        prediction-driven prefetch. Only a warmup caller that has just seeded
+        a prefix nothing has computed sets it — for that prefix the miss is
+        certain, and the prefill is what puts it in LMCache.
+        """
+        params = request.kv_transfer_params
+        return bool(params and params.get("prefill_on_miss"))
 
     def _finish_prefetch_only_misses(
         self,

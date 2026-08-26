@@ -74,6 +74,7 @@ class PhantomPrefetchSubmitter:
         prefix_hash: bytes,
         cache_salt: str,
         identity: dict[str, str] | None = None,
+        prefill_on_miss: bool = False,
     ) -> asyncio.Task | None:
         """Submit one phantom prefetch.
 
@@ -82,6 +83,11 @@ class PhantomPrefetchSubmitter:
         Callers can either ignore the task (fire-and-forget) or
         ``await`` it to block until the phantom completes -- at which
         point the prefix is guaranteed to be registered in APC.
+
+        ``prefill_on_miss`` lets this phantom fall through to a real prefill
+        when LMCache has nothing for the prefix, rather than being aborted.
+        Only a warmup caller that just seeded the prefix should pass True;
+        see ``AgentPrefetchRequest.prefill_on_miss``.
 
         ``identity`` carries ``job_id`` / ``langgraph_node`` / ``call_type``
         into ``sampling_params.extra_args``. Without it the blocks a phantom
@@ -126,6 +132,13 @@ class PhantomPrefetchSubmitter:
             "kv_transfer_params": {
                 "prefetch_only": True,
                 "cache_salt": cache_salt,
+                # Read by `Scheduler._prefetch_may_prefill_on_miss`. False
+                # keeps the normal contract: an LMCache miss aborts before
+                # prefill. True is for a seeding call whose prefix nothing
+                # has computed yet, where the prefill *is* the point -- the
+                # store path then writes it into LMCache so later prefetches
+                # have something to promote.
+                "prefill_on_miss": bool(prefill_on_miss),
             },
         }
         if identity:
