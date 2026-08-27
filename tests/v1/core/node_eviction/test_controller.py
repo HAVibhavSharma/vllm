@@ -59,6 +59,7 @@ def make_request(
     node="research",
     call_type="tavily:summary",
     prefetch_only=False,
+    request_id="req-0",
 ):
     extra_args = {}
     if job_id is not None:
@@ -68,6 +69,8 @@ def make_request(
     if call_type is not None:
         extra_args["call_type"] = call_type
     return SimpleNamespace(
+        request_id=request_id,
+        num_preemptions=0,
         sampling_params=SimpleNamespace(extra_args=extra_args),
         kv_transfer_params={"prefetch_only": True} if prefetch_only else None,
     )
@@ -1355,17 +1358,21 @@ def test_a_newly_worse_key_still_reaches_the_head():
     assert pool.queue_ids()[0] in (4, 5), "the worse key must overtake"
 
 
-def _ttft_request(arrival: float, first_token: float | None):
-    req = make_request()
+def _ttft_request(arrival: float, first_token: float | None, **kw):
+    req = make_request(**kw)
     req.arrival_time = arrival
     req.first_token_ts = first_token
     req.ttft_recorded = False
     return req
 
 
+def _fields(line: str) -> dict[str, str]:
+    return dict(p.split("=", 1) for p in line.split() if "=" in p)
+
+
 def test_ttft_is_recorded_once_per_request():
     """`KVCacheManager.free` also runs on preemption, and a preempted request
-    keeps its original `first_token_ts`. Counting it twice would weight slow
+    keeps its original `first_token_ts`. Emitting it twice would weight slow
     requests by how often they were preempted."""
     controller = make_controller(FakePool())
     req = _ttft_request(arrival=1000.0, first_token=1000.25)
@@ -1374,27 +1381,134 @@ def test_ttft_is_recorded_once_per_request():
     controller.on_request_finished(req)
 
     assert controller.ttft.count == 1
-    assert controller.ttft.mean_ms == 250.0
 
 
 def test_a_request_with_no_first_token_contributes_nothing():
     """Aborted before prefill finished — there is no prefill latency to
-    attribute, and a zero would drag the mean down."""
+    attribute, and a zero would read as an instant response."""
     controller = make_controller(FakePool())
     controller.on_request_finished(_ttft_request(1000.0, None))
     assert controller.ttft.count == 0
 
 
-def test_the_summary_line_carries_ttft():
+def test_the_per_request_line_carries_the_raw_latency():
+    """The whole point of the per-request line: the number in it is one
+    request's own TTFT, not a mean anything was folded into."""
+    controller = make_controller(FakePool())
+    req = _ttft_request(1000.0, 1000.5, request_id="req-7")
+    controller.on_cache_query(num_tokens=1536, num_hits=1024, request=req)
+
+    line = controller._ttft_line(req, 500.0)
+    fields = _fields(line)
+
+    assert line.startswith("kv_hbm_ttft ")
+    assert fields["req"] == "req-7"
+    assert float(fields["ttft_ms"]) == 500.0
+    assert fields["query_tokens"] == "1536"
+    assert fields["hit_tokens"] == "1024"
+    assert fields["external_hit_tokens"] == "0"
+    assert fields["cold_tokens"] == "512"
+    assert fields["preempted"] == "0"
+    assert fields["phantom"] == "0"
+
+
+def test_the_per_request_line_prefers_the_external_tier_figures():
+    """`on_external_cache_query` sees the same lookup one tier later, so its
+    numbers replace the local-only stash rather than adding to it — otherwise
+    the local hit would be counted twice and `cold_tokens` under-reported."""
+    controller = make_controller(FakePool())
+    req = _ttft_request(1000.0, 1000.4)
+    controller.on_cache_query(num_tokens=1000, num_hits=200, request=req)
+    controller.on_external_cache_query(
+        num_tokens=1000, num_local_hits=200, num_external_hits=500, request=req
+    )
+
+    fields = _fields(controller._ttft_line(req, 400.0))
+    assert fields["hit_tokens"] == "200"
+    assert fields["external_hit_tokens"] == "500"
+    assert fields["cold_tokens"] == "300"
+
+
+def test_the_per_request_line_marks_an_unmeasured_lookup():
+    """A request that never reached `get_computed_blocks` has no breakdown.
+    Reporting -1 keeps it from reading as a genuine all-cold prefill, which
+    is what a 0 here would look like."""
+    controller = make_controller(FakePool())
+    fields = _fields(controller._ttft_line(_ttft_request(1000.0, 1000.1), 100.0))
+    assert fields["query_tokens"] == "-1"
+    assert fields["cold_tokens"] == "-1"
+
+
+def test_a_phantom_prefetch_is_flagged_not_hidden():
+    """Phantoms are out of every rate on the `kv_hbm` line, but their latency
+    is real work the policy originated. Dropping it would make origination
+    look free; the flag is what lets it be filtered out afterwards."""
+    controller = make_controller(FakePool())
+    req = _ttft_request(1000.0, 1000.2, prefetch_only=True)
+    assert _fields(controller._ttft_line(req, 200.0))["phantom"] == "1"
+
+
+def test_the_summary_line_carries_only_the_ttft_count():
+    """The latencies live on their own lines. A mean here would be fixed to a
+    window nobody chose."""
     controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
     controller.on_request_finished(_ttft_request(1000.0, 1000.5))
     line = controller._maybe_log_hbm_summary(1_000_000.0)
-    fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
-    assert float(fields["ttft_ms"]) == 500.0
-    assert float(fields["ttft_win_ms"]) == 500.0
-    assert float(fields["ttft_p50_ms"]) == 500.0
-    assert float(fields["ttft_p95_ms"]) == 500.0
+    fields = _fields(line)
+
     assert fields["ttft_n"] == "1"
+    assert fields["ttft_win_n"] == "1"
+    for gone in ("ttft_ms", "ttft_win_ms", "ttft_p50_ms", "ttft_p95_ms"):
+        assert gone not in fields, f"{gone} should be off the kv_hbm line"
+
+
+def _captured_ttft_lines(monkeypatch, controller, request) -> list[str]:
+    """`vllm`'s root logger sets `propagate=False`, so `caplog` sees nothing
+    here — the module logger has to be intercepted directly."""
+    from vllm.v1.core.node_eviction import controller as controller_module
+
+    lines: list[str] = []
+    monkeypatch.setattr(
+        controller_module.logger,
+        "info",
+        lambda fmt, *args: lines.append(fmt % args if args else fmt),
+    )
+    controller.on_request_finished(request)
+    return [ln for ln in lines if ln.startswith("kv_hbm_ttft ")]
+
+
+def test_finishing_a_request_writes_its_own_line(monkeypatch):
+    controller = make_controller(FakePool())
+    req = _ttft_request(1000.0, 1000.5, request_id="req-9")
+    lines = _captured_ttft_lines(monkeypatch, controller, req)
+
+    assert len(lines) == 1
+    fields = _fields(lines[0])
+    assert fields["req"] == "req-9"
+    assert float(fields["ttft_ms"]) == 500.0
+
+
+def test_the_per_request_line_can_be_turned_off(monkeypatch):
+    """One line per request is real cost under load; the count on the
+    `kv_hbm` line must not depend on the switch."""
+    controller = make_controller(FakePool(), ttft_per_request_log=False)
+    req = _ttft_request(1000.0, 1000.5)
+    lines = _captured_ttft_lines(monkeypatch, controller, req)
+
+    assert lines == []
+    assert controller.ttft.count == 1
+
+
+def test_a_backwards_clock_writes_no_line(monkeypatch):
+    """A negative latency in the log is worse than a gap in it, and the
+    sample must not be counted either — `ttft_n` would then stand over a
+    sample nothing can be found for."""
+    controller = make_controller(FakePool())
+    req = _ttft_request(arrival=1000.0, first_token=999.5)
+    lines = _captured_ttft_lines(monkeypatch, controller, req)
+
+    assert lines == []
+    assert controller.ttft.count == 0
 
 
 # -- observe-only (the A/B baseline arm) ----------------------------------

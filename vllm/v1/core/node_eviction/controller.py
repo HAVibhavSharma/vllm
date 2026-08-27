@@ -371,6 +371,13 @@ class NodeEvictionController:
             return
         phantom = request is not None and _is_prefetch_only(request)
         self.movement.on_cache_query(num_tokens, num_hits, phantom)
+        if request is not None:
+            # Kept for this request's own `kv_hbm_ttft` line. Both figures are
+            # taken here, while they are still the prompt's: `num_tokens` grows
+            # with the decode, so reading it at teardown would report a
+            # different denominator than the one the hit was measured against.
+            request.hbm_query_tokens = num_tokens
+            request.hbm_local_hit_tokens = num_hits
 
     def on_external_cache_query(
         self,
@@ -400,13 +407,29 @@ class NodeEvictionController:
         self.movement.on_external_cache_query(
             num_tokens, num_local_hits, num_external_hits, phantom
         )
+        if request is not None:
+            # Overwrites what `on_cache_query` stashed rather than adding to
+            # it: this hook sees the same lookup one tier later, so its local
+            # figure is the authoritative one and its `num_tokens` is the same
+            # denominator. A request that never reaches here (no connector
+            # configured) keeps the local-only stash and reports
+            # `external_hit_tokens=0`, which is what actually happened.
+            request.hbm_query_tokens = num_tokens
+            request.hbm_local_hit_tokens = num_local_hits
+            request.hbm_external_hit_tokens = num_external_hits
 
     def on_request_finished(self, request) -> None:
         """`KVCacheManager.free` — the request is done with its blocks.
 
+        Emits this request's own TTFT, on its own line. Not an average: the
+        `kv_hbm` line carries only how many samples were taken, and the
+        samples themselves live here, one per request, so that any aggregate
+        can be computed afterwards over whichever subset of requests is
+        actually being asked about.
+
         Called on preemption too, which is why the sample is gated on
         `ttft_recorded`: a preempted request keeps its original
-        `first_token_ts`, so counting it twice would weight slow requests by
+        `first_token_ts`, so emitting it twice would weight slow requests by
         how often they were preempted.
         """
         if not self.enabled or request.ttft_recorded:
@@ -417,7 +440,54 @@ class NodeEvictionController:
             # nothing to emit. No prefill latency to attribute.
             return
         request.ttft_recorded = True
-        self.ttft.record((first - request.arrival_time) * 1000.0)
+        ttft_ms = (first - request.arrival_time) * 1000.0
+        if not self.ttft.record(ttft_ms):
+            # Rejected as impossible (a non-monotonic clock). Not logged
+            # either: a negative latency in the log is worse than a gap.
+            return
+        if self.config.ttft_per_request_log:
+            logger.info("%s", self._ttft_line(request, ttft_ms))
+
+    def _ttft_line(self, request, ttft_ms: float) -> str:
+        """One request's TTFT, in the same key=value shape as `kv_hbm`.
+
+        The token breakdown travels with the latency because the latency
+        alone cannot be read: 400 ms is a fast cold prefill or a slow warm
+        one depending on how much of the prompt had to be computed, and
+        separating those is the entire question an eviction policy is being
+        asked. `preempted` is here for the same reason — a preempted request
+        keeps its first `first_token_ts`, so its sample is real, but it was
+        paid for by scheduling pressure rather than by a cache miss.
+        """
+        query = getattr(request, "hbm_query_tokens", None)
+        local = getattr(request, "hbm_local_hit_tokens", None) or 0
+        external = getattr(request, "hbm_external_hit_tokens", None) or 0
+        if query is None:
+            # No lookup was ever recorded for this request — it never reached
+            # `get_computed_blocks`. Reporting -1 rather than 0 keeps it from
+            # reading as a genuine all-cold prefill.
+            query = local = external = -1
+            cold = -1
+        else:
+            # Clamped for the same reason the aggregate is: when the two
+            # tiers' spans overlap, the reported hits can exceed the prompt.
+            cold = max(query - local - external, 0)
+        return (
+            f"kv_hbm_ttft variant={self._variant} "
+            f"epoch={self.metrics_epoch} "
+            f"req={request.request_id} "
+            f"ttft_ms={ttft_ms:.1f} "
+            f"query_tokens={query} "
+            f"hit_tokens={local} "
+            f"external_hit_tokens={external} "
+            f"cold_tokens={cold} "
+            f"preempted={getattr(request, 'num_preemptions', 0)} "
+            # Phantom prefetches are excluded from every rate on the `kv_hbm`
+            # line, so their latency is flagged rather than dropped: it is
+            # real work the policy originated, and hiding it would make
+            # origination look free.
+            f"phantom={int(_is_prefetch_only(request))}"
+        )
 
     def on_reset_prefix_cache(self) -> None:
         if not self.enabled:
@@ -832,17 +902,17 @@ class NodeEvictionController:
             f"regret={c.regret_rate:.3f} "
             f"hit_rate={m.hit_rate:.4f} "
             f"hit_rate_win={m.window_hit_rate:.4f} "
-            # Engine-side TTFT — what a miss cost, next to how often it
-            # happened. Hit rate alone cannot separate a policy that kept
-            # cheap-to-rebuild blocks from one that kept expensive ones.
-            f"ttft_ms={self.ttft.mean_ms:.1f} "
-            f"ttft_win_ms={self.ttft.window_mean_ms:.1f} "
-            # The median sits between the two means and the tail on purpose:
-            # read left to right it goes aggregate cost, this window, what a
-            # typical request saw, what the worst 5% saw.
-            f"ttft_p50_ms={self.ttft.p50_ms:.1f} "
-            f"ttft_p95_ms={self.ttft.p95_ms:.1f} "
+            # How many TTFT samples stand behind this epoch — not what they
+            # were. The latencies themselves are on their own `kv_hbm_ttft`
+            # lines, one per request, because an average computed here is
+            # fixed at write time to a window nobody chose, and TTFT is
+            # heavy-tailed enough that such an average routinely describes
+            # no request in it. The count stays because every rate on this
+            # line is unreadable without knowing how many requests produced
+            # it, and because a window where only latency moved still has to
+            # get past the change gate.
             f"ttft_n={self.ttft.count} "
+            f"ttft_win_n={self.ttft.window_count} "
             f"hit_tokens={m.hit_tokens} "
             f"query_tokens={m.query_tokens} "
             # The rest of `query_tokens - hit_tokens`, split in two so the
@@ -964,10 +1034,11 @@ class NodeEvictionController:
             # started with an empty HBM cache and one that inherited a full
             # one are not the same measurement.
             f"hbm_flushed={hbm_flushed} "
+            # How many TTFT samples the discarded epoch held. Their latencies
+            # are not summarised here — they were already logged one per
+            # request, under the epoch number this marker is retiring, which
+            # is what makes them separable after the fact.
             f"discarded_ttft_n={discarded.get('ttft_n', 0)} "
-            f"discarded_ttft_ms={discarded.get('ttft_ms', 0.0):.1f} "
-            f"discarded_ttft_p50_ms={discarded.get('ttft_p50_ms', 0.0):.1f} "
-            f"discarded_ttft_p95_ms={discarded.get('ttft_p95_ms', 0.0):.1f} "
             f"discarded_hit_rate={discarded.get('hit_rate', 0.0):.4f} "
             f"discarded_query_tokens={discarded.get('query_tokens', 0)} "
             f"discarded_evicted={discarded.get('evictions_total', 0)}"

@@ -194,53 +194,28 @@ def test_counters_serialise():
         assert field in payload
 
 
-def test_ttft_mean_is_exact_and_p95_is_over_the_ring():
-    """The mean answers "did latency move"; p95 answers "for whom". A policy
-    can hold the mean flat and wreck the tail by evicting one large prefix."""
+def test_ttft_counts_samples_and_keeps_no_latency():
+    """The tracker is a counter now. Every latency is emitted on its own
+    `kv_hbm_ttft` line as it is taken, so nothing here should be holding a
+    mean, a median or a ring of recent samples for one to be computed from —
+    an aggregate fixed at write time cannot be re-cut to the subset of
+    requests a question is actually about."""
     from vllm.v1.core.node_eviction.metrics import TTFTTracker
 
     t = TTFTTracker()
-    for ms in list(range(1, 101)):
-        t.record(float(ms))
+    for ms in range(1, 101):
+        assert t.record(float(ms)) is True
 
     assert t.count == 100
-    assert t.mean_ms == 50.5
-    # Nearest-rank: the smallest sample at or above the 95th percentile.
-    assert t.p95_ms == 95.0
-    assert t.p50_ms == 50.0
-
-
-def test_ttft_median_ignores_the_outlier_the_mean_chases():
-    """The reason the median is on the line at all. Nine fast requests and one
-    30s cold prefill: the mean lands at 3s, which is not what any of the ten
-    saw. Read together, mean >> median says the tail moved, not the common
-    case — and quoting the mean as "requests got faster" is the mistake this
-    guards."""
-    from vllm.v1.core.node_eviction.metrics import TTFTTracker
-
-    t = TTFTTracker()
-    for _ in range(9):
-        t.record(100.0)
-    t.record(30_000.0)
-
-    assert t.mean_ms == 3090.0
-    assert t.p50_ms == 100.0
-    assert t.p95_ms == 30_000.0
-
-
-def test_ttft_percentiles_are_zero_before_any_sample():
-    """Not NaN: a NaN here poisons every downstream average, and the summary
-    line has to print *something* on the startup line."""
-    from vllm.v1.core.node_eviction.metrics import TTFTTracker
-
-    t = TTFTTracker()
-    assert t.p50_ms == 0.0
-    assert t.p95_ms == 0.0
+    assert t.as_dict() == {"ttft_n": 100}
+    for gone in ("mean_ms", "window_mean_ms", "p50_ms", "p95_ms", "_recent"):
+        assert not hasattr(t, gone), f"{gone} should no longer exist"
 
 
 def test_ttft_window_resets_but_cumulative_does_not():
-    """Same split as the hit rate: a cumulative mean over a long run is
-    dominated by whatever the workload did first."""
+    """Same split as the hit rate: the window count says how many samples the
+    line just printed stands over, the cumulative one how many the epoch
+    holds."""
     from vllm.v1.core.node_eviction.metrics import TTFTTracker
 
     t = TTFTTracker()
@@ -248,18 +223,30 @@ def test_ttft_window_resets_but_cumulative_does_not():
     t.reset_window()
     t.record(200.0)
 
-    assert t.window_mean_ms == 200.0
-    assert t.mean_ms == 150.0
+    assert t.window_count == 1
     assert t.count == 2
 
 
-def test_a_negative_ttft_is_dropped_not_averaged_in():
-    """A non-monotonic wall clock must not put a negative latency in the
-    mean — a missing sample is the lesser corruption."""
+def test_reset_measurement_drops_both_counts():
+    """The warmup boundary. A count that survived it would make the first
+    line of the measured epoch claim samples that belong to the warmup."""
     from vllm.v1.core.node_eviction.metrics import TTFTTracker
 
     t = TTFTTracker()
-    t.record(-5.0)
-    t.record(10.0)
+    t.record(100.0)
+    t.reset_measurement()
+
+    assert t.count == 0
+    assert t.window_count == 0
+
+
+def test_a_negative_ttft_is_rejected_not_logged():
+    """A non-monotonic wall clock must not put a negative latency in the log —
+    a missing sample is the lesser corruption. The `False` is what tells the
+    caller not to write the line."""
+    from vllm.v1.core.node_eviction.metrics import TTFTTracker
+
+    t = TTFTTracker()
+    assert t.record(-5.0) is False
+    assert t.record(10.0) is True
     assert t.count == 1
-    assert t.mean_ms == 10.0

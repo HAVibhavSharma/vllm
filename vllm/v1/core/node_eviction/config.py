@@ -388,6 +388,23 @@ class NodeEvictionConfig:
     separate a better policy from more HBM, and raw miss counts credit a
     policy for cold starts it had no part in."""
 
+    ttft_per_request_log: bool = True
+    """One INFO `kv_hbm_ttft` line per request that produced a token, giving
+    that request's engine-side TTFT and the token breakdown behind it.
+
+    On by default because it is now the *only* place TTFT is reported: the
+    `kv_hbm` line carries the sample count and nothing else. A mean or a
+    percentile computed in-process is fixed at write time to a window nobody
+    chose, and TTFT is heavy-tailed enough that such a figure routinely
+    describes no request that produced it. Raw samples can be aggregated
+    afterwards over exactly the requests being asked about — a warm subset, a
+    single job, the tail — which no in-process summary can be re-cut into.
+
+    The cost is one line per request rather than one per window, which is
+    real under load. Set False when running with the policy in production
+    rather than in an experiment; the sample count on the `kv_hbm` line does
+    not depend on this."""
+
     hbm_summary_top_keys: int = 5
     """How many `job_id:node` keys the HBM line names as eviction sources.
     Counted per window and reset after each line, which is also what bounds

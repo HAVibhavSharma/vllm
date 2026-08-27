@@ -209,6 +209,36 @@ divide them by 100.
 may itself contain a colon. Split each entry on the **last** `=`, then take
 the label whole. Do not split the label on `:`.
 
+### The `kv_hbm_ttft` lines
+
+TTFT is a second record type in the same file, one line per finished request
+(`hbm-logging-changes.md` §2.1.0), and the engine puts no latency aggregate on
+the `kv_hbm` line at all — only `ttft_n` and `ttft_win_n`. Anchor on
+`kv_hbm_ttft ` and parse the same way. Note that `"kv_hbm "` — with the
+trailing space — does not match these lines, but check for the sample form
+first anyway so that stays true by construction rather than by a space in a
+string literal.
+
+The page then computes the mean, median and p95 itself, per window and
+cumulatively, and writes them onto the `kv_hbm` rows under the field names the
+panels already use. **This is deliberate, not a workaround.** An aggregate the
+engine computed is fixed to a window nobody chose and a population nobody
+selected; computed here, the window boundaries, the percentile definition and
+which requests are even included are all things this page can change later —
+warm epoch only, phantoms excluded, one job only. TTFT is heavy-tailed enough
+that the choice routinely decides the answer.
+
+Two consequences worth writing down:
+
+- **Normalise rows and samples together.** They interleave in the file, so
+  running the day-roll correction over each sequence separately lets one roll
+  a day the other did not.
+- **Keep the backward-compatible path.** A log recorded before the change
+  carries `ttft_ms` / `ttft_p50_ms` / `ttft_p95_ms` on the `kv_hbm` line and
+  no samples. Overwrite those fields only when samples were actually found;
+  a run with `ttft_per_request_log` off has neither, and that must read as
+  *absent* — a break in the line, not a confident 0 ms.
+
 ### Time
 
 Parse the timestamp prefix if you can; fall back to line index if you cannot.
@@ -342,9 +372,9 @@ separate columns — the eye cannot align two columns across a scroll.
 | 1 | **KV rebuilt (cumulative)** | `rematMb`, two lines, MB. **The headline.** The gap between the two curves at the right edge *is* the result. Shade it and label the final delta in the panel. |
 | 2 | **Rebuild rate** | `ΔrematBlocks / Δt`, blocks/s, two lines. Shows *when* the policy helped — a gap that opens only under pressure is a different story from a constant offset. |
 | 3 | **Hit rate** | `hitRateWin`, two lines, 0–1. Read against panel 1: movement down with hit rate flat or up is the win. Movement down *and* hit rate down means it served less, not better. |
-| 4 | **TTFT** | `ttft_win_ms`, two lines, ms. Engine-side: scheduler queueing plus prefill, excluding front-end queueing and detokenization. Read against panel 3 — hit rate says how often the cache worked, this says whether it mattered. A hit-rate gain with TTFT flat means the hits landed on blocks that were cheap to rebuild. |
-| 5 | **TTFT median** | `ttft_p50_ms`, one line per arm, ms. What a *typical* request saw. TTFT is right-skewed, so panel 4's mean can sit where no request was — nine 100 ms prefills and one 30 s cold miss average to 3.09 s. Read against panel 4: **a mean that moved without the median is a tail effect**, not a faster common case. Same ring as panel 6, so the median-to-p95 spread is one population. |
-| 6 | **TTFT p95** | `ttft_p95_ms`, two lines, ms. The tail the mean hides: destroying one large prefix can leave the mean flat and still make a minority of requests much worse. |
+| 4 | **TTFT** | Window mean of the `kv_hbm_ttft` samples that fall in each window, two lines, ms. Engine-side: scheduler queueing plus prefill, excluding front-end queueing and detokenization. Read against panel 3 — hit rate says how often the cache worked, this says whether it mattered. A hit-rate gain with TTFT flat means the hits landed on blocks that were cheap to rebuild. |
+| 5 | **TTFT median** | Median of every sample so far, one line per arm, ms. What a *typical* request saw. TTFT is right-skewed, so panel 4's mean can sit where no request was — nine 100 ms prefills and one 30 s cold miss average to 3.09 s. Read against panel 4: **a mean that moved without the median is a tail effect**, not a faster common case. Same population as panel 6, so the median-to-p95 spread is one distribution. |
+| 6 | **TTFT p95** | p95 of the same population, two lines, ms. The tail the mean hides: destroying one large prefix can leave the mean flat and still make a minority of requests much worse. |
 | 7 | **Redo share** | Windowed `ΔrematBlocks / Δblocks_cached`, two lines, 0–1. Normalises panel 2 for throughput, so a quiet run cannot fake an improvement. |
 | 8 | **Occupancy** | `used`/`total` as a percentage. Baseline dashed, policy solid. Y-axis 0–100%, fixed. |
 | 9 | **Free queue depth** | `queue`, two lines. The eviction-candidate pool; a policy that keeps it deeper is holding more evictable-but-cached blocks. |
@@ -361,13 +391,13 @@ Above the panels, a compact table: one value column per loaded arm, then one Δ
 column per non-reference arm. Movement first, because that is the claim:
 
 - **KV rebuilt (`remat_mb`), and the delta as a percentage** — the headline
-- **TTFT mean (`ttft_ms`)** — the second headline, because it is the only
-  figure that says the movement mattered
-- TTFT median (`ttft_p50_ms`), directly under the mean — the pair *is* the
-  finding, and a mean that moved without the median must not be quoted as
-  "requests got faster"
-- TTFT p95 (`ttft_p95_ms`), and `ttft_n` beside it: means over different
-  request counts are not a comparison
+- **TTFT mean** — the second headline, because it is the only figure that
+  says the movement mattered
+- TTFT median, directly under the mean — the pair *is* the finding, and a
+  mean that moved without the median must not be quoted as "requests got
+  faster"
+- TTFT p95, and `ttft_n` beside it: means over different request counts are
+  not a comparison
 - redo share (`remat_ratio`)
 - hit rate (cumulative)
 - total evictions

@@ -22,7 +22,6 @@ Two artifacts, per §6:
 """
 
 import json
-import math
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -532,117 +531,58 @@ class CacheMovementTracker:
 
 
 class TTFTTracker:
-    """Engine-side time to first token, in ms.
+    """Engine-side time to first token, in ms — one line per request.
 
-    `Request.first_token_ts - Request.arrival_time`, both stamped inside
-    engine core. This is deliberately *not* the front end's TTFT: that one
-    also carries front-end queueing and detokenization, neither of which an
-    eviction policy can move, which dilutes exactly the effect being
-    measured. What is left here — scheduler queueing plus prefill — is the
-    part a cache miss actually pays for.
+    The sample is `Request.first_token_ts - Request.arrival_time`, both
+    stamped inside engine core. This is deliberately *not* the front end's
+    TTFT: that one also carries front-end queueing and detokenization,
+    neither of which an eviction policy can move, which dilutes exactly the
+    effect being measured. What is left — scheduler queueing plus prefill —
+    is the part a cache miss actually pays for.
 
-    It belongs on the `kv_hbm` line because hit rate alone cannot settle the
-    question. A policy can raise hit rate and still lose on latency if the
-    blocks it kept were cheap to rebuild and the ones it dropped were not;
-    `remat_mb` says how much KV was rebuilt, this says what it cost.
+    Every sample is emitted on its own `kv_hbm_ttft` line as it is taken, by
+    `NodeEvictionController.on_request_finished`. This class deliberately
+    keeps no mean, no median and no percentile. Those summaries answer a
+    different question than the one an eviction experiment asks: a mean says
+    what a window cost in aggregate, never what any request saw, and TTFT is
+    heavy-tailed enough that the two routinely disagree. With the samples
+    themselves in the log, any aggregate wanted later can be computed from
+    them — and computed over exactly the request subset being asked about,
+    which no in-process summary fixed at write time can do.
 
-    The mean is cumulative and exact. Percentiles come from a bounded ring of
-    recent samples, because retaining every sample for an exact percentile is
-    unbounded under load and the tail is what matters anyway.
+    What survives here is the count, because two things need it and neither
+    needs a latency: the `kv_hbm` change gate (a window where only latency
+    moved is still worth a line) and the warmup-discard marker.
     """
 
-    def __init__(self, ring_size: int = 4096) -> None:
-        self.ring_size = max(int(ring_size), 0)
-        self._recent: deque = deque(maxlen=self.ring_size or 1)
+    def __init__(self) -> None:
         self.count = 0
-        self.total_ms = 0.0
         self.window_count = 0
-        self.window_total_ms = 0.0
 
-    def record(self, ttft_ms: float) -> None:
+    def record(self, ttft_ms: float) -> bool:
+        """Count one sample; returns whether it was accepted.
+
+        The caller logs the sample only if this says yes, so the one validity
+        rule lives in one place rather than at every call site.
+        """
         if ttft_ms < 0.0:
             # A non-monotonic wall clock can produce this. Dropping is right:
-            # a negative latency in the mean is worse than a missing sample.
-            return
+            # a negative latency in the log is worse than a missing sample.
+            return False
         self.count += 1
-        self.total_ms += ttft_ms
         self.window_count += 1
-        self.window_total_ms += ttft_ms
-        if self.ring_size:
-            self._recent.append(ttft_ms)
-
-    @property
-    def mean_ms(self) -> float:
-        if self.count == 0:
-            return 0.0
-        return self.total_ms / self.count
-
-    @property
-    def window_mean_ms(self) -> float:
-        if self.window_count == 0:
-            return 0.0
-        return self.window_total_ms / self.window_count
-
-    def _percentile(self, q: float) -> float:
-        """Nearest-rank over the retained ring, not the whole run."""
-        if not self._recent:
-            return 0.0
-        ordered = sorted(self._recent)
-        # The smallest sample at or above the qth percentile.
-        idx = min(len(ordered) - 1, int(math.ceil(q * len(ordered))) - 1)
-        return ordered[max(idx, 0)]
-
-    @property
-    def p50_ms(self) -> float:
-        """The median, and the number to read *first*.
-
-        TTFT is heavy-tailed: one 30-second cold prefill in a window of short
-        ones drags the mean somewhere no request actually was. The mean is
-        still the right figure for total work, but it answers "what did this
-        cost in aggregate", not "what did a request see". When the mean and
-        the median disagree by a lot, the mean is describing the tail — and
-        the tail is what `p95_ms` is for.
-
-        Over the same bounded ring as `p95_ms`, so the two are always drawn
-        from the same population and their spread is meaningful. That makes it
-        a median over recent samples, not over the whole run; an exact
-        lifetime median needs every sample retained, which is unbounded under
-        load and is what the ring exists to avoid.
-        """
-        return self._percentile(0.50)
-
-    @property
-    def p95_ms(self) -> float:
-        """Over the retained ring, not the whole run."""
-        return self._percentile(0.95)
+        return True
 
     def reset_window(self) -> None:
         self.window_count = 0
-        self.window_total_ms = 0.0
 
     def reset_measurement(self) -> None:
-        """Drop every sample, including the percentile ring.
-
-        The ring is the reason this exists as a separate call. `p50_ms` and
-        `p95_ms` are nearest-rank over retained samples, so a warmup's cold
-        prefills stay in the tail for the next `ring_size` requests and keep
-        being reported as the measured run's percentiles — which is exactly
-        the number an eviction experiment is trying to read.
-        """
-        self._recent.clear()
+        """Drop every sample, i.e. start a fresh measurement epoch."""
         self.count = 0
-        self.total_ms = 0.0
         self.window_count = 0
-        self.window_total_ms = 0.0
 
     def as_dict(self) -> dict[str, float | int]:
-        return {
-            "ttft_ms": self.mean_ms,
-            "ttft_window_ms": self.window_mean_ms,
-            "ttft_p50_ms": self.p50_ms,
-            "ttft_p95_ms": self.p95_ms,
-            "ttft_n": self.count,
-        }
+        return {"ttft_n": self.count}
 
 
 class EvictionObserver:

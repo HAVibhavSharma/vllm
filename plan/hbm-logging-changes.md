@@ -73,11 +73,8 @@ kv_hbm variant=node_eviction total=24000 used=18342 free=5658 usage=76.4%
 | `regret` | Evictions whose key was requested again within the horizon | always `0.000` |
 | `hit_rate` | Prefix-cache hit rate **in tokens**, since boot | same |
 | `hit_rate_win` | Same, this window only | same |
-| `ttft_ms` | Engine-side time to first token, mean since boot | same |
-| `ttft_win_ms` | Same, this window only | same |
-| `ttft_p50_ms` | Median over the last 4096 samples | same |
-| `ttft_p95_ms` | 95th percentile over the last 4096 samples | same |
-| `ttft_n` | Samples taken, i.e. requests that produced a token | same |
+| `ttft_n` | TTFT samples this epoch, i.e. requests that produced a token. The latencies themselves are on their own `kv_hbm_ttft` lines (§2.1.0) | same |
+| `ttft_win_n` | Same, this window only | same |
 | `hit_tokens` / `query_tokens` | The raw numerator and denominator | same |
 | `external_hit_tokens` | Of the missed tokens, those LMCache served over the connector (§2.1.1) | same |
 | `cold_tokens` | Of the missed tokens, those LMCache could not serve either — the only ones that cost a real prefill (§2.2) | same |
@@ -184,12 +181,40 @@ With no connector configured, `external_hit_tokens == 0` and
 `cold_tokens == query_tokens - hit_tokens` exactly, which is the correct
 degenerate case.
 
-### 2.1.0 `ttft_*` — what the miss cost
+### 2.1.0 `kv_hbm_ttft` — what the miss cost, one line per request
 
 Hit rate says how often the cache worked. It cannot say whether that
 mattered: a policy can raise hit rate and still lose on latency if the blocks
 it kept were cheap to rebuild and the ones it dropped were not. `remat_mb`
-says how much KV was rebuilt; `ttft_*` says what it cost.
+says how much KV was rebuilt; this says what it cost.
+
+**Per request, not aggregated.** Every request that produces a token gets its
+own line:
+
+```
+kv_hbm_ttft variant=node_eviction epoch=2 req=chatcmpl-7f2 ttft_ms=412.7 \
+  query_tokens=1536 hit_tokens=1024 external_hit_tokens=0 cold_tokens=512 \
+  preempted=0 phantom=0
+```
+
+| Field | Meaning |
+|---|---|
+| `variant`, `epoch` | Which arm and which measurement epoch — the same two the `kv_hbm` line carries, so samples can be split on the warmup boundary after the fact |
+| `req` | `Request.request_id` |
+| `ttft_ms` | This request's engine-side TTFT |
+| `query_tokens` | Prompt tokens looked up, i.e. this sample's denominator, captured at lookup time |
+| `hit_tokens` | Of those, served from HBM |
+| `external_hit_tokens` | Of those, served by the connector (§2.1.1) |
+| `cold_tokens` | The rest — the tokens that actually cost a prefill |
+| `preempted` | `Request.num_preemptions`; a nonzero one paid for scheduling pressure, not a cache miss |
+| `phantom` | 1 for a prefetch phantom, excluded from every rate on the `kv_hbm` line but not from this one (§2.1.1) |
+
+The breakdown travels with the latency because the latency alone cannot be
+read: 412 ms is a fast cold prefill or a slow warm one depending entirely on
+how much of the prompt had to be computed, and separating those two is the
+whole question. A request that never reached `get_computed_blocks` has no
+breakdown and reports `-1` rather than `0`, so it cannot be mistaken for a
+genuine all-cold prefill.
 
 **Engine-side, deliberately.** `Request.first_token_ts - Request.arrival_time`,
 both stamped inside engine core — `first_token_ts` in
@@ -206,21 +231,30 @@ Sampled from `KVCacheManager.free`, the only layer still holding the
 request keeps its original `first_token_ts`, so the sample is gated on
 `Request.ttft_recorded` — otherwise slow requests would be weighted by how
 often they were preempted. A request that never produced a token contributes
-nothing rather than a zero.
+nothing rather than a zero. A backwards wall clock would produce a negative
+latency; that sample is dropped and no line is written, because a negative
+latency in the log is worse than a gap in it.
 
-The mean is exact and cumulative; `ttft_p50_ms` and `ttft_p95_ms` come from a
-bounded ring of the last 4096 samples, because retaining every sample for an
-exact percentile is unbounded under load. Both percentiles are drawn from that
-one ring, so the median-to-p95 spread describes a single population.
+**Why no mean, median or percentile on the `kv_hbm` line.** They used to be
+there — `ttft_ms`, `ttft_win_ms`, `ttft_p50_ms`, `ttft_p95_ms`, the last two
+over a 4096-sample ring — and they were removed in favour of the raw samples.
+An aggregate computed in-process is fixed at write time to a window nobody
+chose and to a population nobody selected. TTFT is heavy-tailed enough that
+this routinely matters: nine 100 ms prefills and one 30 s cold miss average to
+3.09 s, which describes none of the ten. With the samples in the log, the
+mean, the median, the p95 and anything else can all be computed afterwards —
+and computed over exactly the requests being asked about: warm only, one job
+only, cold-token-count above some threshold, phantoms excluded. No summary
+fixed at write time can be re-cut that way.
 
-Read all three together. TTFT is heavy-tailed, so the mean can sit somewhere
-no request actually was: nine 100 ms prefills and one 30 s cold miss average
-to 3.09 s, which describes none of the ten. The median says what a typical
-request saw, the p95 says what the worst 5% saw, and the mean says what the
-work cost in aggregate. **A mean that moved without the median is a tail
-effect** — quoting it as "requests got faster" is the specific mistake the
-median was added to prevent. The converse is also a finding: median down with
-the mean flat means the common case improved and one straggler ate the gain.
+What stays on the `kv_hbm` line is `ttft_n` (and `ttft_win_n`), because every
+rate on that line is unreadable without knowing how many requests produced it,
+and because a window in which only latency moved still has to get past the
+line's change gate.
+
+**Cost.** One INFO line per request instead of one per window, which is real
+under load. `NodeEvictionConfig.ttft_per_request_log` turns it off; `ttft_n`
+does not depend on the switch.
 
 ### 2.1.1 Phantoms are excluded, not discarded
 

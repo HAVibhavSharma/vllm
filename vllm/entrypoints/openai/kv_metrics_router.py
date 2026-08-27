@@ -6,9 +6,10 @@ A benchmark that measures KV cache behaviour has to run a warmup pass first,
 or every arm is measured against a cache that happens to be empty. The warmup
 is then inside the numbers, and there is no way to subtract it after the fact:
 
-* `ttft_ms`, `ttft_p50_ms` and `ttft_p95_ms` are computed over retained
-  samples, and a warmup's cold prefills are the tail. The percentiles keep
-  reporting them long after the warmup ended.
+* The per-request `kv_hbm_ttft` lines are stamped with the epoch they were
+  taken in, and a warmup's cold prefills are the whole right tail. Without a
+  boundary in the log there is nothing to filter them on, and any aggregate
+  computed afterwards silently spans both phases.
 * `hit_rate` is cumulative over the life of the server. A cold pass drags it
   down permanently, and by an amount that depends on how long the measured run
   happened to be.

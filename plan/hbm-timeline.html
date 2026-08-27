@@ -234,9 +234,23 @@
 // of data, not a policy with no regret.
 const NUMERIC_FIELDS = new Set([
   "regret","hit_rate",
-  "ttft_ms","ttft_win_ms","ttft_p50_ms","ttft_p95_ms","ttft_n",
+  // The engine stopped putting a TTFT mean, median or percentile on this
+  // line: it now writes one `kv_hbm_ttft` line per request and leaves the
+  // aggregating to whoever is asking. These four stay in the whitelist so a
+  // log recorded before that change still plots — `attachTtftAggregates`
+  // only overwrites them when raw samples were found.
+  "ttft_ms","ttft_win_ms","ttft_p50_ms","ttft_p95_ms",
+  "ttft_n","ttft_win_n",
   "hit_tokens","query_tokens","cold_tokens","external_hit_tokens",
   "evicted_by_score","evicted",
+]);
+
+// The per-request line. Parsed separately from `kv_hbm` because it is a
+// different kind of record: one sample, not a running total, and many of
+// them between any two `kv_hbm` lines.
+const TTFT_SAMPLE_FIELDS = new Set([
+  "ttft_ms","query_tokens","hit_tokens","external_hit_tokens","cold_tokens",
+  "preempted","phantom","epoch",
 ]);
 
 // vLLM's default prefix: `INFO 08-07 12:34:56 [controller.py:600] …`,
@@ -268,9 +282,108 @@ function parseLine(line) {
   return fields;
 }
 
+function parseTtftSample(line) {
+  const at = line.indexOf("kv_hbm_ttft ");
+  if (at < 0) return null;
+  const stamp = parseStamp(line.slice(0, at));
+  const f = {};
+  for (const tok of line.slice(at).split(/\s+/)) {
+    const i = tok.indexOf("=");
+    if (i < 0) continue;
+    const k = tok.slice(0, i);
+    const v = tok.slice(i + 1);
+    f[k] = TTFT_SAMPLE_FIELDS.has(k) ? Number(v) : v;
+  }
+  if (!Number.isFinite(f.ttft_ms)) return null;
+  f._stamp = stamp;
+  return f;
+}
+
+/** Merge two ascending arrays. Keeps `attachTtftAggregates` linear per row. */
+function mergeSorted(a, b) {
+  if (!b.length) return a;
+  if (!a.length) return b.slice();
+  const out = new Array(a.length + b.length);
+  let i = 0, j = 0, k = 0;
+  while (i < a.length && j < b.length) out[k++] = a[i] <= b[j] ? a[i++] : b[j++];
+  while (i < a.length) out[k++] = a[i++];
+  while (j < b.length) out[k++] = b[j++];
+  return out;
+}
+
+/**
+ * Nearest-rank, the same definition the engine used when it still computed
+ * percentiles itself, so a new log and an old one are read on one scale.
+ */
+function percentile(sorted, q) {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1);
+  return sorted[Math.max(idx, 0)];
+}
+
+/**
+ * Fold the per-request samples back into the `kv_hbm` rows, so every panel
+ * downstream keeps reading the same four field names it always did.
+ *
+ * This is the aggregation the engine deliberately stopped doing. Doing it
+ * here rather than there is the entire point: the window boundaries, the
+ * percentile definition and — later — which requests are even in the
+ * population are choices this page makes and can change, instead of choices
+ * frozen at the instant the line was written.
+ *
+ * Only runs when samples were actually found. A log from before the change
+ * carries the engine's own aggregates and is left exactly as parsed; a log
+ * with `ttft_per_request_log` turned off has neither, and `missingFields`
+ * below says so rather than drawing three empty panels.
+ */
+function attachTtftAggregates(rows, samples) {
+  if (!samples.length) return;
+  let si = 0, cumN = 0, cumSum = 0;
+  let cum = [];   // every sample so far, kept in ascending value order
+  for (let i = 0; i < rows.length; i++) {
+    // Samples up to and including this line's stamp belong to the window it
+    // closes. Stamps are second-resolution, so a request that finished in the
+    // same second as the line can land either side of the boundary; over a
+    // 30s window that is noise, and it cannot move the cumulative figures.
+    const win = [];
+    while (si < samples.length && samples[si].t <= rows[i].t) {
+      win.push(samples[si].ttft_ms);
+      cumSum += samples[si].ttft_ms;
+      cumN++;
+      si++;
+    }
+    // A window with no finished request keeps the engine's zero-denominator
+    // convention, which `windowSeries` already reads as an absence via
+    // `ttft_n` rather than plotting it as a latency.
+    win.sort((a, b) => a - b);
+    rows[i].ttft_win_ms = win.length ? win.reduce((a, b) => a + b, 0) / win.length : 0;
+    rows[i].ttft_ms = cumN ? cumSum / cumN : 0;
+    // Over every sample so far, not a bounded ring: the engine capped its
+    // ring at 4096 because retaining more in-process is unbounded under load,
+    // and that constraint does not exist here — the whole log is already in
+    // memory. `cum` is kept sorted by merging each window in rather than
+    // re-sorting it per row, which would be O(rows · n log n) on a log with
+    // one line per request.
+    cum = mergeSorted(cum, win);
+    rows[i].ttft_p50_ms = percentile(cum, 0.50);
+    rows[i].ttft_p95_ms = percentile(cum, 0.95);
+    // Overwrites the engine's count with the number of samples actually
+    // found. The two agree unless the log was truncated at the head, and when
+    // they disagree it is this one the panels above are drawn from.
+    rows[i].ttft_n = cumN;
+  }
+}
+
 function parseRun(text) {
   const rows = [];
+  const samples = [];
   for (const line of text.split(/\r?\n/)) {
+    // Order matters: `kv_hbm_ttft` also contains `kv_hbm`, but `parseLine`
+    // looks for `"kv_hbm "` with the trailing space, so the two cannot be
+    // confused. Checked sample-first anyway, so that stays true by
+    // construction rather than by a space in a string literal.
+    const t = parseTtftSample(line);
+    if (t) { samples.push(t); continue; }
     const f = parseLine(line);
     if (f) rows.push(f);
   }
@@ -279,27 +392,44 @@ function parseRun(text) {
   // Absolute stamps -> elapsed seconds from this run's first line. The two
   // runs happened at different wall-clock times; comparing them on absolute
   // time puts two disjoint traces on one axis.
+  //
+  // Rows and samples are normalised together, in file order: they interleave,
+  // and running the day-roll correction over each sequence separately would
+  // let one of them roll a day the other did not.
+  const merged = rows.concat(samples).sort((a, b) => a._stamp - b._stamp);
   let base = null, prev = null, dayRoll = 0;
-  const haveStamps = rows.every(r => r._stamp !== null);
-  rows.forEach((r, i) => {
-    if (haveStamps) {
+  const haveStamps = rows.every(r => r._stamp !== null) &&
+                     samples.every(r => r._stamp !== null);
+  if (haveStamps) {
+    for (const r of merged) {
       let s = r._stamp + dayRoll;
       if (prev !== null && s < prev - 3600) { dayRoll += 86400; s += 86400; }
       prev = s;
       if (base === null) base = s;
       r.t = s - base;
-    } else {
-      r.t = i * 30;   // no parsable clock: fall back to nominal period
     }
-  });
+  } else {
+    // No parsable clock: fall back to the nominal period for the rows, and
+    // spread the samples evenly through the window each one precedes. Nothing
+    // better is available, and the alternative — dropping them — would empty
+    // the TTFT panels on exactly the logs that are hardest to read.
+    rows.forEach((r, i) => { r.t = i * 30; });
+    const per = samples.length / Math.max(rows.length, 1);
+    samples.forEach((r, i) => { r.t = (i / Math.max(per, 1e-9)) * 30; });
+  }
+  samples.sort((a, b) => a.t - b.t);
+  attachTtftAggregates(rows, samples);
 
   const variant = rows[0].variant;
-  // `ttft_p50_ms` is here so a log written before the median was added says so
-  // instead of drawing panel 3 empty and leaving the reader to guess whether
-  // the median was zero or absent.
+  // `ttft_ms` is here so a log with no TTFT at all — no per-request lines and
+  // no engine-side aggregate — says so instead of drawing three empty panels
+  // and leaving the reader to guess whether the latency was zero or absent.
   const missing = ["hit_rate", "ttft_ms", "ttft_p50_ms", "regret"]
     .filter(k => rows[0][k] === undefined);
-  return { variant, rows, syntheticTime: !haveStamps, missingFields: missing };
+  return {
+    variant, rows, ttftSamples: samples,
+    syntheticTime: !haveStamps, missingFields: missing,
+  };
 }
 
 /* ==================================================================== *
@@ -490,12 +620,13 @@ function num(v) { return Number.isFinite(v) ? v : 0; }
 /**
  * Every rate on the line is guarded by a zero-denominator check in the engine
  * and returns a literal `0.0` when it has nothing to divide — `hit_rate` with
- * no queries, `ttft_*` with no samples, `regret` with no scored eviction yet
- * (`metrics.py:358`, `:151`). Those zeros are absences, and the real logs are
- * full of them: `baseline.kv_hbm` prints `hit_rate=0.0000 query_tokens=0` on
- * its first line and `ttft_win_ms=0.0 ttft_n=11` on two more. Plotted, each
- * one is a cliff to the floor that the server never experienced — and it drags
- * the auto-fitted axis down with it. `requireField` names the denominator; a
+ * no queries, `regret` with no scored eviction yet (`metrics.py:358`, `:151`).
+ * `attachTtftAggregates` follows the same convention for a window in which no
+ * request finished. Those zeros are absences, and the real logs are full of
+ * them: `baseline.kv_hbm` prints `hit_rate=0.0000 query_tokens=0` on its first
+ * line and windows with `ttft_n` unmoved on many more. Plotted, each one is a
+ * cliff to the floor that the server never experienced — and it drags the
+ * auto-fitted axis down with it. `requireField` names the denominator; a
  * sample where it has not moved becomes a break in the line, not a zero.
  */
 function levelSeries(rows, field, requireField) {
@@ -535,8 +666,8 @@ function windowSeries(rows, field, requireField) {
     if (!(t1 > t0)) continue;
     // The line is change-gated on a fingerprint that includes evictions and
     // query tokens, so it prints for windows in which no request finished at
-    // all. Those windows carry `ttft_win_ms=0.0` — the zero-denominator guard
-    // value, not a latency. Break the line rather than plot the zero.
+    // all. Those windows get `ttft_win_ms=0` from `attachTtftAggregates` —
+    // an empty sample set, not a latency. Break the line rather than plot it.
     const moved = requireField === undefined ||
       num(rows[i][requireField]) - (i > 0 ? num(rows[i - 1][requireField]) : 0) > 0;
     if (!moved) { pts.push(null); continue; }
@@ -1424,8 +1555,10 @@ function buildBanners() {
   }
   if (loaded.every(s => num(last(S.runs[s]).ttft_n) === 0)) {
     add(`<b>No TTFT samples in any run</b> — <code>ttft_n=0</code>. Either ` +
-        `no request produced a token, or the logs predate the field. ` +
-        `Panels 2 and 3 will be flat.`);
+        `no request produced a token, or the run was logged with ` +
+        `<code>ttft_per_request_log</code> off, which suppresses the ` +
+        `<code>kv_hbm_ttft</code> lines panels 2–4 are computed from. ` +
+        `Panels 2, 3 and 4 will be flat.`);
   }
 
   for (const r of loaded.map(s => S.runs[s])) {
@@ -1466,15 +1599,15 @@ function panelDefs() {
                   fmtMs(num(s.ttft_ms)) + " over " + fmtNum(num(s.ttft_n), 0) + ")",
   },
   { id: "ttftP50",
-    title: "3 · TTFT median (last 4096 requests)",
-    why: "What a <i>typical</i> request saw. TTFT is heavy-tailed, so panel 2's mean can sit somewhere no request actually was — one cold prefill among short ones moves it and the median not at all. Read the two together: median down with the mean flat means the common case improved and the tail ate the gain; the mean down with the median flat means one or two slow outliers went away and most requests are unchanged. Same bounded ring as panel 4, so the median-to-p95 spread is drawn from one population. Trailing, not windowed — held forward until the next line.",
+    title: "3 · TTFT median (cumulative)",
+    why: "What a <i>typical</i> request saw. TTFT is heavy-tailed, so panel 2's mean can sit somewhere no request actually was — one cold prefill among short ones moves it and the median not at all. Read the two together: median down with the mean flat means the common case improved and the tail ate the gain; the mean down with the median flat means one or two slow outliers went away and most requests are unchanged. Computed here, on this page, from the raw <code>kv_hbm_ttft</code> samples — over every sample so far, not a bounded ring, and over the same population as panel 4 so the median-to-p95 spread is one distribution. Trailing, not windowed — held forward until the next line.",
     kind: "line", clampLo: 0, fmtY: fmtMs,
     series: run => [{ points: levelSeries(run.rows, "ttft_p50_ms", "ttft_n") }],
     readout: s => fmtMs(num(s.ttft_p50_ms)),
   },
   { id: "ttftP95",
-    title: "4 · TTFT p95 (last 4096 requests)",
-    why: "The tail, which the mean hides. A policy that destroys one large prefix can hold the mean flat and still make a minority of requests much worse. A trailing quantity, not a window one — it is the p95 over the last 4096 requests as of each line, so it is held forward until the next.",
+    title: "4 · TTFT p95 (cumulative)",
+    why: "The tail, which the mean hides. A policy that destroys one large prefix can hold the mean flat and still make a minority of requests much worse. A trailing quantity, not a window one — the p95 over every request finished up to each line, so it is held forward until the next.",
     kind: "line", clampLo: 0, fmtY: fmtMs,
     series: run => [{ points: levelSeries(run.rows, "ttft_p95_ms", "ttft_n") }],
     readout: s => fmtMs(num(s.ttft_p95_ms)),
@@ -1766,7 +1899,7 @@ window.addEventListener("resize", () => {
 document.getElementById("demo").addEventListener("click", () => {
   const mk = (variant, seed) => {
     const lines = [];
-    let hitT = 0, qT = 0, ttftN = 0, ttftSum = 0, evicted = 0;
+    let hitT = 0, qT = 0, ttftN = 0, evicted = 0;
     // The cache fills before it evicts, so both arms run clean for a while
     // and the red rule has somewhere to sit.
     const evictFrom = variant === "baseline" ? 12 : variant === "continuum" ? 14 : 15;
@@ -1781,23 +1914,35 @@ document.getElementById("demo").addEventListener("click", () => {
       hitT += Math.round(q * hw);
       const ttftWin = ttftBase * (0.85 + 0.5 * load);
       const nWin = Math.round(14 * load);
-      ttftN += nWin; ttftSum += ttftWin * nWin;
+      ttftN += nWin;
       if (i >= evictFrom) evicted += Math.round(220 * load);
       const stamp = `INFO 08-07 ${String(t.getUTCHours()).padStart(2,"0")}:` +
                     `${String(t.getUTCMinutes()).padStart(2,"0")}:` +
                     `${String(t.getUTCSeconds()).padStart(2,"0")} [controller.py:600]`;
+      // The engine writes one `kv_hbm_ttft` line per request and no latency
+      // aggregate at all, so the demo has to as well — otherwise it would
+      // exercise the backward-compatibility path instead of the real one.
+      // Log-normal-ish by construction: most requests near the window's
+      // centre, a few multiples above it, which is the shape a prefill
+      // latency actually has and the reason the page computes a median.
+      for (let k = 0; k < nWin; k++) {
+        const tail = k === nWin - 1 ? 3.4 : 0.75 + 0.5 * ((k * 7 + i) % 5) / 4;
+        const ms = ttftWin * tail;
+        const cold = Math.round((q / Math.max(nWin, 1)) * (1 - hw));
+        lines.push(
+          `${stamp} kv_hbm_ttft variant=${variant} epoch=1 req=demo-${i}-${k} ` +
+          `ttft_ms=${ms.toFixed(1)} query_tokens=${Math.round(q/Math.max(nWin,1))} ` +
+          `hit_tokens=${Math.round(q/Math.max(nWin,1)) - cold} ` +
+          `external_hit_tokens=0 cold_tokens=${cold} preempted=0 phantom=0`
+        );
+      }
       // Only the fields this page reads; a real line carries many more.
       lines.push(
         `${stamp} kv_hbm variant=${variant} evicted=${evicted} ` +
         `evicted_by_score=${variant==="baseline"?0:Math.round(evicted*0.97)} ` +
         `regret=${variant==="baseline"?"0.000":(0.09+0.02*Math.sin(i/5)).toFixed(3)} ` +
         `hit_rate=${(hitT/qT).toFixed(4)} hit_rate_win=${hw.toFixed(4)} ` +
-        `ttft_ms=${(ttftSum/Math.max(ttftN,1)).toFixed(1)} ` +
-        `ttft_win_ms=${ttftWin.toFixed(1)} ` +
-        // Median below the mean and well below the p95, which is the shape a
-        // right-skewed latency actually has.
-        `ttft_p50_ms=${(ttftWin*0.82).toFixed(1)} ` +
-        `ttft_p95_ms=${(ttftWin*1.9).toFixed(1)} ttft_n=${ttftN} ` +
+        `ttft_n=${ttftN} ttft_win_n=${nWin} ` +
         `hit_tokens=${hitT} query_tokens=${qT}`
       );
     }
