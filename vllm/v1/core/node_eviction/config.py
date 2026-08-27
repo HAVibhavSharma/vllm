@@ -405,6 +405,24 @@ class NodeEvictionConfig:
     rather than in an experiment; the sample count on the `kv_hbm` line does
     not depend on this."""
 
+    ttft_chat_completions_only: bool = True
+    """Take a TTFT sample only from requests that arrived on
+    `/v1/chat/completions` (identified by the `chatcmpl-` request-id prefix
+    the OpenAI front end sets), and never from a phantom prefetch.
+
+    On by default because everything else the engine admits answers a
+    different question. A phantom prefetch, an APC warming submission or a
+    raw `/v1/completions` call has no user waiting on its first token, and
+    the warming traffic is *originated by the policy being measured* — folded
+    into one figure it lets a policy improve its own TTFT by issuing more of
+    the requests it is cheap at. Set False to sample every request that
+    produces a token, e.g. when the run is not driven through the chat API at
+    all.
+
+    Applies to both the per-request `kv_hbm_ttft` lines and the `ttft_n` /
+    `ttft_win_n` counts on the `kv_hbm` line, so the two stay one
+    population."""
+
     hbm_summary_top_keys: int = 5
     """How many `job_id:node` keys the HBM line names as eviction sources.
     Counted per window and reset after each line, which is also what bounds

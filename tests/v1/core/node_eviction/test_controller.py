@@ -1359,6 +1359,9 @@ def test_a_newly_worse_key_still_reaches_the_head():
 
 
 def _ttft_request(arrival: float, first_token: float | None, **kw):
+    # Chat-shaped by default: TTFT is sampled only from `/v1/chat/completions`
+    # requests, which the engine recognises by this id prefix.
+    kw.setdefault("request_id", "chatcmpl-t0")
     req = make_request(**kw)
     req.arrival_time = arrival
     req.first_token_ts = first_token
@@ -1395,14 +1398,14 @@ def test_the_per_request_line_carries_the_raw_latency():
     """The whole point of the per-request line: the number in it is one
     request's own TTFT, not a mean anything was folded into."""
     controller = make_controller(FakePool())
-    req = _ttft_request(1000.0, 1000.5, request_id="req-7")
+    req = _ttft_request(1000.0, 1000.5, request_id="chatcmpl-7")
     controller.on_cache_query(num_tokens=1536, num_hits=1024, request=req)
 
     line = controller._ttft_line(req, 500.0)
     fields = _fields(line)
 
     assert line.startswith("kv_hbm_ttft ")
-    assert fields["req"] == "req-7"
+    assert fields["req"] == "chatcmpl-7"
     assert float(fields["ttft_ms"]) == 500.0
     assert fields["query_tokens"] == "1536"
     assert fields["hit_tokens"] == "1024"
@@ -1479,12 +1482,12 @@ def _captured_ttft_lines(monkeypatch, controller, request) -> list[str]:
 
 def test_finishing_a_request_writes_its_own_line(monkeypatch):
     controller = make_controller(FakePool())
-    req = _ttft_request(1000.0, 1000.5, request_id="req-9")
+    req = _ttft_request(1000.0, 1000.5, request_id="chatcmpl-9")
     lines = _captured_ttft_lines(monkeypatch, controller, req)
 
     assert len(lines) == 1
     fields = _fields(lines[0])
-    assert fields["req"] == "req-9"
+    assert fields["req"] == "chatcmpl-9"
     assert float(fields["ttft_ms"]) == 500.0
 
 
@@ -1496,6 +1499,53 @@ def test_the_per_request_line_can_be_turned_off(monkeypatch):
     lines = _captured_ttft_lines(monkeypatch, controller, req)
 
     assert lines == []
+    assert controller.ttft.count == 1
+
+
+def test_only_chat_completions_are_sampled(monkeypatch):
+    """A request the OpenAI front end did not create for
+    `/v1/chat/completions` has no user waiting on its first token — a warming
+    submission, a raw `generate` call — so it is neither counted nor logged.
+    """
+    controller = make_controller(FakePool())
+    req = _ttft_request(1000.0, 1000.5, request_id="warmup-3")
+
+    lines = _captured_ttft_lines(monkeypatch, controller, req)
+
+    assert lines == []
+    assert controller.ttft.count == 0
+
+
+def test_the_n_greater_than_one_sub_requests_are_still_chat_completions():
+    """`n>1` splits one chat completion into `chatcmpl-<id>_<i>`. Those are
+    the same user's wait and must not fall out of the population."""
+    controller = make_controller(FakePool())
+    controller.on_request_finished(
+        _ttft_request(1000.0, 1000.5, request_id="chatcmpl-abc_1")
+    )
+    assert controller.ttft.count == 1
+
+
+def test_a_phantom_prefetch_is_never_sampled():
+    """Phantoms are latency the policy originated rather than latency a
+    request paid, and one submitted under a chat-shaped id must not sneak
+    into the population through the prefix."""
+    controller = make_controller(FakePool())
+    controller.on_request_finished(
+        _ttft_request(1000.0, 1000.2, request_id="chatcmpl-p", prefetch_only=True)
+    )
+    assert controller.ttft.count == 0
+
+
+def test_the_chat_completions_filter_can_be_turned_off(monkeypatch):
+    """A run not driven through the chat API would otherwise report no TTFT
+    at all."""
+    controller = make_controller(FakePool(), ttft_chat_completions_only=False)
+    req = _ttft_request(1000.0, 1000.5, request_id="warmup-3")
+
+    lines = _captured_ttft_lines(monkeypatch, controller, req)
+
+    assert len(lines) == 1
     assert controller.ttft.count == 1
 
 

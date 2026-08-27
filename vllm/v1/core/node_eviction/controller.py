@@ -101,6 +101,36 @@ def _is_prefetch_only(request) -> bool:
     return bool(params and params.get("prefetch_only"))
 
 
+# What `OpenAIServingChat` prefixes every `/v1/chat/completions` request id
+# with (`chatcmpl-<base id>`, and `chatcmpl-<base id>_<i>` for the `n>1`
+# sub-requests). Nothing else the server admits carries it: `/v1/completions`
+# uses `cmpl-`, the embedding and scoring paths their own prefixes, and a
+# phantom prefetch the `agent_prefetch:` shape.
+_CHAT_COMPLETION_ID_PREFIX = "chatcmpl-"
+
+
+def _is_chat_completion(request) -> bool:
+    """Whether this request came in through `/v1/chat/completions`.
+
+    Decided from the request id because that is the only trace of the
+    entrypoint that survives into engine core — the `Request` carries no
+    route. The prefix is set in one place (`OpenAIServingChat`), so it is as
+    stable as anything available here, but it is a convention rather than a
+    contract: a caller that submits straight to `engine_client.generate` with
+    an id of its own is not counted, which is the intent.
+
+    A phantom prefetch is excluded even when it borrows the shape. It never
+    produces a token a user waited on, so its latency is not TTFT in the
+    sense this measurement is asking about.
+    """
+    if _is_prefetch_only(request):
+        return False
+    request_id = getattr(request, "request_id", None)
+    return isinstance(request_id, str) and request_id.startswith(
+        _CHAT_COMPLETION_ID_PREFIX
+    )
+
+
 class NodeEvictionController:
     """Owns the index, the value table and the splice."""
 
@@ -431,8 +461,21 @@ class NodeEvictionController:
         `ttft_recorded`: a preempted request keeps its original
         `first_token_ts`, so emitting it twice would weight slow requests by
         how often they were preempted.
+
+        Only `/v1/chat/completions` requests are sampled, unless
+        `ttft_chat_completions_only` is off — see that setting for why the
+        other traffic is a different population.
         """
         if not self.enabled or request.ttft_recorded:
+            return
+        if self.config.ttft_chat_completions_only and not _is_chat_completion(
+            request
+        ):
+            # Not a chat completion, so not a latency a user waited on:
+            # phantom prefetches, cache-warming submissions and the raw
+            # `/v1/completions` path all land here. Counting them mixes two
+            # populations in one figure, and the warming traffic is exactly
+            # the traffic the policy adds, so it would flatter itself.
             return
         first = getattr(request, "first_token_ts", None)
         if first is None:

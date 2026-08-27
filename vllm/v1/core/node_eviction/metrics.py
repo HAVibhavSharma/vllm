@@ -534,7 +534,10 @@ class TTFTTracker:
     """Engine-side time to first token, in ms — one line per request.
 
     The sample is `Request.first_token_ts - Request.arrival_time`, both
-    stamped inside engine core. This is deliberately *not* the front end's
+    stamped inside engine core, and — by default — taken only from requests
+    that arrived on `/v1/chat/completions`, so the count here and the
+    `kv_hbm_ttft` lines describe the same population
+    (`ttft_chat_completions_only`). This is deliberately *not* the front end's
     TTFT: that one also carries front-end queueing and detokenization,
     neither of which an eviction policy can move, which dilutes exactly the
     effect being measured. What is left — scheduler queueing plus prefill —

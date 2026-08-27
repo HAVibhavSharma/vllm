@@ -209,6 +209,17 @@ kv_hbm_ttft variant=node_eviction epoch=2 req=chatcmpl-7f2 ttft_ms=412.7 \
 | `preempted` | `Request.num_preemptions`; a nonzero one paid for scheduling pressure, not a cache miss |
 | `phantom` | 1 for a prefetch phantom, excluded from every rate on the `kv_hbm` line but not from this one (§2.1.1) |
 
+**Chat completions only.** A line is written only for a request the OpenAI
+front end created for `/v1/chat/completions` (id prefix `chatcmpl-`), and
+never for a phantom prefetch. Everything else the engine admits — APC warming
+submissions, phantoms, raw `/v1/completions` or `engine_client.generate`
+traffic — has no user waiting on its first token, and the warming traffic is
+originated by the policy under test, so folding it in lets a policy improve
+its own TTFT by issuing more of the requests it is cheap at. `ttft_n` on the
+`kv_hbm` line counts the same population. Set
+`ttft_chat_completions_only=False` to sample every request that produces a
+token; `phantom` then stays meaningful and is otherwise always `0`.
+
 The breakdown travels with the latency because the latency alone cannot be
 read: 412 ms is a fast cold prefill or a slow warm one depending entirely on
 how much of the prompt had to be computed, and separating those two is the
