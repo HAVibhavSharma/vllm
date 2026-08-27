@@ -187,6 +187,17 @@ class Request:
         # so a preemption (which frees and re-allocates) cannot double-count.
         self.ttft_recorded = False
 
+        # What the prefix cache answered for *this* request, stashed by
+        # `HBMSummaryLogger.on_cache_query` at the instant it fires. The
+        # per-request `kv_hbm_ttft` line reports them beside the latency,
+        # because a raw TTFT on its own cannot be read: 400 ms is a fast cold
+        # prefill or a slow warm one depending entirely on how much of the
+        # prompt had to be computed. Kept here rather than derived at teardown
+        # because by then `num_tokens` has grown by the decode and
+        # `prefill_stats` may already have been taken.
+        self.hbm_query_tokens: int | None = None
+        self.hbm_local_hit_tokens: int | None = None
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []

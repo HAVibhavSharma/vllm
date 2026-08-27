@@ -34,11 +34,8 @@ EXPECTED_FIELDS = [
     "hit_rate",
     "hit_rate_fresh",
     "hit_rate_win",
-    "ttft_ms",
-    "ttft_win_ms",
-    "ttft_p50_ms",
-    "ttft_p95_ms",
     "ttft_n",
+    "ttft_win_n",
     "hit_tokens",
     "query_tokens",
     "query_tokens_fresh",
@@ -64,17 +61,23 @@ class FakePool:
         return self.free_block_queue.num_free_blocks
 
 
-def make_request(job_id="run-42", node="research"):
+def make_request(job_id="run-42", node="research", request_id="req-0",
+                 prefetch_only=False):
     extra_args = {}
     if job_id is not None:
         extra_args["job_id"] = job_id
     if node is not None:
         extra_args["langgraph_node"] = node
-    return SimpleNamespace(sampling_params=SimpleNamespace(extra_args=extra_args))
+    return SimpleNamespace(
+        request_id=request_id,
+        num_preemptions=0,
+        kv_transfer_params={"prefetch_only": True} if prefetch_only else None,
+        sampling_params=SimpleNamespace(extra_args=extra_args),
+    )
 
 
-def make_logger(pool, period_ms=10_000.0, top_keys=5):
-    return HBMSummaryLogger(pool, period_ms=period_ms, top_keys=top_keys)
+def make_logger(pool, period_ms=10_000.0, top_keys=5, **kw):
+    return HBMSummaryLogger(pool, period_ms=period_ms, top_keys=top_keys, **kw)
 
 
 def parse(line):
@@ -421,18 +424,33 @@ def test_preempted_requeries_are_excluded_from_hit_rate_fresh():
     assert int(fields["query_tokens"]) == 1000
 
 
-def _ttft_request(arrival: float, first_token: float | None):
-    req = make_request()
+def _ttft_request(arrival: float, first_token: float | None, **kw):
+    req = make_request(**kw)
     req.arrival_time = arrival
     req.first_token_ts = first_token
     req.ttft_recorded = False
     return req
 
 
+def _captured_ttft_lines(monkeypatch, logger, request):
+    """`vllm`'s root logger sets `propagate=False`, so `caplog` sees nothing
+    here — the module logger has to be intercepted directly."""
+    from vllm.v1.core import hbm_summary as hbm_summary_module
+
+    lines = []
+    monkeypatch.setattr(
+        hbm_summary_module.logger,
+        "info",
+        lambda fmt, *args: lines.append(fmt % args if args else fmt),
+    )
+    logger.on_request_finished(request)
+    return [ln for ln in lines if ln.startswith("kv_hbm_ttft ")]
+
+
 def test_ttft_is_recorded_once_per_request():
     """`KVCacheManager.free` also runs on preemption, and a preempted request
-    keeps its original `first_token_ts`. Counting it twice would weight slow
-    requests by how often they were preempted. Must match the policy branch."""
+    keeps its original `first_token_ts`. Emitting it twice would weight slow
+    requests by how often they were preempted."""
     logger = make_logger(FakePool())
     req = _ttft_request(arrival=1000.0, first_token=1000.25)
 
@@ -440,54 +458,111 @@ def test_ttft_is_recorded_once_per_request():
     logger.on_request_finished(req)
 
     assert logger.ttft_count == 1
-    assert logger.ttft_mean_ms == 250.0
 
 
 def test_a_request_with_no_first_token_contributes_nothing():
     """Aborted before prefill finished — no prefill latency to attribute, and
-    a zero would drag the mean down."""
+    a zero would read as an instant response."""
     logger = make_logger(FakePool())
     logger.on_request_finished(_ttft_request(1000.0, None))
     assert logger.ttft_count == 0
 
 
-def test_ttft_p95_is_over_the_ring():
+def test_finishing_a_request_writes_its_own_line(monkeypatch):
+    """The whole point: the number in the log is one request's own TTFT, not
+    a mean anything was folded into."""
     logger = make_logger(FakePool())
-    for ms in range(1, 101):
-        logger.on_request_finished(_ttft_request(0.0, ms / 1000.0))
-    assert logger.ttft_count == 100
-    assert logger.ttft_mean_ms == pytest.approx(50.5)
-    assert logger.ttft_p95_ms == pytest.approx(95.0)
-    assert logger.ttft_p50_ms == pytest.approx(50.0)
+    req = _ttft_request(1000.0, 1000.5, request_id="req-9")
+    logger.on_cache_query(num_tokens=1536, num_hits=1024, request=req)
+    lines = _captured_ttft_lines(monkeypatch, logger, req)
+
+    assert len(lines) == 1
+    fields = parse(lines[0])
+    assert lines[0].startswith("kv_hbm_ttft variant=baseline ")
+    assert fields["req"] == "req-9"
+    assert float(fields["ttft_ms"]) == 500.0
+    assert fields["query_tokens"] == "1536"
+    assert fields["hit_tokens"] == "1024"
+    assert fields["cold_tokens"] == "512"
+    assert fields["preempted"] == "0"
+    assert fields["phantom"] == "0"
+    # Emitted rather than omitted so a field-by-field diff against the policy
+    # branch's line still lines up; this branch sees no connector answer.
+    assert fields["external_hit_tokens"] == "0"
 
 
-def test_the_summary_line_carries_ttft():
+def test_the_per_request_line_marks_an_unmeasured_lookup(monkeypatch):
+    """A request that never reached `get_computed_blocks` has no breakdown.
+    Reporting -1 keeps it from reading as a genuine all-cold prefill, which is
+    what a 0 here would look like."""
+    logger = make_logger(FakePool())
+    lines = _captured_ttft_lines(monkeypatch, logger, _ttft_request(1000.0, 1000.1))
+    fields = parse(lines[0])
+    assert fields["query_tokens"] == "-1"
+    assert fields["cold_tokens"] == "-1"
+
+
+def test_a_phantom_prefetch_is_flagged_not_hidden(monkeypatch):
+    """Phantoms are out of every rate on the `kv_hbm` line, but their latency
+    is real work warming bought. Dropping it would make warming look free."""
+    logger = make_logger(FakePool())
+    req = _ttft_request(1000.0, 1000.2, prefetch_only=True)
+    lines = _captured_ttft_lines(monkeypatch, logger, req)
+    assert parse(lines[0])["phantom"] == "1"
+
+
+def test_a_phantom_still_gets_its_token_breakdown(monkeypatch):
+    """`on_cache_query` returns early for a phantom, after the stash. Stashing
+    below that return would leave every phantom's line reading -1."""
+    logger = make_logger(FakePool())
+    req = _ttft_request(1000.0, 1000.2, prefetch_only=True)
+    logger.on_cache_query(num_tokens=800, num_hits=300, phantom=True, request=req)
+    fields = parse(logger._ttft_line(req, 200.0))
+    assert fields["query_tokens"] == "800"
+    assert fields["hit_tokens"] == "300"
+    assert fields["cold_tokens"] == "500"
+
+
+def test_the_per_request_line_can_be_turned_off(monkeypatch):
+    """One line per request is real cost under load; `ttft_n` must not depend
+    on the switch."""
+    logger = make_logger(FakePool(), ttft_per_request_log=False)
+    lines = _captured_ttft_lines(monkeypatch, logger, _ttft_request(1000.0, 1000.5))
+
+    assert lines == []
+    assert logger.ttft_count == 1
+
+
+def test_a_backwards_clock_writes_no_line(monkeypatch):
+    """A negative latency in the log is worse than a gap in it, and the sample
+    must not be counted either — `ttft_n` would then stand over a sample
+    nothing can be found for."""
+    logger = make_logger(FakePool())
+    lines = _captured_ttft_lines(monkeypatch, logger, _ttft_request(1000.0, 999.5))
+
+    assert lines == []
+    assert logger.ttft_count == 0
+
+
+def test_the_summary_line_carries_only_the_ttft_count():
+    """The latencies live on their own lines. A mean here would be fixed to a
+    window nobody chose."""
     logger = make_logger(FakePool(), period_ms=10_000.0)
     logger.on_request_finished(_ttft_request(1000.0, 1000.5))
     fields = parse(logger.summary())
-    assert float(fields["ttft_ms"]) == 500.0
-    assert float(fields["ttft_win_ms"]) == 500.0
-    assert float(fields["ttft_p50_ms"]) == 500.0
+
     assert fields["ttft_n"] == "1"
+    assert fields["ttft_win_n"] == "1"
+    for gone in ("ttft_ms", "ttft_win_ms", "ttft_p50_ms", "ttft_p95_ms"):
+        assert gone not in fields, f"{gone} should be off the kv_hbm line"
 
 
-def test_ttft_median_ignores_the_outlier_the_mean_chases():
-    """The reason the median is on the line at all. Nine fast requests and one
-    30s cold prefill: the mean lands at 3s, which is not what any of the ten
-    saw. Mean >> median says the tail moved, not the common case."""
-    logger = make_logger(FakePool())
-    for _ in range(9):
-        logger.on_request_finished(_ttft_request(0.0, 0.1))
-    logger.on_request_finished(_ttft_request(0.0, 30.0))
+def test_ttft_window_count_resets_but_cumulative_does_not():
+    logger = make_logger(FakePool(), period_ms=10_000.0)
+    logger.on_request_finished(_ttft_request(1000.0, 1000.1))
+    logger.maybe_log(1_000_000.0)
 
-    assert logger.ttft_mean_ms == pytest.approx(3090.0)
-    assert logger.ttft_p50_ms == pytest.approx(100.0)
-    assert logger.ttft_p95_ms == pytest.approx(30_000.0)
-
-
-def test_ttft_percentiles_are_zero_before_any_sample():
-    """Not NaN: a NaN poisons every downstream average, and the summary line
-    has to print something on the startup line."""
-    logger = make_logger(FakePool())
-    assert logger.ttft_p50_ms == 0.0
-    assert logger.ttft_p95_ms == 0.0
+    logger.on_request_finished(_ttft_request(2000.0, 2000.3))
+    fields = parse(logger.maybe_log(2_000_000.0))
+    assert fields["ttft_win_n"] == "1"
+    assert fields["ttft_n"] == "2"

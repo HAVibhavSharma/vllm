@@ -25,7 +25,6 @@ blocks" is not actionable; "9k of them belonged to job7:research" says the
 pressure has a source.
 """
 
-import math
 import os
 import time
 from collections import deque
@@ -93,6 +92,7 @@ class HBMSummaryLogger:
         top_keys: int = 5,
         remat_window_blocks: int = 0,
         block_size_bytes: int = 0,
+        ttft_per_request_log: bool = True,
     ) -> None:
         self.block_pool = block_pool
         self.period_ms = period_ms
@@ -128,14 +128,21 @@ class HBMSummaryLogger:
         # stamped inside engine core. Deliberately not the front end's TTFT —
         # that also carries front-end queueing and detokenization, neither of
         # which an eviction policy can move, which dilutes the effect being
-        # measured. Mirrors `node_eviction/metrics.py::TTFTTracker`; the mean
-        # is exact and cumulative, the percentile comes from a bounded ring
-        # because retaining every sample is unbounded under load.
-        self._ttft_recent: deque = deque(maxlen=4096)
+        # measured.
+        #
+        # No mean, no median, no percentile: every sample is emitted on its
+        # own `kv_hbm_ttft` line as it is taken, mirroring
+        # `node_eviction/metrics.py::TTFTTracker`. An aggregate computed here
+        # would be fixed at write time to a window nobody chose and a
+        # population nobody selected, and TTFT is heavy-tailed enough that
+        # this routinely decides the answer. With the samples in the log, any
+        # aggregate can be computed afterwards over exactly the requests being
+        # asked about. Only the count survives, because the `kv_hbm` line's
+        # rates are unreadable without it and because a window in which only
+        # latency moved still has to get past the change gate.
         self.ttft_count = 0
-        self.ttft_total_ms = 0.0
         self.ttft_window_count = 0
-        self.ttft_window_total_ms = 0.0
+        self.ttft_per_request_log = ttft_per_request_log
 
         self._reset_totals()
 
@@ -218,11 +225,20 @@ class HBMSummaryLogger:
             window = int(os.environ.get("VLLM_HBM_REMAT_WINDOW_BLOCKS", "0"))
         except ValueError:
             window = 0
+        # One INFO line per request instead of one per window, which is real
+        # cost under load. On by default because it is now the only place TTFT
+        # is reported; `ttft_n` on the `kv_hbm` line does not depend on it.
+        per_request = os.environ.get("VLLM_HBM_TTFT_PER_REQUEST", "1") not in (
+            "0",
+            "false",
+            "False",
+        )
         return cls(
             block_pool,
             period_ms,
             max(top_keys, 0),
             remat_window_blocks=max(window, 0),
+            ttft_per_request_log=per_request,
         )
 
     # -- hooks from BlockPool ---------------------------------------------
@@ -250,6 +266,7 @@ class HBMSummaryLogger:
         num_hits: int,
         preempted: bool = False,
         phantom: bool = False,
+        request=None,
     ) -> None:
         """One prefix-cache lookup, from `KVCacheManager.get_computed_blocks`.
 
@@ -267,6 +284,15 @@ class HBMSummaryLogger:
         may originate a different number of phantoms, either direction shows
         up as a policy difference that never happened.
         """
+        if request is not None:
+            # Stashed for this request's own `kv_hbm_ttft` line, phantom or
+            # not: a phantom's latency is real work, and the line flags it
+            # rather than dropping it. Taken here, while both figures are
+            # still the prompt's — `num_tokens` grows with the decode, so
+            # reading it at teardown would report a different denominator
+            # than the one the hit was measured against.
+            request.hbm_query_tokens = num_tokens
+            request.hbm_local_hit_tokens = num_hits
         if phantom:
             self.phantom_query_tokens += num_tokens
             self.phantom_hit_tokens += num_hits
@@ -282,9 +308,15 @@ class HBMSummaryLogger:
     def on_request_finished(self, request) -> None:
         """`KVCacheManager.free` — the request is done with its blocks.
 
+        Emits this request's own TTFT, on its own line. Not an average: the
+        `kv_hbm` line carries only how many samples were taken, and the
+        samples themselves live here, one per request, so any aggregate can be
+        computed afterwards over whichever subset of requests is actually
+        being asked about.
+
         Called on preemption too, which is why the sample is gated on
         `ttft_recorded`: a preempted request keeps its original
-        `first_token_ts`, so counting it twice would weight slow requests by
+        `first_token_ts`, so emitting it twice would weight slow requests by
         how often they were preempted.
         """
         if request.ttft_recorded:
@@ -298,55 +330,56 @@ class HBMSummaryLogger:
         ttft_ms = (first - request.arrival_time) * 1000.0
         if ttft_ms < 0.0:
             # A non-monotonic wall clock can produce this. Dropping is right:
-            # a negative latency in the mean is worse than a missing sample.
+            # a negative latency in the log is worse than a missing sample,
+            # and it must not be counted either — `ttft_n` would then stand
+            # over a sample nothing can be found for.
             return
         self.ttft_count += 1
-        self.ttft_total_ms += ttft_ms
         self.ttft_window_count += 1
-        self.ttft_window_total_ms += ttft_ms
-        self._ttft_recent.append(ttft_ms)
+        if self.ttft_per_request_log:
+            logger.info("%s", self._ttft_line(request, ttft_ms))
 
-    @property
-    def ttft_mean_ms(self) -> float:
-        if self.ttft_count == 0:
-            return 0.0
-        return self.ttft_total_ms / self.ttft_count
+    def _ttft_line(self, request, ttft_ms: float) -> str:
+        """One request's TTFT, in the same key=value shape as `kv_hbm`.
 
-    @property
-    def ttft_window_mean_ms(self) -> float:
-        if self.ttft_window_count == 0:
-            return 0.0
-        return self.ttft_window_total_ms / self.ttft_window_count
+        The token breakdown travels with the latency because the latency alone
+        cannot be read: 400 ms is a fast cold prefill or a slow warm one
+        depending on how much of the prompt had to be computed, and separating
+        those is the whole question. `preempted` is here for the same reason —
+        a preempted request keeps its first `first_token_ts`, so its sample is
+        real, but it was paid for by scheduling pressure rather than a miss.
 
-    def _ttft_percentile(self, q: float) -> float:
-        """Nearest-rank over the retained ring, not the whole run."""
-        if not self._ttft_recent:
-            return 0.0
-        ordered = sorted(self._ttft_recent)
-        # The smallest sample at or above the qth percentile.
-        idx = min(len(ordered) - 1, int(math.ceil(q * len(ordered))) - 1)
-        return ordered[max(idx, 0)]
-
-    @property
-    def ttft_p50_ms(self) -> float:
-        """The median, and the number to read *first*.
-
-        TTFT is heavy-tailed: one cold prefill in a window of short ones drags
-        the mean somewhere no request actually was. The mean still answers
-        "what did this cost in aggregate"; the median answers "what did a
-        request see". When they disagree by a lot, the mean is describing the
-        tail — which is what `ttft_p95_ms` is for.
-
-        Over the same ring as `ttft_p95_ms`, so the two are drawn from one
-        population and their spread means something. Mirrors
-        `node_eviction/metrics.py::TTFTTracker.p50_ms`.
+        Identical in shape to the policy branch's line, field for field, for
+        the same reason the `kv_hbm` line is: the arms are meant to be diffed.
+        `external_hit_tokens` is always 0 here — this branch has no hook that
+        sees the connector's answer — and is emitted rather than omitted so a
+        field-by-field diff still lines up.
         """
-        return self._ttft_percentile(0.50)
-
-    @property
-    def ttft_p95_ms(self) -> float:
-        """Over the retained ring, not the whole run."""
-        return self._ttft_percentile(0.95)
+        query = getattr(request, "hbm_query_tokens", None)
+        local = getattr(request, "hbm_local_hit_tokens", None) or 0
+        if query is None:
+            # No lookup was ever recorded for this request — it never reached
+            # `get_computed_blocks`. Reporting -1 rather than 0 keeps it from
+            # reading as a genuine all-cold prefill.
+            query = local = -1
+            cold = -1
+        else:
+            cold = max(query - local, 0)
+        return (
+            "kv_hbm_ttft variant=baseline "
+            f"epoch={self.metrics_epoch} "
+            f"req={getattr(request, 'request_id', '-')} "
+            f"ttft_ms={ttft_ms:.1f} "
+            f"query_tokens={query} "
+            f"hit_tokens={local} "
+            f"external_hit_tokens=0 "
+            f"cold_tokens={cold} "
+            f"preempted={getattr(request, 'num_preemptions', 0)} "
+            # Phantom prefetches are out of every rate on the `kv_hbm` line,
+            # so their latency is flagged rather than dropped: it is real work
+            # warming bought, and hiding it would make warming look free.
+            f"phantom={int(is_prefetch_only(request))}"
+        )
 
     def on_reset_prefix_cache(self) -> None:
         # Every hash in the pool was just invalidated, so every claim here is
@@ -495,14 +528,13 @@ class HBMSummaryLogger:
             f"hit_rate={self.hit_rate:.4f} "
             f"hit_rate_fresh={self.hit_rate_fresh:.4f} "
             f"hit_rate_win={self.window_hit_rate:.4f} "
-            # Engine-side TTFT — what a miss cost, next to how often it
-            # happened. Hit rate alone cannot separate a policy that kept
-            # cheap-to-rebuild blocks from one that kept expensive ones.
-            f"ttft_ms={self.ttft_mean_ms:.1f} "
-            f"ttft_win_ms={self.ttft_window_mean_ms:.1f} "
-            f"ttft_p50_ms={self.ttft_p50_ms:.1f} "
-            f"ttft_p95_ms={self.ttft_p95_ms:.1f} "
+            # How many TTFT samples stand behind this epoch — not what they
+            # were. The latencies are on their own `kv_hbm_ttft` lines, one
+            # per request, because an average computed here is fixed at write
+            # time to a window nobody chose and TTFT is heavy-tailed enough
+            # that such an average routinely describes no request in it.
             f"ttft_n={self.ttft_count} "
+            f"ttft_win_n={self.ttft_window_count} "
             f"hit_tokens={self.hit_tokens} "
             f"query_tokens={self.query_tokens} "
             f"query_tokens_fresh={self.query_tokens_fresh} "
@@ -547,8 +579,9 @@ class HBMSummaryLogger:
 
         The workload calls this over `POST /v1/kv_metrics/reset` once its
         warmup has populated the caches. A warmup pass corrupts every headline
-        number three separate ways: the TTFT mean, median and p95 carry cold
-        prefills no measured request paid; the hit rate is cumulative, so a
+        number three separate ways: the `kv_hbm_ttft` samples carry cold
+        prefills no measured request paid, and nothing but the epoch stamp
+        separates them; the hit rate is cumulative, so a
         cold pass drags it down for the rest of the run; and the elapsed
         window behind any rate starts at server boot rather than at the first
         measured request.
@@ -593,14 +626,11 @@ class HBMSummaryLogger:
         self._reset_totals()
         self.evictions_total = 0
         self._evictions_by_key.clear()
-        # Percentiles are nearest-rank over the retained ring, so without this
-        # the warmup's cold prefills stay in the tail — and keep being
-        # reported as the measured run's p95 — for the next 4096 requests.
-        self._ttft_recent.clear()
+        # The samples themselves are already in the log, stamped with the
+        # epoch they were taken in; this is what stops the next epoch's first
+        # line from claiming a count that belongs to the warmup.
         self.ttft_count = 0
-        self.ttft_total_ms = 0.0
         self.ttft_window_count = 0
-        self.ttft_window_total_ms = 0.0
 
         self.metrics_epoch += 1
         self._epoch_started_monotonic = time.monotonic()
@@ -625,10 +655,11 @@ class HBMSummaryLogger:
             # started with an empty HBM cache and one that inherited a full
             # one are not the same measurement.
             f"hbm_flushed={hbm_flushed} "
+            # How many TTFT samples the discarded epoch held. Their latencies
+            # are not summarised here — they were already logged one per
+            # request, under the epoch this marker is retiring, which is what
+            # makes them separable afterwards.
             f"discarded_ttft_n={discarded['ttft_n']} "
-            f"discarded_ttft_ms={discarded['ttft_ms']:.1f} "
-            f"discarded_ttft_p50_ms={discarded['ttft_p50_ms']:.1f} "
-            f"discarded_ttft_p95_ms={discarded['ttft_p95_ms']:.1f} "
             f"discarded_hit_rate={discarded['hit_rate']:.4f} "
             f"discarded_query_tokens={discarded['query_tokens']} "
             f"discarded_evicted={discarded['evictions_total']}"
@@ -687,7 +718,6 @@ class HBMSummaryLogger:
         self.window_hit_tokens = 0
         self.window_query_tokens = 0
         self.ttft_window_count = 0
-        self.ttft_window_total_ms = 0.0
         return line
 
     def stats(self) -> dict[str, float | int]:
@@ -708,11 +738,8 @@ class HBMSummaryLogger:
             "hit_rate": self.hit_rate,
             "hit_rate_window": self.window_hit_rate,
             "hit_rate_fresh": self.hit_rate_fresh,
-            "ttft_ms": self.ttft_mean_ms,
-            "ttft_window_ms": self.ttft_window_mean_ms,
-            "ttft_p50_ms": self.ttft_p50_ms,
-            "ttft_p95_ms": self.ttft_p95_ms,
             "ttft_n": self.ttft_count,
+            "ttft_window_n": self.ttft_window_count,
             "hit_tokens": self.hit_tokens,
             "query_tokens": self.query_tokens,
             "hit_tokens_fresh": self.hit_tokens_fresh,

@@ -262,6 +262,10 @@ class KVCacheManager:
                 # `/v1/agents/prefetch` warming is not demand the cache
                 # served, so it is routed out of the headline hit rate.
                 phantom=is_prefetch_only(request),
+                # Stashed on the request for its own `kv_hbm_ttft` line: a raw
+                # TTFT cannot be read without knowing how much of the prompt
+                # was cold.
+                request=request,
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
