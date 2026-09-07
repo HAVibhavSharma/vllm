@@ -78,15 +78,6 @@ class EvictionCounters:
     speculative_blocks_created: int = 0
     speculative_evicted_before_confirm: int = 0
 
-    # Prefetch origination (02 §4, step 6).
-    prefetch_wants_created: int = 0
-    prefetch_wants_dropped: int = 0
-    prefetch_wants_drained: int = 0
-    prefetch_wants_satisfied: int = 0
-    prefetch_wants_expired: int = 0
-    prefetch_wants_pending: int = 0
-    prefetch_wants_outstanding: int = 0
-
     snapshot_stale_seconds: float = 0.0
     snapshot_revision: int = 0
     index_keys: int = 0
@@ -124,14 +115,6 @@ class EvictionCounters:
                 self.speculative_evicted_before_confirm
             ),
             "speculative_waste": self.speculative_waste,
-            "prefetch_wants_created": self.prefetch_wants_created,
-            "prefetch_wants_dropped": self.prefetch_wants_dropped,
-            "prefetch_wants_drained": self.prefetch_wants_drained,
-            "prefetch_wants_satisfied": self.prefetch_wants_satisfied,
-            "prefetch_wants_expired": self.prefetch_wants_expired,
-            "prefetch_wants_pending": self.prefetch_wants_pending,
-            "prefetch_wants_outstanding": self.prefetch_wants_outstanding,
-            "prefetch_want_hit_rate": self.prefetch_want_hit_rate,
             "score_outcome_correlation": self.score_outcome_correlation,
             "snapshot_stale_seconds": self.snapshot_stale_seconds,
             "snapshot_revision": self.snapshot_revision,
@@ -173,11 +156,6 @@ class EvictionCounters:
         self.speculative_confirmed = 0
         self.speculative_blocks_created = 0
         self.speculative_evicted_before_confirm = 0
-        self.prefetch_wants_created = 0
-        self.prefetch_wants_dropped = 0
-        self.prefetch_wants_drained = 0
-        self.prefetch_wants_satisfied = 0
-        self.prefetch_wants_expired = 0
         self.needed_score_sum = 0.0
         self.needed_count = 0
         self.not_needed_score_sum = 0.0
@@ -215,21 +193,6 @@ class EvictionCounters:
             self.speculative_evicted_before_confirm
             / self.speculative_blocks_created
         )
-
-    @property
-    def prefetch_want_hit_rate(self) -> float:
-        """How often a want was answered before it aged out.
-
-        Distinct from `speculative_waste`, which asks whether a *landed*
-        prefetch was used. This asks the prior question — whether the
-        instruction reached HBM at all — and separates "the forecast was
-        wrong" from "the phantom never ran" (02 §4).
-        """
-        answered = self.prefetch_wants_satisfied
-        total = answered + self.prefetch_wants_expired
-        if total == 0:
-            return 0.0
-        return answered / total
 
     @property
     def score_outcome_correlation(self) -> float:

@@ -1625,7 +1625,6 @@ def test_observe_only_forces_the_switches_that_define_the_arm():
         {
             "VLLM_NODE_EVICTION_OBSERVE": "1",
             "VLLM_NODE_EVICTION_POLICY": "0",
-            "VLLM_NODE_EVICTION_PREFETCH_DRAIN": "1",
         },
     ):
         cfg = NodeEvictionConfig.from_env()
@@ -1634,6 +1633,4 @@ def test_observe_only_forces_the_switches_that_define_the_arm():
     # Forced on despite POLICY=0, or there would be no controller to observe.
     assert cfg.enabled is True
     assert cfg.splice_max_blocks == 0
-    # A baseline that originates prefills is not a baseline.
-    assert cfg.prefetch_wants_enabled is False
     cfg.validate()

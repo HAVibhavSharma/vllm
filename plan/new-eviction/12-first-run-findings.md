@@ -1,5 +1,15 @@
 # First Real Run — What Broke, and the Four Fixes
 
+> **Amended 2026-09-07.** Engine-side prefetch origination (step 6) has been
+> removed: `wantlist.py`, `agent_prefetch/drain.py`, `drain_prefetch_wants`
+> and `VLLM_NODE_EVICTION_PREFETCH_DRAIN` are gone, along with the
+> `prefetch_*` want config and the `prefetch_wants_*` counters. The eviction
+> policy itself — index, scoring, tick, splice, speculative stamping — is
+> unchanged. Phantoms now arrive only from a client calling
+> `POST /v1/agents/prefetch`, so the engine reports what landed
+> (`speculative_*`, `speculative_waste`) but never what was asked for.
+> Anything below describing a want-list is history.
+
 **What this is:** the measured result of the first end-to-end run of the
 node-aware policy against a real workload (2026-08-07, Qwen2.5-72B-AWQ,
 LMCacheMPConnector, 228 requests replayed identically on both arms), and the

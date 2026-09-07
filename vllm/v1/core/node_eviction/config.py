@@ -36,9 +36,8 @@ class NodeEvictionConfig:
     field by field — which is what that line exists for.
 
     Set by `VLLM_NODE_EVICTION_OBSERVE=1`, which forces `enabled` on (so the
-    hooks fire), `splice_max_blocks` to 0 (so `_splice` returns on its first
-    line and eviction stays pure LRU `popleft`) and `prefetch_wants_enabled`
-    off (a baseline that originates prefills is not a baseline).
+    hooks fire) and `splice_max_blocks` to 0 (so `_splice` returns on its
+    first line and eviction stays pure LRU `popleft`).
 
     The value table is still rebuilt each tick, so the decision log records
     what the policy *would* have done without it doing anything — the
@@ -116,129 +115,15 @@ class NodeEvictionConfig:
     Set back to a value above `delta_cold_ms` (1e9 was the old default) to
     A/B against the protected behaviour."""
 
-    # --- Prefetch origination (02 §4, step 6) -----------------------------
-    prefetch_wants_enabled: bool = False
-    """Produce a want-list at all. Separate from `enabled` on purpose:
-    reordering the free queue is free, while originating a prefetch costs a
-    real prefill whenever LMCache misses the prefix. Driven by
-    `VLLM_NODE_EVICTION_PREFETCH_DRAIN`, the same switch the front-end
-    drainer reads, so the two halves cannot be turned on independently."""
-
-    prefetch_min_prob: float = 0.5
-    """Only forecast rows at least this likely become wants. The diagram's
-    "admit/prefetch if the need for the cache is imminent" has two axes; this
-    is the *will it happen* one.
-
-    **Defaults to 0.5 — on, as of 2026-08-10.** It was 0.0 (off) on the
-    argument that with ~58% of rows at the `prob=0.01` floor and ~22% at 1.0
-    and almost nothing between (12 §2), a probability gate is not selecting
-    likely rows, it is selecting one arm of a broken binary signal — so it
-    "cannot rank anything and only suppresses want volume".
-
-    Both halves of that turned out to be the wrong way round:
-
-    - A binary signal cannot **rank**, but this gate does not rank; it
-      **admits**. Admission is exactly the job a binary classifier can do,
-      and 12 §1 measured which arm to keep: the saturated `prob=1.0` class
-      comes back 54.7% of the time against 24.3% for the floored class. The
-      arm this gate selects is the valuable one.
-    - "Only suppresses want volume" was the goal, not the objection. With
-      the gate off a real run produced **13,464 wants and 41 satisfied**
-      (0.3%), because every floored row became a want on every tick.
-
-    Anything in `(0.01, 1.0]` gives the same partition while the forecast
-    stays bimodal; 0.5 is the natural line and leaves room if
-    `reach_probabilities()` is ever made fractional (12 §4). Set to 0.0 to
-    restore the unfiltered behaviour."""
-
-    prefetch_horizon_ms: float = 0.0
-    """...and this is the *when* axis. A node predicted 10 minutes out is
-    real but not imminent, and warming it now just evicts something that is
-    needed sooner.
-
-    **0 disables the gate**, which is the default for the same reason as
-    `prefetch_min_prob`: `time_to_next_call_ms` is currently 60s or 3600s
-    and nothing else, so the gate is a proxy for the same binary split."""
-
-    prefetch_min_coverage: float = 1.0
-    """Fraction of a key's prefix run that must be resident for it to count
-    as "in HBM" and therefore *not* worth prefetching.
-
-    The original admission test was `index.get_entry(key) is not None`, and
-    `remove_block` only deletes an entry when its **last** block goes
-    (`index.py:133`). A key whose prefix had been 99% evicted therefore still
-    read as resident and was never wanted — with `index_keys` at 8–11 across
-    a 9-node graph this gated out nearly every want, which is why the first
-    run produced 96 wants in 74 minutes.
-
-    Coverage is `num_blocks / run_len`, and `run_len` is derived from
-    `max_position`, which only ever grows — so partial eviction genuinely
-    drives it down. At the default 1.0, anything short of fully resident is
-    wanted."""
-
-    prefetch_ignore_staleness: bool = True
-    """Offer wants for keys whose forecast row is older than
-    `staleness_cutoff_ms`.
-
-    The eviction half must degrade to LRU on a stale row because it is about
-    to *destroy* a block on that row's say-so. A want only warms a prefix the
-    registry has already seen this process serve, so a stale row costs at
-    worst one redundant prefill. Defaulting this on keeps a quiet forecast
-    from silently switching prefetching off."""
-
-    prefetch_max_outstanding: int = 64
-    """Ceiling on wants pending + in flight. This is the actual bound on how
-    much prefill work speculation can create.
-
-    Raised from 8 with the gates removed: 8 was sized for a want-list that
-    also had a probability gate and a horizon gate in front of it, and it
-    becomes the binding constraint once those are off. Note this counts
-    *wants*, not phantoms — see `prefetch_top_k_per_want` for the fan-out."""
-
-    prefetch_max_per_drain: int = 32
-    """Ceiling on how many wants one front-end poll may take. Each want fans
-    out to up to `prefetch_top_k_per_want` prefixes, so this is not the
-    phantom count."""
-
-    prefetch_top_k_per_want: int = 1
-    """How many registered prefixes one want may warm, most-recent first.
-
-    Read by the front-end drainer, which previously used `get_all()` — every
-    prefix the registry ever recorded for the agent. That was safe only while
-    the gates kept want volume near zero; with them off it is the difference
-    between one phantom per want and one per recorded turn. 1 means "warm the
-    newest prefix for that node", which is the one a repeat call is most
-    likely to match. 0 or below restores the unbounded fan-out."""
-
-    prefetch_want_ttl_ms: float = 30_000.0
-    """A want nobody drained within this window is dropped as stale intent
-    rather than acted on late."""
-
-    prefetch_resubmit_backoff_ms: float = 10_000.0
-    """How long a drained want blocks a re-offer for the same key. Bounds
-    the retry rate when a phantom is dropped or its prefix never lands.
-
-    Lowered from 60s: this is the one dedup that must stay — without it the
-    250ms tick re-offers a key the 1s drain is still working on — but at 60s
-    a key evicted right after its phantom landed could not be re-warmed for a
-    full minute, which is long relative to how fast the splice turns the pool
-    over."""
-
     prefetch_summary_period_ms: float = 30_000.0
-    """How often the tick may log one INFO line of prefetch state. Rate
-    limited *and* change-gated, so an idle server stays silent. Set to 0 to
-    turn the line off; the counters remain readable via
+    """How often the tick may log one INFO line of speculative-block state.
+    Rate limited *and* change-gated, so an idle server stays silent. Set to 0
+    to turn the line off; the counters remain readable via
     `KVCacheManager.get_node_eviction_stats()` either way.
 
-    This exists because every per-event prefetch log is either too rare to
-    prove anything (startup) or too frequent for INFO (one per phantom), and
-    the numbers that actually separate "the forecast is wrong" from "the
-    phantom never ran" are ratios over time, not events."""
-
-    prefetch_agent_namespace: str = "langgraph"
-    """`agent_id` is `{namespace}:{node_name}` — the join with the LangGraph
-    fork's `derive_agent_id()`. Resolved engine-side so the front-end drainer
-    needs no knowledge of the naming convention."""
+    Origination itself lives outside the engine — phantoms arrive over
+    `POST /v1/agents/prefetch` — so what this line reports is what landed and
+    whether it was used, not what was asked for."""
 
     # --- Tick and splice (01 §6 Rule 4) -----------------------------------
     tick_period_ms: float = 250.0
@@ -484,7 +369,6 @@ class NodeEvictionConfig:
         # drainer reads this same env var, and a JSON file that could switch
         # the engine half on by itself would accumulate wants nobody submits
         # — which reads as a broken forecast, not a config mistake.
-        cfg.prefetch_wants_enabled = bool(envs.VLLM_NODE_EVICTION_PREFETCH_DRAIN)
 
         if envs.VLLM_NODE_EVICTION_OBSERVE:
             # Last, so it wins over both the JSON file and the switches
@@ -495,7 +379,6 @@ class NodeEvictionConfig:
             cfg.observe_only = True
             cfg.enabled = True
             cfg.splice_max_blocks = 0
-            cfg.prefetch_wants_enabled = False
 
         return cfg
 
@@ -542,20 +425,6 @@ class NodeEvictionConfig:
                 "speculative_floor_high must be 0 (off) or exceed "
                 "delta_cold_ms so the floor sits above the whole score range"
             )
-        if not 0.0 <= self.prefetch_min_prob <= 1.0:
-            raise ValueError("prefetch_min_prob must be a probability in [0, 1]")
-        if self.prefetch_max_outstanding < 0:
-            raise ValueError("prefetch_max_outstanding must be >= 0")
-        if self.prefetch_max_per_drain < 0:
-            raise ValueError("prefetch_max_per_drain must be >= 0")
-        if not 0.0 <= self.prefetch_min_coverage <= 1.0:
-            # Above 1.0 no key could ever reach the threshold, so every key
-            # would be wanted forever including the ones already fully
-            # resident — a permanent phantom storm rather than a quiet
-            # misconfiguration.
-            raise ValueError(
-                "prefetch_min_coverage must be a fraction in [0, 1]"
-            )
         if self.hbm_summary_top_keys < 0:
             raise ValueError("hbm_summary_top_keys must be >= 0")
         if self.remat_window_blocks < 0:
@@ -567,14 +436,6 @@ class NodeEvictionConfig:
             raise ValueError(
                 "uninformative_prob_at_or_below must be <= 1.0; a gate above "
                 "the probability range would make every key unscored"
-            )
-        if self.prefetch_wants_enabled and not self.prefetch_agent_namespace:
-            # An empty namespace yields agent_id ":research", which matches
-            # nothing in the registry — every want would fan out to zero
-            # phantoms and the failure would be invisible.
-            raise ValueError(
-                "prefetch_agent_namespace must be non-empty when prefetch "
-                "origination is on"
             )
 
 

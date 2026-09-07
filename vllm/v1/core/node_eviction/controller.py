@@ -50,7 +50,6 @@ from vllm.v1.core.node_eviction.types import (
     NodeKey,
     ScoreBreakdown,
 )
-from vllm.v1.core.node_eviction.wantlist import PrefetchWant, PrefetchWantList
 
 logger = init_logger(__name__)
 
@@ -185,9 +184,7 @@ class NodeEvictionController:
         self._last_restage_monotonic = 0.0
         self._evictions_since_tick = 0
 
-        # Step 6. None when origination is off, which is the default: the
-        # reorder half is free, the prefetch half buys prefill work.
-        self._wants: PrefetchWantList | None = None
+        # Rate limit + change gate for the speculative-block summary line.
         self._last_prefetch_log_monotonic = 0.0
         self._last_prefetch_fingerprint: tuple[int, ...] | None = None
 
@@ -222,16 +219,6 @@ class NodeEvictionController:
         )
         # What a miss actually costs, next to how often it happened.
         self.ttft = TTFTTracker()
-        if (
-            config.prefetch_wants_enabled
-            and self.enabled
-            and not config.observe_only
-        ):
-            self._wants = PrefetchWantList(
-                max_outstanding=config.prefetch_max_outstanding,
-                want_ttl_ms=config.prefetch_want_ttl_ms,
-                resubmit_backoff_ms=config.prefetch_resubmit_backoff_ms,
-            )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -540,12 +527,6 @@ class NodeEvictionController:
         self._value_table = {}
         self._spliced_scores.clear()
         self._spliced_ranks.clear()
-        if self._wants is not None:
-            # Every block hash in the pool has just been invalidated, so an
-            # outstanding want's prefix is gone whether or not its phantom
-            # landed. Keeping the want would block a re-offer for the whole
-            # backoff, exactly when everything needs re-warming.
-            self._wants.clear()
 
     # -- hooks from KVCacheManager ----------------------------------------
 
@@ -653,11 +634,6 @@ class NodeEvictionController:
         self.observer.expire(now_ms)
         self._maybe_gc(now)
 
-        # Deliberately *above* the fresh-block early return below. Wanting a
-        # prefix is most useful precisely when there is free space to put it
-        # in — that is the cheap case, not the one to skip — whereas the
-        # splice only matters once cached blocks are being destroyed.
-        self._rebuild_want_list(snapshot, now, now_ms)
         self._maybe_log_prefetch_summary(now)
 
         # Rule 1, measured **at the head** rather than over the whole queue.
@@ -736,115 +712,21 @@ class NodeEvictionController:
             return True
         return (entry.num_blocks / run_len) >= threshold
 
-    def _rebuild_want_list(
-        self, snapshot: ImportanceSnapshot, now: float, now_ms: float
-    ) -> None:
-        """Decide which prefixes should be pulled into HBM (02 §4, step 6).
-
-        The diagram's admission question, in order:
-
-            "after the value is assessed it checks the hbm if its present or
-             not; if not present -> prefetch call"
-
-        Presence is the ownership index: a key with an entry has blocks in
-        HBM right now. Absence plus an imminent, likely call is a want.
-
-        The other half of the diagram's rule — *"if it can't be admitted to
-        HBM due to it being full: evict others in order of least value except
-        this"* — needs no separate mechanism here. The splice has already
-        moved the least valuable blocks to the head, so `get_new_blocks` pops
-        those first.
-
-        The "except this" clause used to be the speculative floor, which put
-        a freshly prefetched prefix above the whole score range. That is off
-        by default now (`config.speculative_floor_high`): a prefetch is
-        ranked on the same row that justified fetching it, so a prefix worth
-        warming is protected by its own score or not at all.
-        """
-        wants = self._wants
-        if wants is None:
-            return
-
-        counters = self.observer.counters
-        dropped_pending, dropped_outstanding = wants.expire(now)
-        counters.prefetch_wants_expired += dropped_pending + dropped_outstanding
-
-        cfg = self.config
-        for key, row in snapshot.rows.items():
-            if self._is_resident(key):
-                # Already resident. Retiring the want here rather than on the
-                # phantom's completion means it works no matter who put the
-                # prefix there — the phantom, a real request, or a co-owning
-                # node's identical preamble.
-                if wants.note_satisfied(key):
-                    counters.prefetch_wants_satisfied += 1
-                continue
-            if wants.is_tracked(key):
-                continue
-            if not cfg.prefetch_ignore_staleness and is_stale(
-                row, now_ms, cfg.staleness_cutoff_ms
-            ):
-                # A stale row must not buy prefill work. The eviction half
-                # degrades to LRU on staleness; this half degrades to doing
-                # nothing, which is the same conservative direction. Off by
-                # default — see `prefetch_ignore_staleness`.
-                continue
-            # Both gates below are disabled by default (0.0 admits every row,
-            # since prob >= 0 and ttnc >= 0 always). They are kept as knobs
-            # rather than deleted so a fractional forecast can switch them
-            # back on without a code change.
-            if cfg.prefetch_min_prob > 0.0 and row.prob < cfg.prefetch_min_prob:
-                continue
-            if (
-                cfg.prefetch_horizon_ms > 0.0
-                and row.time_to_next_call_ms > cfg.prefetch_horizon_ms
-            ):
-                continue
-
-            # `num_blocks=1` makes this `prob * decay * E_miss`: expected ms
-            # saved, not ms saved per block. The density form is right for
-            # ranking blocks already held against each other; for choosing
-            # what to *fetch*, the prefix size is unknown until it lands, and
-            # a big prefix is more worth fetching, not less.
-            breakdown = score_key(row, 1, cfg)
-            want = PrefetchWant(
-                key=key,
-                agent_id=f"{cfg.prefetch_agent_namespace}:{key.node}",
-                score=breakdown.score,
-                prob=breakdown.prob,
-                time_to_next_call_ms=row.time_to_next_call_ms,
-                created_at=now,
-            )
-            if wants.offer(want):
-                counters.prefetch_wants_created += 1
-            else:
-                counters.prefetch_wants_dropped += 1
-
-        counters.prefetch_wants_pending = wants.num_pending
-        counters.prefetch_wants_outstanding = wants.num_outstanding
-
     def prefetch_summary(self) -> str | None:
-        """One line of prefetch state, or None when origination is off.
+        """One line on what prefetching bought, or None when the policy is off.
 
-        Both halves of the question, on one line: did the *instruction* reach
-        HBM (`wants`), and was what landed actually *used* (`speculative`).
-        Reporting only the first makes a forecast that predicts the wrong node
-        look healthy; only the second cannot distinguish a wrong forecast from
-        a phantom that never ran.
+        Origination now lives entirely outside the engine: phantoms arrive
+        over `POST /v1/agents/prefetch`, so the engine no longer knows what
+        was *asked* for and can only report what *landed* — blocks stamped
+        speculative, and whether a real request ever came for them.
+        `waste` is the honest read on whether the caller's predictions are
+        worth the prefills they cost.
         """
-        if self._wants is None:
+        if not self.enabled:
             return None
         c = self.observer.counters
         return (
             "node_eviction prefetch: "
-            f"wants created={c.prefetch_wants_created} "
-            f"drained={c.prefetch_wants_drained} "
-            f"satisfied={c.prefetch_wants_satisfied} "
-            f"expired={c.prefetch_wants_expired} "
-            f"dropped={c.prefetch_wants_dropped} "
-            f"pending={self._wants.num_pending} "
-            f"inflight={self._wants.num_outstanding} "
-            f"hit_rate={c.prefetch_want_hit_rate:.0%} | "
             f"speculative keys={self.index.num_speculative_keys} "
             f"blocks={c.speculative_blocks_created} "
             f"confirmed={c.speculative_confirmed} "
@@ -864,7 +746,7 @@ class NodeEvictionController:
         sets `propagate=False`, so pytest's `caplog` sees nothing and a test
         written against it would pass vacuously.
         """
-        if self._wants is None or self.config.prefetch_summary_period_ms <= 0:
+        if not self.enabled or self.config.prefetch_summary_period_ms <= 0:
             return None
         period_s = self.config.prefetch_summary_period_ms / 1000.0
         if now - self._last_prefetch_log_monotonic < period_s:
@@ -872,11 +754,6 @@ class NodeEvictionController:
 
         c = self.observer.counters
         fingerprint = (
-            c.prefetch_wants_created,
-            c.prefetch_wants_drained,
-            c.prefetch_wants_satisfied,
-            c.prefetch_wants_expired,
-            c.prefetch_wants_dropped,
             c.speculative_blocks_created,
             c.speculative_confirmed,
             c.speculative_evicted_before_confirm,
@@ -1148,33 +1025,6 @@ class NodeEvictionController:
         self.ttft.reset_window()
         return summary
 
-    def drain_prefetch_wants(self, max_items: int) -> list[dict[str, str | float]]:
-        """Hand pending wants to the front end (02 §4 option a).
-
-        Reached over `call_utility`, which the engine-core busy loop dispatches
-        on its own thread — the same one that runs the tick — so this needs no
-        lock despite being called from another process.
-
-        Returns plain dicts: the front end submits phantoms and has no reason
-        to import engine-core types.
-        """
-        if self._wants is None or not self.enabled:
-            return []
-        drained = self._wants.drain(
-            min(max_items, self.config.prefetch_max_per_drain), time.monotonic()
-        )
-        if drained:
-            counters = self.observer.counters
-            counters.prefetch_wants_drained += len(drained)
-            counters.prefetch_wants_pending = self._wants.num_pending
-            counters.prefetch_wants_outstanding = self._wants.num_outstanding
-            logger.debug(
-                "node_eviction: handed %d prefetch want(s) to the front end: %s",
-                len(drained),
-                [w.agent_id for w in drained],
-            )
-        return [want.as_dict() for want in drained]
-
     def _maybe_gc(self, now: float) -> None:
         if (now - self._last_gc_monotonic) * 1000.0 < self.config.index_gc_period_ms:
             return
@@ -1403,10 +1253,6 @@ class NodeEvictionController:
         out["metrics_epoch"] = self.metrics_epoch
         out["epoch_age_s"] = self.epoch_age_s
         out["observe_only"] = self.config.observe_only
-        out["prefetch_origination_enabled"] = self._wants is not None
-        if self._wants is not None:
-            out["prefetch_wants_pending"] = self._wants.num_pending
-            out["prefetch_wants_outstanding"] = self._wants.num_outstanding
         if self.snapshot_source is not None:
             for name, value in self.snapshot_source.stats().items():
                 out[f"source_{name}"] = value

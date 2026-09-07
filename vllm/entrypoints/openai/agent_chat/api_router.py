@@ -89,20 +89,16 @@ def get_or_init_agent_prefetch_state(
 ) -> tuple[AgentPrefixRegistry, PhantomPrefetchSubmitter]:
     """The singletons, keyed on app state.
 
-    Split out from the request-scoped helper so the want-list drainer
-    (`vllm/v1/agent_prefetch/drain.py`), which starts at server startup and
-    has no request, shares *these* instances. Two registries would mean the
-    drainer fanning out over prefixes the chat endpoint never recorded.
+    Split out from the request-scoped helper so any caller without a request
+    in hand shares *these* instances. Two registries would mean one endpoint
+    fanning out over prefixes the other never recorded.
     """
     registry: AgentPrefixRegistry | None = getattr(state, _REGISTRY_ATTR, None)
     submitter: PhantomPrefetchSubmitter | None = getattr(
         state, _SUBMITTER_ATTR, None
     )
     if registry is None:
-        # `max_per_agent` was unlimited while the only writers were the two
-        # explicit /v1/agents/* endpoints. Ordinary chat traffic now records
-        # here too (`agent_prefetch/auto_register.py`), which is one
-        # descriptor per turn per node and unbounded over a long run. The
+        # One descriptor per turn per node, unbounded over a long run. The
         # inner map is LRU, so a cap keeps the newest prefixes — which are
         # the ones a repeat call can actually match — and drops prompts from
         # jobs that ended.
@@ -246,14 +242,12 @@ def _resolve_registry_agent_id(
     """The requested `agent_id`, unless nothing is filed under it and the
     request's own `langgraph_node` names an agent that does exist.
 
-    Two writers fill this registry and both key it on the **bare** node:
-    `auto_register.maybe_record_chat_prefix` uses
-    `f"{namespace}:{extra_args['langgraph_node']}"`, and engine core builds
-    `PrefetchWant.agent_id` as `f"{namespace}:{key.node}"` from a `NodeKey`
-    that holds only the node. A client that identifies nodes by their graph
-    position instead — `langgraph:research_supervisor:supervisor_tools:
-    researcher` against a registry holding `langgraph:researcher` — asks for
-    an agent no writer ever creates.
+    The registry is filled by `POST /v1/agents/chat/completions` and by a
+    `text=` seed on this endpoint, under whatever `agent_id` the caller sent.
+    A client that identifies nodes by their graph position on one path and by
+    the bare node on the other — `langgraph:research_supervisor:
+    supervisor_tools:researcher` against a registry holding
+    `langgraph:researcher` — asks for an agent no writer ever created.
 
     That failure is silent in the worst way. `agent_size` returns 0, the
     fan-out submits nothing, and the endpoint still answers 200 OK in under a
@@ -627,13 +621,12 @@ async def prefetch_agent_cache(
             "registered under that id, so this call submitted no phantoms. "
             "Registration is retrospective, so this is expected on a node's "
             "first execution. If it persists past the second visit, the "
-            "client's agent_id does not match the `%s:<langgraph_node>` key "
-            "chat traffic registers under. (Setting "
-            "VLLM_NODE_EVICTION_PREFETCH_DRAIN=1 is NOT the fix: it creates "
-            "the registry at startup, but it also switches on engine-core "
-            "want origination, which submits phantoms of its own.)",
+            "client's agent_id does not match the one its "
+            "/v1/agents/chat/completions traffic registers under -- or that "
+            "traffic is going to plain /v1/chat/completions, which does not "
+            "write the registry. Send a `text=` seed on this endpoint (with "
+            "prefill_on_miss=true) to populate it up front.",
             request.agent_id,
-            request.agent_id.split(":", 1)[0] if ":" in request.agent_id else "ns",
         )
     if identity is None:
         logger.warning_once(

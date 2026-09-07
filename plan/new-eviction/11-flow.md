@@ -1,5 +1,15 @@
 # The whole loop, two nodes
 
+> **Amended 2026-09-07.** Engine-side prefetch origination (step 6) has been
+> removed: `wantlist.py`, `agent_prefetch/drain.py`, `drain_prefetch_wants`
+> and `VLLM_NODE_EVICTION_PREFETCH_DRAIN` are gone, along with the
+> `prefetch_*` want config and the `prefetch_wants_*` counters. The eviction
+> policy itself — index, scoring, tick, splice, speculative stamping — is
+> unchanged. Phantoms now arrive only from a client calling
+> `POST /v1/agents/prefetch`, so the engine reports what landed
+> (`speculative_*`, `speculative_waste`) but never what was asked for.
+> Anything below describing a want-list is history.
+
 **Written:** 2026-08-03, against branch `vllm-v2`. The scenario is 06 §3.3 —
 `supervisor` has just run and `research` is next — with prefetch origination
 (step 6) switched on: `VLLM_NODE_EVICTION_PREFETCH_DRAIN=1`.

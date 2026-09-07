@@ -232,17 +232,6 @@ class EngineCoreClient(ABC):
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
-    async def drain_prefetch_wants_async(
-        self, max_items: int = 4
-    ) -> list[dict[str, str | float]]:
-        """Prefixes the node-eviction policy wants warmed into HBM.
-
-        Returns an empty list on clients that do not implement it, because a
-        missing drain path must degrade to "no prefetching", never to an
-        exception on a background poll (02 §4).
-        """
-        return []
-
     async def reset_kv_metrics_async(
         self, label: str = "", flush_hbm: bool = False
     ) -> dict[str, Any]:
@@ -1125,11 +1114,6 @@ class AsyncMPClient(MPClient):
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
 
-    async def drain_prefetch_wants_async(
-        self, max_items: int = 4
-    ) -> list[dict[str, str | float]]:
-        return await self.call_utility_async("drain_prefetch_wants", max_items)
-
     async def reset_kv_metrics_async(
         self, label: str = "", flush_hbm: bool = False
     ) -> dict[str, Any]:
@@ -1205,28 +1189,6 @@ class DPAsyncMPClient(AsyncMPClient):
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
-        self._warned_no_prefetch_drain = False
-
-    async def drain_prefetch_wants_async(
-        self, max_items: int = 4
-    ) -> list[dict[str, str | float]]:
-        """Disabled under data parallelism.
-
-        Every engine runs its own KV cache and its own want-list, but a
-        phantom submitted from the front end is routed by the load balancer
-        and cannot be addressed to the engine that asked. Warming engine 0
-        for a prefix engine 1 wanted leaves engine 1 cold *and* costs engine 0
-        a prefill it had no use for, so origination fails closed here — the
-        same choice the policy makes for multi-KV-group models.
-        """
-        if not self._warned_no_prefetch_drain:
-            self._warned_no_prefetch_drain = True
-            logger.warning(
-                "Node-eviction prefetch origination is disabled under data "
-                "parallelism: phantom requests cannot be routed to the engine "
-                "that requested them. Eviction reordering is unaffected."
-            )
-        return []
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (

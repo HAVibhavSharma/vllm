@@ -132,18 +132,6 @@ def test_provenance_can_be_asserted_by_the_caller():
     assert observer.counters.speculative_evicted_before_confirm == 1
 
 
-def test_a_want_that_never_landed_is_distinguished_from_one_that_was_unused():
-    """`prefetch_want_hit_rate` asks whether the instruction reached HBM;
-    `speculative_waste` asks whether what landed was used. Collapsing them
-    would make "the phantom never ran" indistinguishable from "the forecast
-    was wrong" (02 §4)."""
-    observer = EvictionObserver()
-    observer.counters.prefetch_wants_satisfied = 3
-    observer.counters.prefetch_wants_expired = 1
-    assert observer.counters.prefetch_want_hit_rate == 0.75
-    assert observer.counters.speculative_waste == 0.0
-
-
 def test_decision_log_carries_the_terms_and_the_snapshot_age(tmp_path):
     """Logging the components, not just the total, is what makes a bad score
     diagnosable rather than merely visible. `snapshot_age_ms` separates a

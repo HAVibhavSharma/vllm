@@ -1,5 +1,15 @@
 # Running It — Deployment and Bring-Up
 
+> **Amended 2026-09-07.** Engine-side prefetch origination (step 6) has been
+> removed: `wantlist.py`, `agent_prefetch/drain.py`, `drain_prefetch_wants`
+> and `VLLM_NODE_EVICTION_PREFETCH_DRAIN` are gone, along with the
+> `prefetch_*` want config and the `prefetch_wants_*` counters. The eviction
+> policy itself — index, scoring, tick, splice, speculative stamping — is
+> unchanged. Phantoms now arrive only from a client calling
+> `POST /v1/agents/prefetch`, so the engine reports what landed
+> (`speculative_*`, `speculative_waste`) but never what was asked for.
+> Anything below describing a want-list is history.
+
 **What this is:** how to stand up the three components and the Redis between
 them so a LangGraph workflow runs against the node-aware eviction policy.
 

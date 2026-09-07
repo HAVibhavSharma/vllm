@@ -612,19 +612,6 @@ class KVCacheManager:
             return None
         return self.node_eviction.get_value_for_request(request)
 
-    def drain_prefetch_wants(self, max_items: int) -> list[dict[str, str | float]]:
-        """Hand the front end prefixes the policy wants pulled into HBM.
-
-        The manager decides, the API-server process submits (02 §4 option a):
-        engine core has no channel for originating a request, so the decision
-        is published here and drained over `call_utility`. Returns an empty
-        list when the policy or its prefetch half is off, which is the
-        default.
-        """
-        if self.node_eviction is None:
-            return []
-        return self.node_eviction.drain_prefetch_wants(max_items)
-
     def shutdown(self) -> None:
         """Release anything the eviction policy holds.
 

@@ -13,6 +13,10 @@ requests that created those blocks, scores every tracked key on a
 wall-clock tick from a forecast published to Redis by the workflow, and
 moves the worst-scoring blocks to the head of the free queue.
 
+Prefetch *origination* is deliberately not here: phantoms are submitted by
+whoever calls `POST /v1/agents/prefetch`. This package only records that a
+block arrived speculatively and reports whether anything ever used it.
+
 Design docs live in `plan/new-eviction/`. Start with `06-walkthrough.md` for
 why, `02-controller-scope.md` §10 for the build order.
 
@@ -39,7 +43,6 @@ from vllm.v1.core.node_eviction.types import (
     NodeKey,
     ScoreBreakdown,
 )
-from vllm.v1.core.node_eviction.wantlist import PrefetchWant, PrefetchWantList
 
 __all__ = [
     "BlockOwnershipIndex",
@@ -52,8 +55,6 @@ __all__ = [
     "NodeEvictionConfig",
     "NodeEvictionController",
     "NodeKey",
-    "PrefetchWant",
-    "PrefetchWantList",
     "ScoreBreakdown",
     "SnapshotSource",
     "StaticSnapshotSource",
