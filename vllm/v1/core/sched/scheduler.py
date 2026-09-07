@@ -106,6 +106,10 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # Requests admitted into their first prefill by the last
+        # schedule() call. Reported in SchedulerStats; the running/
+        # waiting gauges cannot express admission rate on their own.
+        self.last_num_new_scheduled_reqs: int = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -1110,6 +1114,10 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
+        # Counted here, not after the scheduler output is built: the v2
+        # runner path folds `scheduled_resumed_reqs` into `scheduled_new_reqs`
+        # below, which would silently make this mean two different things.
+        self.last_num_new_scheduled_reqs = len(scheduled_new_reqs)
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -2208,6 +2216,11 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            # make_stats() runs from update_from_output(), i.e. after
+            # this step's schedule(), so both of these describe the
+            # batch just built rather than the previous one.
+            num_scheduled_reqs=len(self.prev_step_scheduled_req_ids),
+            num_new_scheduled_reqs=self.last_num_new_scheduled_reqs,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

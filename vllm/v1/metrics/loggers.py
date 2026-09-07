@@ -1291,9 +1291,20 @@ class FileStatLogger(StatLoggerBase):
         base = f"finished_requests_engine{engine_index}_{ts}"
         csv_path = os.path.join(output_dir, f"{base}.csv")
         jsonl_path = os.path.join(output_dir, f"{base}.jsonl")
+        sched_path = os.path.join(output_dir, f"scheduler_engine{engine_index}_{ts}.jsonl")
 
         self._csv_file = open(csv_path, "w", newline="", buffering=-1)
         self._jsonl_file = open(jsonl_path, "w", buffering=-1)
+        self._sched_file = open(sched_path, "w", buffering=-1)
+        # Queue depth is a time series, and record() fires once per engine
+        # step, so writing every step would produce ~100 lines/s of mostly
+        # unchanged rows. Emit on any change, plus a heartbeat, so an idle
+        # stretch is still distinguishable from a stalled logger.
+        self._sched_heartbeat_s = float(
+            os.getenv("VLLM_REQUEST_STATS_SCHEDULER_INTERVAL_S", "1.0")
+        )
+        self._last_sched_key: tuple[int, int, int, int, int] | None = None
+        self._last_sched_write: float = 0.0
         self._csv_writer = csv.DictWriter(
             self._csv_file,
             fieldnames=_CSV_COLUMNS,
@@ -1308,13 +1319,15 @@ class FileStatLogger(StatLoggerBase):
         atexit.register(self._close)
 
         logger.info(
-            "FileStatLogger: writing request stats to %s and %s",
+            "FileStatLogger: writing request stats to %s and %s, "
+            "scheduler timeline to %s",
             csv_path,
             jsonl_path,
+            sched_path,
         )
 
     def _close(self):
-        for f in (self._csv_file, self._jsonl_file):
+        for f in (self._csv_file, self._jsonl_file, self._sched_file):
             if not f.closed:
                 f.flush()
                 f.close()
@@ -1326,7 +1339,8 @@ class FileStatLogger(StatLoggerBase):
         mm_cache_stats: MultiModalCacheStats | None = None,
         engine_idx: int = 0,
     ):
-        del scheduler_stats, mm_cache_stats, engine_idx
+        del mm_cache_stats, engine_idx
+        self._record_scheduler_stats(scheduler_stats, iteration_stats)
         if iteration_stats is None:
             return
 
@@ -1364,6 +1378,60 @@ class FileStatLogger(StatLoggerBase):
             }
             self._csv_writer.writerow(row)
             self._jsonl_file.write(json.dumps(row) + "\n")
+
+    def _record_scheduler_stats(
+        self,
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
+    ):
+        """Append one queue-depth sample to the scheduler timeline.
+
+        Answers "how many requests were scheduled, waiting and running while
+        this question ran" -- the per-request file cannot, since it only says
+        how long each request queued, not how many others were queued with it.
+        """
+        if scheduler_stats is None:
+            return
+        key = (
+            scheduler_stats.num_running_reqs,
+            scheduler_stats.num_waiting_reqs,
+            scheduler_stats.num_skipped_waiting_reqs,
+            scheduler_stats.num_scheduled_reqs,
+            scheduler_stats.num_new_scheduled_reqs,
+        )
+        now = time.time()
+        if key == self._last_sched_key and now - self._last_sched_write < (
+            self._sched_heartbeat_s
+        ):
+            return
+        self._last_sched_key = key
+        self._last_sched_write = now
+
+        num_preempted = (
+            iteration_stats.num_preempted_reqs if iteration_stats is not None else 0
+        )
+        num_finished = (
+            len(iteration_stats.finished_requests) if iteration_stats is not None else 0
+        )
+        self._sched_file.write(
+            json.dumps(
+                {
+                    "ts": now,
+                    "step": scheduler_stats.step_counter,
+                    "num_scheduled_reqs": scheduler_stats.num_scheduled_reqs,
+                    "num_new_scheduled_reqs": scheduler_stats.num_new_scheduled_reqs,
+                    "num_running_reqs": scheduler_stats.num_running_reqs,
+                    "num_waiting_reqs": scheduler_stats.num_waiting_reqs,
+                    "num_skipped_waiting_reqs": (
+                        scheduler_stats.num_skipped_waiting_reqs
+                    ),
+                    "num_preempted_reqs": num_preempted,
+                    "num_finished_reqs": num_finished,
+                    "kv_cache_usage": scheduler_stats.kv_cache_usage,
+                }
+            )
+            + "\n"
+        )
 
     def log_engine_initialized(self):
         pass

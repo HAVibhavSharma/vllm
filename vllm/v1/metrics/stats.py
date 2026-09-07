@@ -176,6 +176,13 @@ class SchedulerStats:
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
 
+    # What the scheduler actually admitted this step, as opposed to the queue
+    # depths above: every request it allocated tokens for, and the subset of
+    # those starting their prefill. Without these, a run that is waiting and a
+    # run that is thrashing look identical -- both show a long waiting queue.
+    num_scheduled_reqs: int = 0
+    num_new_scheduled_reqs: int = 0
+
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0
