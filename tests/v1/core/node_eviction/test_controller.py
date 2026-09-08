@@ -605,97 +605,6 @@ def test_config_rejects_a_cold_miss_cheaper_than_l1():
 # -- HBM accounting line -------------------------------------------------
 
 
-def test_hbm_summary_reports_the_pool_split():
-    """total = used + free, and `queue` is the eviction candidate count.
-
-    Asserted as an identity rather than against literals so the test still
-    means something if the fake pool's size changes.
-    """
-    pool = FakePool(num_blocks=16)
-    controller = make_controller(pool)
-    pool.blocks[3].ref_cnt = 1
-    pool.free_block_queue.remove(pool.blocks[3])
-
-    line = controller.hbm_summary()
-    fields = dict(
-        part.split("=", 1) for part in line.split() if "=" in part
-    )
-    assert fields["variant"] == "node_eviction"
-    total = int(fields["total"])
-    used = int(fields["used"])
-    free = int(fields["free"])
-    assert total == 16
-    assert used + free == total
-    assert used == 1
-    assert int(fields["queue"]) == free
-
-
-def test_hbm_summary_names_the_node_that_lost_the_block():
-    """The point of the line: not "12k blocks went" but whose they were."""
-    pool = FakePool(num_blocks=16)
-    controller = make_controller(pool)
-    index_prefix(controller, pool, RESEARCH, [1, 2, 3])
-    index_prefix(controller, pool, SUPERVISOR, [4])
-
-    for block_id in (1, 2, 3):
-        controller.on_block_evicted(block_id)
-    controller.on_block_evicted(4)
-
-    line = controller.hbm_summary()
-    assert "top_evicted=run-42:research=3,run-42:supervisor=1" in line
-
-
-def test_hbm_summary_attributes_untracked_blocks_separately():
-    """A block nobody claimed must not be silently dropped from the tally,
-    or `evicted=` and `top_evicted=` stop adding up."""
-    pool = FakePool(num_blocks=16)
-    controller = make_controller(pool)
-    controller.on_block_evicted(7)
-    assert "top_evicted=<untracked>=1" in controller.hbm_summary()
-
-
-def test_hbm_line_is_rate_limited_and_change_gated():
-    """An idle server must log nothing: an identical line every period
-    trains everyone to filter the line out."""
-    pool = FakePool(num_blocks=16)
-    controller = make_controller(pool, hbm_summary_period_ms=10_000.0)
-
-    assert controller._maybe_log_hbm_summary(1000.0) is not None
-    # Same window.
-    assert controller._maybe_log_hbm_summary(1001.0) is None
-    # New window, but nothing moved.
-    assert controller._maybe_log_hbm_summary(1_000_000.0) is None
-
-    index_prefix(controller, pool, RESEARCH, [1])
-    controller.on_block_evicted(1)
-    assert controller._maybe_log_hbm_summary(2_000_000.0) is not None
-
-
-def test_hbm_attribution_is_per_window():
-    """Counts reset when the line is emitted, which is also what stops a
-    finished job's id from being pinned for the life of the server."""
-    pool = FakePool(num_blocks=16)
-    controller = make_controller(pool, hbm_summary_period_ms=10_000.0)
-    index_prefix(controller, pool, RESEARCH, [1])
-    controller.on_block_evicted(1)
-
-    first = controller._maybe_log_hbm_summary(1_000_000.0)
-    assert "run-42:research=1" in first
-
-    index_prefix(controller, pool, SUPERVISOR, [4])
-    controller.on_block_evicted(4)
-    second = controller._maybe_log_hbm_summary(2_000_000.0)
-    assert "run-42:supervisor=1" in second
-    assert "run-42:research" not in second
-
-
-def test_hbm_line_can_be_switched_off():
-    pool = FakePool(num_blocks=16)
-    controller = make_controller(pool, hbm_summary_period_ms=0.0)
-    controller.on_block_evicted(1)
-    assert controller._maybe_log_hbm_summary(1_000_000.0) is None
-
-
 def test_stats_carry_the_pool_split():
     pool = FakePool(num_blocks=16)
     controller = make_controller(pool)
@@ -728,20 +637,6 @@ def test_hit_rate_is_tokens_not_requests():
     controller.on_cache_query(num_tokens=10, num_hits=10)
     controller.on_cache_query(num_tokens=10_000, num_hits=0)
     assert controller.movement.hit_rate == 10 / 10_010
-
-
-def test_windowed_hit_rate_resets_but_cumulative_does_not():
-    """A cumulative rate over a long run is dominated by whatever the
-    workload did first, so the line carries both."""
-    controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
-    controller.on_cache_query(num_tokens=100, num_hits=0)
-    controller._maybe_log_hbm_summary(1_000_000.0)
-
-    controller.on_cache_query(num_tokens=100, num_hits=100)
-    line = controller._maybe_log_hbm_summary(2_000_000.0)
-    fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
-    assert float(fields["hit_rate_win"]) == 1.0
-    assert float(fields["hit_rate"]) == 0.5
 
 
 def test_a_phantom_lookup_is_not_counted_as_demand():
@@ -813,26 +708,6 @@ def test_reset_prefix_cache_clears_the_hit_rate():
     assert controller.movement.hit_rate == 0.0, "the old tokens must not carry"
 
 
-def test_the_summary_line_prints_when_only_phantoms_ran():
-    """Phantom queries no longer move `query_tokens`, so the change gate has
-    to watch them too — otherwise origination goes silent exactly in the
-    window where it is doing all the work."""
-    controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
-    controller.on_cache_query(num_tokens=100, num_hits=100)
-    assert controller._maybe_log_hbm_summary(1_000_000.0) is not None
-
-    controller.on_cache_query(
-        num_tokens=500, num_hits=0, request=make_request(prefetch_only=True)
-    )
-    line = controller._maybe_log_hbm_summary(2_000_000.0)
-    assert line is not None
-    fields = dict(p.split("=", 1) for p in line.split() if "=" in p)
-    assert fields["phantom_query_tokens"] == "500"
-    assert float(fields["phantom_hit_rate"]) == 0.0
-    # The real rate is untouched by the phantom.
-    assert float(fields["hit_rate"]) == 1.0
-
-
 def test_cold_tokens_excludes_what_lmcache_served():
     """The field exists precisely to stop `query - hit` being read as prefill.
 
@@ -886,16 +761,13 @@ def test_a_phantom_contributes_no_cold_tokens():
     assert controller.movement.cold_tokens == 0
 
 
-def test_cold_tokens_is_on_the_summary_line():
+def test_cold_tokens_is_reported():
     controller = make_controller(FakePool())
     controller.on_cache_query(num_tokens=1_000, num_hits=200)
     controller.on_external_cache_query(
         num_tokens=1_000, num_local_hits=200, num_external_hits=700
     )
-    fields = dict(
-        p.split("=", 1) for p in controller.hbm_summary().split() if "=" in p
-    )
-    assert fields["cold_tokens"] == "100"
+    assert controller.stats()["cold_tokens"] == 100
 
 
 def test_a_measurement_reset_zeroes_cold_tokens():
@@ -961,16 +833,13 @@ def test_a_phantom_contributes_no_external_hit_tokens():
     assert controller.movement.external_hit_tokens == 0
 
 
-def test_external_hit_tokens_is_on_the_summary_line():
+def test_external_hit_tokens_is_reported():
     controller = make_controller(FakePool())
     controller.on_cache_query(num_tokens=1_000, num_hits=200)
     controller.on_external_cache_query(
         num_tokens=1_000, num_local_hits=200, num_external_hits=700
     )
-    fields = dict(
-        p.split("=", 1) for p in controller.hbm_summary().split() if "=" in p
-    )
-    assert fields["external_hit_tokens"] == "700"
+    assert controller.stats()["external_hit_tokens"] == 700
 
 
 def test_a_measurement_reset_zeroes_external_hit_tokens():
@@ -1071,7 +940,7 @@ def test_movement_in_mb_uses_the_configured_page_size():
     pool.blocks[1].reset_hash()
     cache_block(controller, pool, 1, "hA")
     assert controller.movement.remat_mb == 2.0
-    assert "remat_mb=2.0 " in controller.hbm_summary()
+    assert controller.stats()["remat_mb"] == 2.0
 
 
 def test_movement_in_mb_is_zero_when_the_page_size_is_unknown():
@@ -1451,20 +1320,6 @@ def test_a_phantom_prefetch_is_flagged_not_hidden():
     assert _fields(controller._ttft_line(req, 200.0))["phantom"] == "1"
 
 
-def test_the_summary_line_carries_only_the_ttft_count():
-    """The latencies live on their own lines. A mean here would be fixed to a
-    window nobody chose."""
-    controller = make_controller(FakePool(), hbm_summary_period_ms=10_000.0)
-    controller.on_request_finished(_ttft_request(1000.0, 1000.5))
-    line = controller._maybe_log_hbm_summary(1_000_000.0)
-    fields = _fields(line)
-
-    assert fields["ttft_n"] == "1"
-    assert fields["ttft_win_n"] == "1"
-    for gone in ("ttft_ms", "ttft_win_ms", "ttft_p50_ms", "ttft_p95_ms"):
-        assert gone not in fields, f"{gone} should be off the kv_hbm line"
-
-
 def _captured_ttft_lines(monkeypatch, controller, request) -> list[str]:
     """`vllm`'s root logger sets `propagate=False`, so `caplog` sees nothing
     here — the module logger has to be intercepted directly."""
@@ -1566,16 +1421,11 @@ def test_a_backwards_clock_writes_no_line(monkeypatch):
 
 def test_observe_only_reports_itself_as_the_baseline_variant():
     """`VLLM_NODE_EVICTION_POLICY=0` gives upstream, not a measurable
-    baseline: no controller means no `kv_hbm` line to diff against. Observe
-    mode keeps the line and labels it so the two arms are distinguishable in
-    the field the timeline tool keys on."""
+    baseline: no controller means no `kv_hbm_ttft` line to diff against.
+    Observe mode keeps the lines and labels them so the two arms are
+    distinguishable in the field the timeline tool keys on."""
     controller = make_controller(FakePool(num_blocks=16), observe_only=True)
-    fields = dict(
-        part.split("=", 1)
-        for part in controller.hbm_summary().split()
-        if "=" in part
-    )
-    assert fields["variant"] == "baseline"
+    assert controller._variant == "baseline"
     assert controller.stats()["observe_only"] is True
 
 
@@ -1583,7 +1433,7 @@ def test_a_disabled_splice_is_labelled_baseline_too():
     """`splice_max_blocks: 0` in the JSON is behaviourally the same arm, and
     used to report itself as `node_eviction`."""
     controller = make_controller(FakePool(num_blocks=16), splice_max_blocks=0)
-    assert "variant=baseline " in controller.hbm_summary()
+    assert controller._variant == "baseline"
 
 
 def test_observe_only_never_reorders_the_queue():

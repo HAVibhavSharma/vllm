@@ -188,17 +188,9 @@ class NodeEvictionController:
         self._last_prefetch_log_monotonic = 0.0
         self._last_prefetch_fingerprint: tuple[int, ...] | None = None
 
-        # HBM accounting line. `_evictions_by_key` counts per window and is
-        # cleared when the line is emitted: a job that finished stops being
-        # named instead of pinning its `job_id` in a dict for the lifetime
-        # of the server.
-        self._last_hbm_log_monotonic = 0.0
-        self._last_hbm_fingerprint: tuple[int, ...] | None = None
-        self._evictions_by_key: dict[str, int] = {}
-
         # Measurement epoch. Bumped by `reset_measurement`, which the
         # benchmark harness calls over `POST /v1/kv_metrics/reset` once its
-        # warmup has finished. Every `kv_hbm` line carries the epoch it was
+        # warmup has finished. Every `kv_hbm_ttft` line carries the epoch it was
         # measured in, so a line from the warmup can never be mistaken for a
         # line from the run — the two are otherwise identical in shape.
         self.metrics_epoch = 0
@@ -339,18 +331,6 @@ class NodeEvictionController:
             was_spliced=breakdown is not None and breakdown.scored,
             speculative=speculative,
         )
-        # Attribute the eviction to the node that owned the block, so the
-        # summary line can say *whose* prefix was destroyed rather than only
-        # how many blocks went. A block with several owners is charged to
-        # each: the eviction cost all of them their hit.
-        for key in keys:
-            label = f"{key.job_id}:{key.node}"
-            self._evictions_by_key[label] = self._evictions_by_key.get(label, 0) + 1
-        if not keys:
-            self._evictions_by_key["<untracked>"] = (
-                self._evictions_by_key.get("<untracked>", 0) + 1
-            )
-
         # Remember the hash so a later re-cache of the same prefix can be
         # recognised as redone work. Read off the block rather than passed
         # in: `BlockPool` calls this *before* `reset_hash()`, so the hash is
@@ -439,7 +419,7 @@ class NodeEvictionController:
         """`KVCacheManager.free` — the request is done with its blocks.
 
         Emits this request's own TTFT, on its own line. Not an average: the
-        `kv_hbm` line carries only how many samples were taken, and the
+        aggregate line carried only how many samples were taken, and the
         samples themselves live here, one per request, so that any aggregate
         can be computed afterwards over whichever subset of requests is
         actually being asked about.
@@ -479,7 +459,7 @@ class NodeEvictionController:
             logger.info("%s", self._ttft_line(request, ttft_ms))
 
     def _ttft_line(self, request, ttft_ms: float) -> str:
-        """One request's TTFT, in the same key=value shape as `kv_hbm`.
+        """One request's TTFT, in `key=value` shape.
 
         The token breakdown travels with the latency because the latency
         alone cannot be read: 400 ms is a fast cold prefill or a slow warm
@@ -512,7 +492,7 @@ class NodeEvictionController:
             f"external_hit_tokens={external} "
             f"cold_tokens={cold} "
             f"preempted={getattr(request, 'num_preemptions', 0)} "
-            # Phantom prefetches are excluded from every rate on the `kv_hbm`
+            # Phantom prefetches are excluded from every demand-side rate
             # line, so their latency is flagged rather than dropped: it is
             # real work the policy originated, and hiding it would make
             # origination look free.
@@ -603,12 +583,6 @@ class NodeEvictionController:
 
         counters = self.observer.counters
         counters.ticks_total += 1
-
-        # Above the early returns below: HBM occupancy and the splice volume
-        # are exactly what needs reporting when the tick is skipping, since
-        # a tick that never reaches the splice is the failure mode the line
-        # is meant to expose.
-        self._maybe_log_hbm_summary(now)
 
         snapshot = (
             self.snapshot_source.get_snapshot()
@@ -781,90 +755,6 @@ class NodeEvictionController:
             else "node_eviction"
         )
 
-    def hbm_summary(self) -> str:
-        """One line of HBM block accounting, in `key=value` form.
-
-        The LRU baseline emits the *same* line with `variant=baseline` and
-        `splices=0`, which is the whole point: the two runs are meant to be
-        diffed field by field, and a format that drifts between them turns
-        the comparison into manual reading.
-
-        `top_evicted` names `job_id:node` because "we evicted 12k blocks" is
-        not actionable and "we evicted 12k blocks, 9k of them job7:research"
-        is — it says the forecast for one node is wrong, not that the cache
-        is small.
-        """
-        pool = self.block_pool
-        total = pool.num_gpu_blocks
-        free = pool.get_num_free_blocks()
-        used = total - free
-        c = self.observer.counters
-        m = self.movement
-        top = sorted(
-            self._evictions_by_key.items(), key=lambda kv: (-kv[1], kv[0])
-        )[: self.config.hbm_summary_top_keys]
-        top_str = ",".join(f"{label}={n}" for label, n in top) or "-"
-        return (
-            f"kv_hbm variant={self._variant} "
-            f"total={total} used={used} free={free} "
-            f"usage={(used / total * 100.0) if total else 0.0:.1f}% "
-            f"queue={pool.free_block_queue.num_free_blocks} "
-            f"splices={c.splices_total} "
-            f"spliced_blocks={c.blocks_spliced_total} "
-            # `staged` is how deep the policy's authority reaches into the
-            # free queue; `deficit` is what it wanted to rank and could not.
-            # Everything past `staged` is evicted by raw LRU age, so these
-            # two say whether the scores are governing evictions at all.
-            f"staged={c.splice_staged_blocks} "
-            f"deficit={c.splice_deficit_blocks} "
-            f"evicted={c.evictions_total} "
-            f"evicted_by_score={c.evictions_by_score_total} "
-            f"regret={c.regret_rate:.3f} "
-            f"hit_rate={m.hit_rate:.4f} "
-            f"hit_rate_win={m.window_hit_rate:.4f} "
-            # How many TTFT samples stand behind this epoch — not what they
-            # were. The latencies themselves are on their own `kv_hbm_ttft`
-            # lines, one per request, because an average computed here is
-            # fixed at write time to a window nobody chose, and TTFT is
-            # heavy-tailed enough that such an average routinely describes
-            # no request in it. The count stays because every rate on this
-            # line is unreadable without knowing how many requests produced
-            # it, and because a window where only latency moved still has to
-            # get past the change gate.
-            f"ttft_n={self.ttft.count} "
-            f"ttft_win_n={self.ttft.window_count} "
-            f"hit_tokens={m.hit_tokens} "
-            f"query_tokens={m.query_tokens} "
-            # The rest of `query_tokens - hit_tokens`, split in two so the
-            # line reads as a cascade: queried, held in HBM, served by
-            # LMCache, and what still had to be prefilled. The external
-            # figure is reported rather than left to be derived because the
-            # derivation is wrong whenever the tiers' spans overlap and the
-            # clamp fires; neither is a rate, because no eviction policy
-            # here governs the external tier.
-            f"external_hit_tokens={m.external_hit_tokens} "
-            f"cold_tokens={m.cold_tokens} "
-            # Phantom traffic, excluded from every rate above. Reported so
-            # the prefill origination bought is visible next to the hit rate
-            # it was meant to raise, rather than hidden inside it.
-            f"phantom_hit_rate={m.phantom_hit_rate:.4f} "
-            f"phantom_query_tokens={m.phantom_query_tokens} "
-            f"remat_blocks={m.remat_blocks} "
-            f"remat_mb={m.remat_mb:.1f} "
-            f"remat_ratio={m.remat_ratio:.4f} "
-            f"blocks_cached={m.blocks_cached} "
-            f"index_keys={self.index.num_keys} "
-            f"index_blocks={self.index.num_blocks} "
-            # Which measurement epoch these numbers belong to, and how long it
-            # has been running. `epoch=0` is everything before the harness
-            # said its warmup was done; the run to report on is the highest
-            # epoch present. Placed ahead of `top_evicted` because that field
-            # is free-form (it contains `=` and `,`) and has to stay last.
-            f"epoch={self.metrics_epoch} "
-            f"epoch_age_s={self.epoch_age_s:.1f} "
-            f"top_evicted={top_str}"
-        )
-
     @property
     def epoch_age_s(self) -> float:
         """Seconds since the current measurement epoch began.
@@ -903,17 +793,11 @@ class NodeEvictionController:
         so the warm phase starts with an empty HBM cache in front of a
         populated CPU tier.
 
-        The final pre-reset `kv_hbm` line is emitted first, ungated, so the
-        cold phase's numbers survive in the log rather than being thrown away;
-        then a `kv_hbm_reset` marker line names the boundary. Returns the
-        discarded stats so the caller can file them with its own results.
+        A `kv_hbm_reset` marker line names the boundary, and the discarded
+        stats are returned so the caller can file them with its own results --
+        which is where the cold phase's numbers survive now that the periodic
+        accounting line is gone.
         """
-        # Ungated: `_maybe_log_hbm_summary` would suppress this if the period
-        # had not elapsed or nothing had changed, and the one line guaranteed
-        # to matter is the last one before the boundary.
-        discarded_line = self.hbm_summary()
-        logger.info("%s", discarded_line)
-
         discarded = self.stats()
         previous_epoch = self.metrics_epoch
         epoch_age_s = self.epoch_age_s
@@ -929,18 +813,11 @@ class NodeEvictionController:
         self.observer.counters.policy_enabled = self.enabled
         self.movement.reset_measurement()
         self.ttft.reset_measurement()
-        self._evictions_by_key.clear()
 
         self.metrics_epoch += 1
         self._epoch_started_monotonic = time.monotonic()
         self._epoch_started_wall = time.time()
         self._epoch_label = label or "reset"
-
-        # So the first line of the new epoch is not withheld by the rate limit
-        # or the change gate — with the counters at zero the fingerprint would
-        # otherwise have to move before anything printed.
-        self._last_hbm_log_monotonic = 0.0
-        self._last_hbm_fingerprint = None
 
         marker = (
             f"kv_hbm_reset variant={self._variant} "
@@ -978,52 +855,6 @@ class NodeEvictionController:
             "discarded_stats": discarded,
             "marker": marker,
         }
-
-    def _maybe_log_hbm_summary(self, now: float) -> str | None:
-        """Rate-limited and change-gated, exactly like the prefetch line.
-
-        Returns the line it logged, or None — `vllm`'s root logger sets
-        `propagate=False`, so a test written against pytest's `caplog` would
-        see nothing and pass vacuously.
-        """
-        if self.config.hbm_summary_period_ms <= 0:
-            return None
-        period_s = self.config.hbm_summary_period_ms / 1000.0
-        if now - self._last_hbm_log_monotonic < period_s:
-            return None
-
-        c = self.observer.counters
-        # Occupancy is deliberately *not* in the fingerprint: it moves by a
-        # block on every step, so including it would defeat the change gate
-        # and print a line every period forever.
-        fingerprint = (
-            c.splices_total,
-            c.blocks_spliced_total,
-            c.evictions_total,
-            c.evictions_by_score_total,
-            self.movement.query_tokens,
-            # Phantom queries no longer move `query_tokens`, so without this
-            # a window of pure origination activity would compare equal and
-            # print nothing — origination invisible exactly when it is doing
-            # the most work.
-            self.movement.phantom_query_tokens,
-            self.movement.remat_blocks,
-            # A window where only latency moved is still worth a line.
-            self.ttft.count,
-        )
-        if fingerprint == self._last_hbm_fingerprint:
-            return None
-        self._last_hbm_log_monotonic = now
-        self._last_hbm_fingerprint = fingerprint
-        summary = self.hbm_summary()
-        logger.info("%s", summary)
-        # Per-window, so the next line names who is evicting *now* and shows
-        # the hit rate *now* rather than one dominated by whatever the
-        # workload happened to do first.
-        self._evictions_by_key.clear()
-        self.movement.reset_window()
-        self.ttft.reset_window()
-        return summary
 
     def _maybe_gc(self, now: float) -> None:
         if (now - self._last_gc_monotonic) * 1000.0 < self.config.index_gc_period_ms:

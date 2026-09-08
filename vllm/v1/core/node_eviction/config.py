@@ -31,7 +31,7 @@ class NodeEvictionConfig:
     """Run the bookkeeping and the reporting, but never reorder the queue.
 
     The A/B baseline arm. `VLLM_NODE_EVICTION_POLICY=0` gives *upstream*, not
-    a measurable baseline: with no controller there is no `kv_hbm` line, no
+    a measurable baseline: with no controller there is no `kv_hbm_ttft` line, no
     hit-rate or remat tracking, and nothing to diff the policy arm against
     field by field — which is what that line exists for.
 
@@ -249,19 +249,6 @@ class NodeEvictionConfig:
     regret_buffer_size: int = 4096
     """Bound on the ring buffer backing that counter."""
 
-    hbm_summary_period_ms: float = 30_000.0
-    """How often the tick may log one INFO line of HBM block accounting:
-    how many blocks exist, how many are in use, how many sit in the free
-    queue, how many the splice reshuffled, and which node keys the evictions
-    came from. Rate limited *and* change-gated like the prefetch line, so an
-    idle server stays silent. Set to 0 to turn the line off.
-
-    The line is emitted in the same `kv_hbm ...` key=value shape by the LRU
-    baseline, so the two runs diff directly. Without it there is no way to
-    tell a policy that reshuffled nothing from one that reshuffled
-    constantly — both look identical in the hit rate until the workload
-    changes."""
-
     remat_window_blocks: int = 0
     """How many recently-evicted block hashes to remember when counting
     rematerialisation — a block cached again after being evicted, i.e. work
@@ -277,18 +264,16 @@ class NodeEvictionConfig:
     """One INFO `kv_hbm_ttft` line per request that produced a token, giving
     that request's engine-side TTFT and the token breakdown behind it.
 
-    On by default because it is now the *only* place TTFT is reported: the
-    `kv_hbm` line carries the sample count and nothing else. A mean or a
+    On by default because it is the *only* place TTFT is reported. A mean or a
     percentile computed in-process is fixed at write time to a window nobody
     chose, and TTFT is heavy-tailed enough that such a figure routinely
     describes no request that produced it. Raw samples can be aggregated
     afterwards over exactly the requests being asked about — a warm subset, a
     single job, the tail — which no in-process summary can be re-cut into.
 
-    The cost is one line per request rather than one per window, which is
-    real under load. Set False when running with the policy in production
-    rather than in an experiment; the sample count on the `kv_hbm` line does
-    not depend on this."""
+    The cost is one line per request, which is real under load. Set False
+    when running with the policy in production rather than in an
+    experiment."""
 
     ttft_chat_completions_only: bool = True
     """Take a TTFT sample only from requests that arrived on
@@ -304,14 +289,8 @@ class NodeEvictionConfig:
     produces a token, e.g. when the run is not driven through the chat API at
     all.
 
-    Applies to both the per-request `kv_hbm_ttft` lines and the `ttft_n` /
-    `ttft_win_n` counts on the `kv_hbm` line, so the two stay one
-    population."""
-
-    hbm_summary_top_keys: int = 5
-    """How many `job_id:node` keys the HBM line names as eviction sources.
-    Counted per window and reset after each line, which is also what bounds
-    the memory: a finished job stops appearing instead of accumulating."""
+    Applies to the per-request `kv_hbm_ttft` lines and to the `ttft_n`
+    counter reported by `stats()`, so the two stay one population."""
 
     # --- Redis transport (01 §2) ------------------------------------------
     redis_url: str | None = None
@@ -425,8 +404,6 @@ class NodeEvictionConfig:
                 "speculative_floor_high must be 0 (off) or exceed "
                 "delta_cold_ms so the floor sits above the whole score range"
             )
-        if self.hbm_summary_top_keys < 0:
-            raise ValueError("hbm_summary_top_keys must be >= 0")
         if self.remat_window_blocks < 0:
             raise ValueError("remat_window_blocks must be >= 0")
         if self.uninformative_prob_at_or_below > 1.0:
