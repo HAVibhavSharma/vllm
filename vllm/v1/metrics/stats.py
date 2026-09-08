@@ -251,6 +251,17 @@ class FinishedRequestStats:
     # Prompt tokens fetched via external KV transfer (e.g. LMCache connector).
     num_external_cached_tokens: int = 0
     prefix_cache_hit_rate: float = 0.0
+    # Absolute wall-clock timestamps, in epoch seconds. Durations alone cannot
+    # express the gap *between* two requests of a job, which is the only
+    # signal vLLM has for tool execution time -- and without it this build's
+    # per-request rows cannot be lined up against the modified build's.
+    #
+    # Wall clock only: this class mixes two clocks, and the engine-core
+    # timestamps (queued_ts, scheduled_ts, first_token_ts, last_token_ts) are
+    # monotonic. Monotonic values are meaningless across processes and across
+    # restarts, so they may only ever be exported as durations.
+    arrival_ts: float = 0.0
+    finish_ts: float = 0.0
 
 
 @dataclass
@@ -506,6 +517,11 @@ class IterationStats:
             num_local_cached_tokens=num_local_cached_tokens,
             num_external_cached_tokens=num_external_cached_tokens,
             prefix_cache_hit_rate=prefix_cache_hit_rate,
+            arrival_ts=req_stats.arrival_time,
+            # Derived rather than stamped again: `e2e_latency` is already
+            # `iteration_timestamp - arrival_time`, so adding it back gives the
+            # finishing iteration's own timestamp on the same clock.
+            finish_ts=req_stats.arrival_time + e2e_latency,
         )
         self.finished_requests.append(finished_req)
 

@@ -1267,6 +1267,8 @@ _CSV_COLUMNS = [
     "inference_time",
     "decode_time",
     "max_tokens_param",
+    "arrival_ts",
+    "finish_ts",
 ]
 
 
@@ -1350,6 +1352,11 @@ class FileStatLogger(StatLoggerBase):
                 "inference_time": req.inference_time,
                 "decode_time": req.decode_time,
                 "max_tokens_param": req.max_tokens_param,
+                # Wall clock, epoch seconds. A trace analyser infers tool
+                # execution time from next.arrival_ts - prev.finish_ts within
+                # one job; a gap cannot be derived from durations.
+                "arrival_ts": req.arrival_ts,
+                "finish_ts": req.finish_ts,
             }
             self._csv_writer.writerow(row)
             self._jsonl_file.write(json.dumps(row) + "\n")
