@@ -84,6 +84,13 @@ def _compile_agent_pattern(pattern: str) -> re.Pattern[str] | None:
         return None
 
 
+# Separates the parallel-unit suffix from the graph path in an agent id, e.g.
+# `langgraph:1:research_supervisor:supervisor_tools:researcher#2`. Mirrors
+# `AGENT_UNIT_SEP` on the client that mints these ids; kept as a literal here
+# rather than imported, since the client is not a dependency of the engine.
+AGENT_UNIT_SEP = "#"
+
+
 @dataclass(frozen=True)
 class PrefixDescriptor:
     """A single recordable prefix entry."""
@@ -226,7 +233,7 @@ class AgentPrefixRegistry:
         """
         if not self._patterns:
             return []
-        bare = agent_id.split("#", 1)[0]
+        bare = agent_id.split(AGENT_UNIT_SEP, 1)[0]
         return [
             key
             for key, compiled in self._patterns.items()
@@ -234,21 +241,60 @@ class AgentPrefixRegistry:
             and (compiled.match(agent_id) or compiled.match(bare))
         ]
 
+    def _unit_siblings_locked(self, agent_id: str) -> list[str]:
+        """Keys naming the same graph path as ``agent_id`` at a different unit.
+
+        Two callers name the same predicted target differently, and neither is
+        wrong. A predictor that fires *before* a fan-out has assigned its unit
+        can only say ``…:researcher``; one that fires after, off a request
+        that already carries ``…:researcher#1``, says that. Chat traffic is
+        recorded under the id the request carried, so without this the
+        unit-less caller looks into a bucket nothing ever writes and sees only
+        whatever pattern seed happens to cover it -- never the conversation
+        prefix the node has actually been accumulating.
+
+        So the bare id is treated as the pooled parent of its units: asking
+        for it sees every ``…#unit`` bucket, and asking for one unit also sees
+        the parent. Pooling siblings is the price -- a bare lookup during a
+        fan-out mixes ``#1`` and ``#2`` -- and it is the right price, because
+        a caller that cannot name the unit is asking exactly that question.
+        A caller that can name it still gets its own bucket first.
+        """
+        bare, sep, _ = agent_id.partition(AGENT_UNIT_SEP)
+        if sep:
+            # Asking as a unit: the pooled parent, if anything wrote it.
+            return [bare] if bare in self._by_agent else []
+        # Asking as the parent: every unit under it.
+        prefix = agent_id + AGENT_UNIT_SEP
+        return [key for key in self._by_agent if key.startswith(prefix)]
+
     def _descriptors_locked(self, agent_id: str) -> list[PrefixDescriptor]:
         """Every descriptor visible to ``agent_id``, newest-first.
 
-        The agent's own bucket plus any pattern bucket that covers it, merged
-        on recency rather than concatenated -- a caller asking for the k most
-        recent prefixes must get the k most recent, not k from whichever
-        bucket happened to be scanned first.
+        The agent's own bucket, any pattern bucket that covers it, and the
+        unit siblings of its graph path, merged on recency rather than
+        concatenated -- a caller asking for the k most recent prefixes must
+        get the k most recent, not k from whichever bucket happened to be
+        scanned first.
         """
         own = self._by_agent.get(agent_id)
-        matches = self._matching_agents_locked(agent_id)
-        if not matches:
+        extra = self._matching_agents_locked(agent_id)
+        extra.extend(
+            key for key in self._unit_siblings_locked(agent_id) if key not in extra
+        )
+        if not extra:
             return list(reversed(list(own.values()))) if own else []
         pooled: list[PrefixDescriptor] = list(own.values()) if own else []
-        for key in matches:
-            pooled.extend(self._by_agent[key].values())
+        # Deduped on prefix hash: the same prefix can sit in a unit bucket and
+        # in a pattern bucket that covers it, and returning it twice would
+        # spend two of the caller's k slots on one prefix.
+        seen: set[bytes] = {d.prefix_hash for d in pooled}
+        for key in extra:
+            for desc in self._by_agent[key].values():
+                if desc.prefix_hash in seen:
+                    continue
+                seen.add(desc.prefix_hash)
+                pooled.append(desc)
         pooled.sort(key=lambda d: d.last_used_ns, reverse=True)
         return pooled
 
