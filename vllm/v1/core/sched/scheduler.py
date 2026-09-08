@@ -182,15 +182,27 @@ class Scheduler(SchedulerInterface):
         # ahead sat `Deferred` for all 15, and the request it targeted still
         # paid the prefill as latency.
         #
-        # `1` lets a phantom overlap a batch that is only decoding, which is
-        # the state a single-agent workflow is in for most of its run. That
-        # costs the decoding request one long step -- chunked prefill bounds
-        # it via `long_prefill_token_threshold` -- in exchange for taking the
-        # prefill off the next request's critical path, which is the entire
-        # trade the prefetch exists to make. Raise it further to overlap
-        # deeper batches, or set `0` to restore strictly-idle.
+        # `2` overlaps a batch that is decoding or lightly loaded. `1` was
+        # enough to fix the strictly-idle failure above, and it is where the
+        # safe part of the trade ends: a decoding step has almost its whole
+        # token budget spare, so a phantom joining it costs that request one
+        # long step -- chunked prefill bounds it via
+        # `long_prefill_token_threshold` -- and buys the next request its
+        # whole prefill.
+        #
+        # Past that the count starts being a poor proxy for what actually
+        # matters, which is how much of the step's token budget real work is
+        # already drawing. On the ODR replay the two are perfectly
+        # correlated in the wrong direction: every window with 2 or 3
+        # running was the burst of concurrent tool summarizations, at
+        # 1300-2200 tok/s of real prefill, while 8 of 12 single-request
+        # windows ran at 0.0. So raising this admits phantoms precisely
+        # where the budget is already contended, and the deferral it
+        # bypasses is the one case it was built for. Watch the *cold*
+        # requests' TTFT when raising it, not the hit rate -- the hit rate
+        # cannot see the cost.
         self._prefetch_prefill_max_running = int(
-            os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "1") or 1
+            os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "2") or 2
         )
         # A deferred phantom is not free to wait forever: a warm that lands
         # after the request it was for is pure cost. Past this many seconds it
