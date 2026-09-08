@@ -871,7 +871,9 @@ class NodeEvictionController:
             "at": self._epoch_started_wall,
             "prev_epoch_age_s": epoch_age_s,
             "hbm_flushed": hbm_flushed,
-            "discarded_line": discarded_line,
+            # `discarded_line` used to carry the final pre-reset kv_hbm line.
+            # That line is gone; `discarded_stats` is the same numbers in the
+            # form a caller can actually read, so nothing was lost with it.
             "discarded_stats": discarded,
             "marker": marker,
         }
