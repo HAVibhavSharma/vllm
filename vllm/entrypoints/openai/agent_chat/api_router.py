@@ -242,6 +242,12 @@ def _resolve_registry_agent_id(
     """The requested `agent_id`, unless nothing is filed under it and the
     request's own `langgraph_node` names an agent that does exist.
 
+    Mostly superseded by wildcard registry keys: a seed written as
+    `ns:*:**:node` is *found under the requested id*, so `agent_size` is
+    non-zero and this never fires. It remains for the case a pattern cannot
+    express -- a writer that used a different key shape entirely -- and as
+    the signal that one is in play.
+
     The registry is filled by `POST /v1/agents/chat/completions` and by a
     `text=` seed on this endpoint, under whatever `agent_id` the caller sent.
     A client that identifies nodes by their graph position on one path and by
@@ -714,7 +720,9 @@ async def prefetch_agent_cache(
             "traffic is going to plain /v1/chat/completions, which does not "
             "write the registry. Send a `text=` (single message) or "
             "`messages=` (conversation) seed on this endpoint, with "
-            "prefill_on_miss=true, to populate it up front.",
+            "prefill_on_miss=true, to populate it up front -- under a "
+            "wildcard key (`ns:*:**:node`) if the seeding phase does not yet "
+            "know the job id or the graph path the real traffic will use.",
             request.agent_id,
         )
     if identity is None:
@@ -747,6 +755,12 @@ async def prefetch_agent_cache(
             else {}
         ),
         "agent_kind": request.agent_kind,
+        # Capability flag, not a per-call outcome. A seed written under a
+        # wildcard key is inert on a server without pattern matching -- it is
+        # stored as a literal agent id nothing ever asks for, and every later
+        # prefetch reports `available_prefixes: 0` with no error. The seeding
+        # phase asserts this before trusting a wildcard seed.
+        "pattern_agent_ids": True,
         # `seeded` says a prefix was recorded; the second field says which
         # spelling it came in as, because the two have different failure
         # modes -- a `text` seed can be a prefix of nothing if the role is

@@ -26,6 +26,7 @@ post-processing) may also touch the registry.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -34,6 +35,53 @@ from dataclasses import dataclass, field
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# A key containing one of these is a pattern, not an agent. Real ids come from
+# `derive_agent_id`, which normalizes every segment, so neither can occur in
+# one by accident.
+_WILDCARD = "*"
+
+# Guards the per-lookup scan. Patterns come from a seeding phase with one entry
+# per node, so this is orders of magnitude above what a run creates; a config
+# that blows past it is a bug, not a workload.
+_MAX_PATTERNS = 256
+
+
+def _compile_agent_pattern(pattern: str) -> re.Pattern[str] | None:
+    """Translate a segment glob over agent ids into an anchored regex.
+
+    Two wildcards, both segment-scoped -- never a raw regex from a caller,
+    because these keys arrive over HTTP and a caller-supplied pattern is both
+    a ReDoS surface and a way to match buckets it should not see.
+
+    ``*``   exactly one segment  (``langgraph:*:researcher``)
+    ``**``  zero or more segments (``langgraph:*:**:researcher``)
+
+    The second is what makes a seed reachable: it spans the graph path, whose
+    depth the seeding phase does not know. Returns None for a key with no
+    wildcard, which is an ordinary agent id and must stay an exact-match key.
+    """
+    if _WILDCARD not in pattern:
+        return None
+    segments = pattern.split(":")
+    out: list[str] = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        if segment == "**":
+            # Absorbs its own trailing separator so it can match zero segments.
+            out.append(r"[^:]+(?::[^:]+)*" if last else r"(?:[^:]+:)*")
+            continue
+        if segment == _WILDCARD:
+            out.append(r"[^:]+")
+        else:
+            out.append(re.escape(segment))
+        if not last:
+            out.append(":")
+    try:
+        return re.compile("".join(out) + r"\Z")
+    except re.error:
+        return None
 
 
 @dataclass(frozen=True)
@@ -100,6 +148,10 @@ class AgentPrefixRegistry:
         self._by_agent: OrderedDict[
             str, OrderedDict[bytes, PrefixDescriptor]
         ] = OrderedDict()
+        # Compiled form of every wildcard key in `_by_agent`, kept alongside
+        # rather than recompiled per lookup. Empty in the common case, which
+        # is the one branch every read pays.
+        self._patterns: dict[str, re.Pattern[str]] = {}
 
     # -- mutators ---------------------------------------------------------
 
@@ -120,6 +172,9 @@ class AgentPrefixRegistry:
             if agent_map is None:
                 agent_map = OrderedDict()
                 self._by_agent[agent_id] = agent_map
+                compiled = _compile_agent_pattern(agent_id)
+                if compiled is not None and len(self._patterns) < _MAX_PATTERNS:
+                    self._patterns[agent_id] = compiled
                 self._maybe_evict_agent_locked()
             else:
                 # Promote the agent itself to MRU in the outer dict.
@@ -144,16 +199,58 @@ class AgentPrefixRegistry:
 
     def evict_agent(self, agent_id: str) -> bool:
         """Drop all entries for an agent. Returns True if anything was
-        removed."""
+        removed.
+
+        Exact key only. A `non-react` seed dropping every pattern that happens
+        to cover it would delete another node's seeds as a side effect of
+        recording its own.
+        """
         with self._lock:
+            self._patterns.pop(agent_id, None)
             return self._by_agent.pop(agent_id, None) is not None
 
     def clear(self) -> None:
         """Drop the entire registry."""
         with self._lock:
             self._by_agent.clear()
+            self._patterns.clear()
 
     # -- readers ----------------------------------------------------------
+
+    def _matching_agents_locked(self, agent_id: str) -> list[str]:
+        """Pattern keys that cover ``agent_id``, exact key excluded.
+
+        Matched against the id with its ``#unit`` suffix stripped as well as
+        whole, so a seed written before any unit existed still covers the
+        per-unit buckets a fan-out will ask for.
+        """
+        if not self._patterns:
+            return []
+        bare = agent_id.split("#", 1)[0]
+        return [
+            key
+            for key, compiled in self._patterns.items()
+            if key != agent_id
+            and (compiled.match(agent_id) or compiled.match(bare))
+        ]
+
+    def _descriptors_locked(self, agent_id: str) -> list[PrefixDescriptor]:
+        """Every descriptor visible to ``agent_id``, newest-first.
+
+        The agent's own bucket plus any pattern bucket that covers it, merged
+        on recency rather than concatenated -- a caller asking for the k most
+        recent prefixes must get the k most recent, not k from whichever
+        bucket happened to be scanned first.
+        """
+        own = self._by_agent.get(agent_id)
+        matches = self._matching_agents_locked(agent_id)
+        if not matches:
+            return list(reversed(list(own.values()))) if own else []
+        pooled: list[PrefixDescriptor] = list(own.values()) if own else []
+        for key in matches:
+            pooled.extend(self._by_agent[key].values())
+        pooled.sort(key=lambda d: d.last_used_ns, reverse=True)
+        return pooled
 
     def top_k(self, agent_id: str, k: int | None = None) -> list[PrefixDescriptor]:
         """Return up to ``k`` most-recently-used descriptors for the agent.
@@ -171,13 +268,7 @@ class AgentPrefixRegistry:
             return []
 
         with self._lock:
-            agent_map = self._by_agent.get(agent_id)
-            if not agent_map:
-                return []
-            # OrderedDict is iterated oldest -> newest; we want the
-            # newest k entries, in newest-first order.
-            descriptors = list(agent_map.values())
-            return list(reversed(descriptors[-k:]))
+            return self._descriptors_locked(agent_id)[:k]
 
     def get_all(self, agent_id: str) -> list[PrefixDescriptor]:
         """Return *every* descriptor registered for ``agent_id``,
@@ -190,15 +281,17 @@ class AgentPrefixRegistry:
         gets warmed.
         """
         with self._lock:
-            agent_map = self._by_agent.get(agent_id)
-            if not agent_map:
-                return []
-            return list(reversed(list(agent_map.values())))
+            return self._descriptors_locked(agent_id)
 
     def agent_size(self, agent_id: str) -> int:
+        """How many prefixes a prefetch for ``agent_id`` would find.
+
+        Counts pattern buckets too, because this is what the endpoint reports
+        as `available_prefixes` and gates its "nothing to warm" warning on --
+        a seed reachable only through a pattern must not read as nothing.
+        """
         with self._lock:
-            agent_map = self._by_agent.get(agent_id)
-            return len(agent_map) if agent_map is not None else 0
+            return len(self._descriptors_locked(agent_id))
 
     def num_agents(self) -> int:
         with self._lock:
@@ -215,6 +308,7 @@ class AgentPrefixRegistry:
                 # ``None`` is JSON-serialized as ``null`` ≡ unlimited.
                 "max_per_agent": self.max_per_agent,
                 "default_top_k": self.default_top_k,
+                "num_patterns": len(self._patterns),
             }
 
     # -- internal ---------------------------------------------------------
@@ -227,6 +321,7 @@ class AgentPrefixRegistry:
         """
         while len(self._by_agent) > self.max_agents:
             evicted_agent, _ = self._by_agent.popitem(last=False)
+            self._patterns.pop(evicted_agent, None)
             logger.debug(
                 "agent_prefetch: evicted agent %s (cross-agent LRU)",
                 evicted_agent,
