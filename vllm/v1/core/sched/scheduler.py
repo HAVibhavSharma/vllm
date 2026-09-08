@@ -169,12 +169,28 @@ class Scheduler(SchedulerInterface):
         # A phantom allowed to prefill on a miss is speculative compute, and
         # the GPU is one resource: batching means it does not block a real
         # request, but every token it prefills is token budget that step's
-        # real work does not get. So it is admitted only into a step with no
-        # real work running -- the gap the prefetch was issued into in the
-        # first place. `0` means strictly idle; raise it to let phantoms
-        # overlap a shallow batch.
+        # real work does not get. This caps how much real work it will
+        # overlap.
+        #
+        # Not `0`. Strictly-idle was the first default and it defeats the
+        # whole point: an engine reaches zero-running exactly when the
+        # previous request finishes, which in an agent workflow is the same
+        # instant the next request is issued. A phantom held until then
+        # prefills in a dead heat with the request it was warming for, and
+        # the lead time the caller went to the trouble of creating is spent
+        # in the waiting queue. Measured on an ODR replay: a seed issued 15s
+        # ahead sat `Deferred` for all 15, and the request it targeted still
+        # paid the prefill as latency.
+        #
+        # `1` lets a phantom overlap a batch that is only decoding, which is
+        # the state a single-agent workflow is in for most of its run. That
+        # costs the decoding request one long step -- chunked prefill bounds
+        # it via `long_prefill_token_threshold` -- in exchange for taking the
+        # prefill off the next request's critical path, which is the entire
+        # trade the prefetch exists to make. Raise it further to overlap
+        # deeper batches, or set `0` to restore strictly-idle.
         self._prefetch_prefill_max_running = int(
-            os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "0") or 0
+            os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "1") or 1
         )
         # A deferred phantom is not free to wait forever: a warm that lands
         # after the request it was for is pure cost. Past this many seconds it
