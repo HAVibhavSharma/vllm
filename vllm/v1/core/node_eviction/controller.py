@@ -89,6 +89,20 @@ def node_key_for_request(
     )
 
 
+def _agent_id_of(request) -> str | None:
+    """The prefetch registry key this request records under, if it carries one.
+
+    Rides in `sampling_params.extra_args` like the eviction identity: the
+    agent chat endpoint keeps `agent_id` on the inner request precisely so it
+    survives into the engine (see
+    `AgentChatCompletionRequest.to_chat_completion_request`).
+    """
+    sampling_params = getattr(request, "sampling_params", None)
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    agent_id = extra_args.get("agent_id")
+    return str(agent_id) if agent_id else None
+
+
 def _is_prefetch_only(request) -> bool:
     """Discriminate a phantom prefetch from a real request.
 
@@ -486,6 +500,12 @@ class NodeEvictionController:
             f"kv_hbm_ttft variant={self._variant} "
             f"epoch={self.metrics_epoch} "
             f"req={request.request_id} "
+            # The graph position this request came from. `node_key_for_request`
+            # already keys eviction on (job, node, call_type); the agent id is
+            # the same identity in the form the prefetch registry uses, so a
+            # warm and the request it was for can be joined by string equality
+            # instead of by reconstructing one from the other.
+            f"agent={_agent_id_of(request) or '-'} "
             f"ttft_ms={ttft_ms:.1f} "
             f"query_tokens={query} "
             f"hit_tokens={local} "

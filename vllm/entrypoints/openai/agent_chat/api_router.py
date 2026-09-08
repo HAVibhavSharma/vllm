@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
+from vllm.logging_utils.access_log_filter import set_request_agent_id
 from vllm.v1.agent_prefetch import (
     DEFAULT_CHUNK_SIZE,
     AgentPrefixRegistry,
@@ -507,6 +508,7 @@ async def create_agent_chat_completion(
 
     registry, _submitter = _get_or_init_state(raw_request, chat_handler)
 
+    set_request_agent_id(request.agent_id)
     cache_salt = _resolve_chat_cache_salt(request)
 
     # 1) Tokenize the incoming request so we can record its prefix
@@ -600,6 +602,10 @@ async def prefetch_agent_cache(
       }
     """
     started_ns = time.monotonic_ns()
+    # Named on this request's access line, so a prefetch can be placed
+    # against the chat completion it was meant to warm without joining two
+    # logs by timestamp.
+    set_request_agent_id(request.agent_id)
 
     chat_handler = _chat_handler(raw_request)
     if chat_handler is None:

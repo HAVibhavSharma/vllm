@@ -9,7 +9,25 @@ production environments.
 """
 
 import logging
+from contextvars import ContextVar
 from urllib.parse import urlparse
+
+# The agent an in-flight request belongs to, for the access log.
+#
+# Uvicorn writes its access line from the ASGI scope, which carries the path
+# and nothing about the body -- so the endpoint has to hand the identity over
+# out of band. A ContextVar is what makes that safe: uvicorn logs from the
+# same task that awaited the handler, so the value set inside the handler is
+# visible when the line is written, and a request that never sets it cannot
+# read another's, because every request runs in its own task context.
+request_agent_id: ContextVar[str | None] = ContextVar(
+    "request_agent_id", default=None
+)
+
+
+def set_request_agent_id(agent_id: str | None) -> None:
+    """Name the agent this request belongs to, for its access log line."""
+    request_agent_id.set(agent_id or None)
 
 
 class UvicornAccessLogFilter(logging.Filter):
@@ -68,6 +86,29 @@ class UvicornAccessLogFilter(logging.Filter):
         return True
 
 
+class AgentAccessFormatter:
+    """Uvicorn's access formatter, plus the agent the request belongs to.
+
+    Subclassed lazily (at construction, not import) so this module does not
+    import uvicorn -- it is imported by the CLI path too, where uvicorn may
+    not be installed.
+
+    The field is appended rather than interpolated into the format string so
+    a line for a non-agent endpoint is byte-identical to what it was before.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        from uvicorn.logging import AccessFormatter
+
+        class _Formatter(AccessFormatter):
+            def formatMessage(self, record: logging.LogRecord) -> str:
+                line = super().formatMessage(record)
+                agent = request_agent_id.get()
+                return f"{line} agent={agent}" if agent else line
+
+        return _Formatter(*args, **kwargs)
+
+
 def create_uvicorn_log_config(
     excluded_paths: list[str] | None = None,
     log_level: str = "info",
@@ -111,7 +152,7 @@ def create_uvicorn_log_config(
                 "use_colors": None,
             },
             "access": {
-                "()": "uvicorn.logging.AccessFormatter",
+                "()": "vllm.logging_utils.access_log_filter.AgentAccessFormatter",
                 "fmt": '%(levelprefix)s %(asctime)s.%(msecs)03d %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },
