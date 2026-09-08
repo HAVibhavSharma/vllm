@@ -387,6 +387,80 @@ async def _render_seed_text_to_token_ids(
     return out
 
 
+async def _render_seed_messages_to_token_ids(
+    chat_handler: "OpenAIServingChat",
+    model_name: str,
+    messages: list[dict[str, Any]],
+) -> list[int] | None:
+    """Render a whole conversation the same way the chat endpoint would.
+
+    The multi-turn counterpart of :func:`_render_seed_text_to_token_ids`, and
+    the reason it exists: ``text`` wraps its content in exactly one message of
+    one role, so a conversation sent through it renders as a single block
+    whose tokens are a prefix of nothing. A caller that knows the message list
+    the next request will open with -- an agent loop that has just appended
+    its own reply to the turn it sent -- can only express that here.
+
+    ``add_generation_prompt=False`` is what makes the result a *prefix*: with
+    it, rendering stops after the last message, so the tokens are exactly the
+    leading run of any real chat that starts with these messages. Roles need
+    no separate argument; each message carries its own.
+    """
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+
+    try:
+        inner = ChatCompletionRequest(
+            model=model_name,
+            messages=messages,
+            chat_template_kwargs={"add_generation_prompt": False},
+        )
+    except Exception:
+        logger.exception(
+            "agent_prefetch: failed to build seed ChatCompletionRequest "
+            "from %d messages",
+            len(messages),
+        )
+        return None
+
+    try:
+        rendered = await chat_handler.render_chat_request(inner)
+    except Exception:
+        logger.exception(
+            "agent_prefetch: render_chat_request failed for seed messages"
+        )
+        return None
+
+    if isinstance(rendered, ErrorResponse):
+        logger.warning(
+            "agent_prefetch: render_chat_request returned ErrorResponse "
+            "for seed messages: %s",
+            rendered.error.message if rendered.error else "<no message>",
+        )
+        return None
+
+    _conversation, engine_inputs = rendered
+    if not engine_inputs:
+        logger.warning(
+            "agent_prefetch: render produced no engine inputs for seed "
+            "messages"
+        )
+        return None
+
+    components = chat_handler._extract_prompt_components(engine_inputs[0])
+    out = list(components.token_ids or [])
+    logger.info(
+        "agent_prefetch: seed messages rendered to %d tokens "
+        "(messages=%d, roles=%s, chunk_size=%d, path=render_chat_request)",
+        len(out),
+        len(messages),
+        ",".join(str(m.get("role")) for m in messages[:8]),
+        DEFAULT_CHUNK_SIZE,
+    )
+    return out
+
+
 @router.post(
     "/v1/agents/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -538,25 +612,39 @@ async def prefetch_agent_cache(
     cache_salt = _resolve_prefetch_cache_salt(request)
     seeded = False
 
+    seeded_from_messages = False
+
     logger.info(
-        "agent_prefetch: seed payload presence: text=%s (chars=%s)",
+        "agent_prefetch: seed payload presence: text=%s (chars=%s) "
+        "messages=%s",
         request.text is not None,
         len(request.text) if request.text is not None else 0,
+        len(request.messages) if request.messages is not None else 0,
     )
 
-    # Optional registry seed from raw prefix text.
-    if request.text is not None:
-        token_ids = await _render_seed_text_to_token_ids(
-            chat_handler,
-            chat_handler.model_config.model,
-            request.text,
-            role=request.text_role,
-        )
+    # Optional registry seed, from raw prefix text or from a conversation.
+    # The two are mutually exclusive (enforced on the model), so this is one
+    # slot with two spellings rather than two independent seeds.
+    if request.text is not None or request.messages is not None:
+        if request.messages is not None:
+            seeded_from_messages = True
+            token_ids = await _render_seed_messages_to_token_ids(
+                chat_handler,
+                chat_handler.model_config.model,
+                request.messages,
+            )
+        else:
+            token_ids = await _render_seed_text_to_token_ids(
+                chat_handler,
+                chat_handler.model_config.model,
+                request.text,
+                role=request.text_role,
+            )
         if token_ids is None:
             return JSONResponse(
                 content=ErrorResponse(
                     type="BadRequest",
-                    message="Failed to render/tokenize seed text via chat "
+                    message="Failed to render/tokenize the seed via the chat "
                     "template.",
                     code=HTTPStatus.BAD_REQUEST.value,
                 ).model_dump(),
@@ -577,7 +665,7 @@ async def prefetch_agent_cache(
             )
         except Exception:
             logger.exception(
-                "agent_prefetch: failed to record seed text for agent %s",
+                "agent_prefetch: failed to record seed for agent %s",
                 request.agent_id,
             )
 
@@ -624,8 +712,9 @@ async def prefetch_agent_cache(
             "client's agent_id does not match the one its "
             "/v1/agents/chat/completions traffic registers under -- or that "
             "traffic is going to plain /v1/chat/completions, which does not "
-            "write the registry. Send a `text=` seed on this endpoint (with "
-            "prefill_on_miss=true) to populate it up front.",
+            "write the registry. Send a `text=` (single message) or "
+            "`messages=` (conversation) seed on this endpoint, with "
+            "prefill_on_miss=true, to populate it up front.",
             request.agent_id,
         )
     if identity is None:
@@ -658,7 +747,12 @@ async def prefetch_agent_cache(
             else {}
         ),
         "agent_kind": request.agent_kind,
-        "seeded_from_text": seeded,
+        # `seeded` says a prefix was recorded; the second field says which
+        # spelling it came in as, because the two have different failure
+        # modes -- a `text` seed can be a prefix of nothing if the role is
+        # wrong, a `messages` seed if the list is not the real leading run.
+        "seeded_from_text": seeded and not seeded_from_messages,
+        "seeded_from_messages": seeded and seeded_from_messages,
         # Echoed because it changes what a phantom costs: with it set, a miss
         # is a full prefill rather than an abort, and a caller that set it by
         # accident has no other way to tell from the outside.

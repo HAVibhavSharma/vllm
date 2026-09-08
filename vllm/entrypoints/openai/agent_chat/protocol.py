@@ -18,9 +18,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -118,6 +118,20 @@ class AgentPrefetchRequest(BaseModel):
         "phantom prefetches. Omit to use whatever the registry already "
         "holds for the agent."
     )
+    messages: list[dict[str, Any]] | None = Field(
+        default=None, max_length=4096,
+        description="Optional multi-turn prefix, as an OpenAI-shaped message "
+        "list. Rendered through the served model's chat template with "
+        "``add_generation_prompt=False``, so the tokens are a strict prefix "
+        "of any real chat whose leading messages are the same list.\n\n"
+        "This is what ``text`` cannot express: ``text`` wraps its content as "
+        "one message of one role, so a conversation pushed through it renders "
+        "as a single block and is a prefix of nothing. A caller that knows the "
+        "*conversation* the next request will send -- an agent loop that has "
+        "just appended its own reply to the turn it sent -- passes it here.\n\n"
+        "Mutually exclusive with ``text``. ``text_role`` does not apply: each "
+        "message carries its own role."
+    )
     text_role: Literal["system", "user"] = Field(
         default="system",
         description="Role to wrap ``text`` in before rendering. The chat "
@@ -154,6 +168,22 @@ class AgentPrefetchRequest(BaseModel):
         "reaches the abort, and the phantom terminates before prefill as "
         "usual."
     )
+    @model_validator(mode="after")
+    def _one_seed_source(self) -> "AgentPrefetchRequest":
+        """``text`` and ``messages`` are two spellings of the same slot.
+
+        Accepting both would leave the precedence up to handler order, and a
+        caller that sent the wrong one would get a silently-warmed prefix that
+        no request hits. Refusing is the only outcome that surfaces it.
+        """
+        if self.text is not None and self.messages is not None:
+            raise ValueError(
+                "text and messages are mutually exclusive; send one seed"
+            )
+        if self.messages is not None and not self.messages:
+            raise ValueError("messages must be non-empty when provided")
+        return self
+
     # --- node-eviction identity -------------------------------------
     #
     # `(job_id, langgraph_node, call_type)` is the key the node-aware
