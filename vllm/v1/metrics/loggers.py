@@ -1318,6 +1318,23 @@ class FileStatLogger(StatLoggerBase):
 
         atexit.register(self._close)
 
+        # Anchor line. Durations elsewhere in vLLM come from monotonic clocks,
+        # which mean nothing across processes or restarts; this pins the two
+        # clocks to each other once, so a monotonic duration can be placed on
+        # the same axis as the epoch timestamps in these files.
+        self._sched_file.write(
+            json.dumps(
+                {
+                    "event": "clock_anchor",
+                    "ts": time.time(),
+                    "monotonic": time.monotonic(),
+                    "engine_index": engine_index,
+                    "pid": os.getpid(),
+                }
+            )
+            + "\n"
+        )
+
         logger.info(
             "FileStatLogger: writing request stats to %s and %s, "
             "scheduler timeline to %s",

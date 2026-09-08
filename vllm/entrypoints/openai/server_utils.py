@@ -136,31 +136,28 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
 
     Priority:
     1. If log_config_file is specified, use it
-    2. If disable_access_log_for_endpoints is specified, create a config with
-       the access log filter
-    3. Otherwise, return None (use uvicorn defaults)
+    2. Otherwise, a timestamped config, with the access log filter applied
+       when disable_access_log_for_endpoints is set
     """
     # First, try to load from file if specified
     log_config = load_log_config(args.log_config_file)
     if log_config is not None:
         return log_config
 
-    # If endpoints to filter are specified, create a config with the filter
-    if args.disable_access_log_for_endpoints:
-        from vllm.logging_utils import create_uvicorn_log_config
+    # Otherwise always build the config rather than falling back to uvicorn's
+    # defaults: the only difference is the timestamp on each access line, and
+    # an access log without one cannot be lined up with the engine's.
+    from vllm.logging_utils import create_uvicorn_log_config
 
-        # Parse comma-separated string into list
-        excluded_paths = [
-            p.strip()
-            for p in args.disable_access_log_for_endpoints.split(",")
-            if p.strip()
-        ]
-        return create_uvicorn_log_config(
-            excluded_paths=excluded_paths,
-            log_level=args.uvicorn_log_level,
-        )
-
-    return None
+    excluded_paths = [
+        p.strip()
+        for p in (args.disable_access_log_for_endpoints or "").split(",")
+        if p.strip()
+    ]
+    return create_uvicorn_log_config(
+        excluded_paths=excluded_paths,
+        log_level=args.uvicorn_log_level,
+    )
 
 
 def _extract_content_from_chunk(chunk_data: dict) -> str:

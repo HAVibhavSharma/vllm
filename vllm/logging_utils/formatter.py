@@ -97,8 +97,19 @@ class ColoredFormatter(NewLineFormatter):
     def __init__(self, fmt, datefmt=None, style="%"):
         # Inject grey color codes into format string for timestamp and file info
         if fmt:
-            # Wrap %(asctime)s with grey
-            fmt = fmt.replace("%(asctime)s", f"{self.GREY}%(asctime)s{self.RESET}")
+            # Wrap the timestamp with grey. The sub-second part is a
+            # separate field, so match it first -- otherwise the reset lands
+            # between the seconds and the milliseconds and only half the
+            # timestamp is greyed.
+            if "%(asctime)s.%(msecs)03d" in fmt:
+                fmt = fmt.replace(
+                    "%(asctime)s.%(msecs)03d",
+                    f"{self.GREY}%(asctime)s.%(msecs)03d{self.RESET}",
+                )
+            else:
+                fmt = fmt.replace(
+                    "%(asctime)s", f"{self.GREY}%(asctime)s{self.RESET}"
+                )
             # Wrap [%(fileinfo)s:%(lineno)d] with grey
             fmt = fmt.replace(
                 "[%(fileinfo)s:%(lineno)d]",

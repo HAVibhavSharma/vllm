@@ -100,14 +100,20 @@ def create_uvicorn_log_config(
             },
         },
         "formatters": {
+            # Timestamped to match vllm.logger's own format. Without this the
+            # access lines carry only ordering, so a request cannot be placed
+            # against the engine's timeline -- which is the whole reason to
+            # read them next to the scheduler and prefetch logs.
             "default": {
                 "()": "uvicorn.logging.DefaultFormatter",
-                "fmt": "%(levelprefix)s %(message)s",
+                "fmt": "%(levelprefix)s %(asctime)s.%(msecs)03d %(message)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S",
                 "use_colors": None,
             },
             "access": {
                 "()": "uvicorn.logging.AccessFormatter",
-                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
+                "fmt": '%(levelprefix)s %(asctime)s.%(msecs)03d %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
+                "datefmt": "%Y-%m-%d %H:%M:%S",
             },
         },
         "handlers": {
