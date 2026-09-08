@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -165,6 +166,26 @@ class Scheduler(SchedulerInterface):
         # for yet.
         self._prefetch_only_misses: list[Request] = []
         self._prefetch_only_misses_total = 0
+        # A phantom allowed to prefill on a miss is speculative compute, and
+        # the GPU is one resource: batching means it does not block a real
+        # request, but every token it prefills is token budget that step's
+        # real work does not get. So it is admitted only into a step with no
+        # real work running -- the gap the prefetch was issued into in the
+        # first place. `0` means strictly idle; raise it to let phantoms
+        # overlap a shallow batch.
+        self._prefetch_prefill_max_running = int(
+            os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "0") or 0
+        )
+        # A deferred phantom is not free to wait forever: a warm that lands
+        # after the request it was for is pure cost. Past this many seconds it
+        # is finished as a miss -- the same outcome as `prefill_on_miss=False`,
+        # which is the honest fallback when the gap never came.
+        self._prefetch_prefill_defer_timeout_s = float(
+            os.getenv("VLLM_PREFETCH_PREFILL_DEFER_TIMEOUT_S", "30") or 30
+        )
+        self._prefetch_deferred_since: dict[str, float] = {}
+        self._prefetch_prefill_deferrals = 0
+        self._prefetch_prefill_expired = 0
         self.ec_connector = None
         if self.vllm_config.ec_transfer_config is not None:
             self.ec_connector = ECConnectorFactory.create_connector(
@@ -688,6 +709,11 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # Counted once per step, not per candidate: `running` is capped at
+            # max_num_seqs and this is a plain scan.
+            num_running_real = sum(
+                1 for r in self.running if not self._is_prefetch_only_request(r)
+            )
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -798,7 +824,50 @@ class Scheduler(SchedulerInterface):
                             # as 0.
                             request_queue.pop_request()
                             self._prefetch_only_misses.append(request)
+                            self._prefetch_deferred_since.pop(request_id, None)
                             continue
+
+                        if (
+                            ext_tokens == 0
+                            and self._is_prefetch_only_request(request)
+                            and self._prefetch_may_prefill_on_miss(request)
+                            and num_running_real
+                            > self._prefetch_prefill_max_running
+                        ):
+                            # Allowed to prefill, but not into this step: real
+                            # requests are running and the prefill would spend
+                            # their token budget. Push it back and reconsider
+                            # next step -- the gap it was issued into usually
+                            # arrives within a few. Past the deadline it is
+                            # finished as a miss instead, because a warm that
+                            # lands after its request is worse than no warm.
+                            deferred_since = self._prefetch_deferred_since.get(
+                                request_id
+                            )
+                            now = time.monotonic()
+                            if deferred_since is None:
+                                self._prefetch_deferred_since[request_id] = now
+                                self._prefetch_prefill_deferrals += 1
+                            elif (
+                                now - deferred_since
+                                > self._prefetch_prefill_defer_timeout_s
+                            ):
+                                self._prefetch_prefill_expired += 1
+                                self._prefetch_deferred_since.pop(request_id, None)
+                                logger.debug(
+                                    "agent_prefetch: phantom %s waited %.1fs for "
+                                    "an idle step and was dropped without "
+                                    "prefilling",
+                                    request_id,
+                                    now - deferred_since,
+                                )
+                                request_queue.pop_request()
+                                self._prefetch_only_misses.append(request)
+                                continue
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        self._prefetch_deferred_since.pop(request_id, None)
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -2083,6 +2152,9 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        # A phantom can be aborted while parked in `skipped_waiting`; without
+        # this its deferral timestamp outlives it.
+        self._prefetch_deferred_since.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
@@ -2221,6 +2293,9 @@ class Scheduler(SchedulerInterface):
             # batch just built rather than the previous one.
             num_scheduled_reqs=len(self.prev_step_scheduled_req_ids),
             num_new_scheduled_reqs=self.last_num_new_scheduled_reqs,
+            num_prefetch_prefill_deferred=len(self._prefetch_deferred_since),
+            num_prefetch_prefill_deferrals=self._prefetch_prefill_deferrals,
+            num_prefetch_prefill_expired=self._prefetch_prefill_expired,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

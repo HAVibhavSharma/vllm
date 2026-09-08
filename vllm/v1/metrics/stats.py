@@ -182,6 +182,15 @@ class SchedulerStats:
     # run that is thrashing look identical -- both show a long waiting queue.
     num_scheduled_reqs: int = 0
     num_new_scheduled_reqs: int = 0
+    # Phantom prefetches allowed to prefill on a miss but held out of this
+    # step because real requests were running. `deferred` is the current
+    # backlog, `deferrals` how many phantoms have ever been held (each counted
+    # once, not once per step), `expired` how many gave up waiting for an idle
+    # step and were finished without prefilling. A run where `expired` tracks
+    # `deferrals` never had a gap to prefill in, and the seeds bought nothing.
+    num_prefetch_prefill_deferred: int = 0
+    num_prefetch_prefill_deferrals: int = 0
+    num_prefetch_prefill_expired: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
