@@ -49,7 +49,10 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
-from vllm.logging_utils.access_log_filter import set_request_agent_id
+from vllm.logging_utils.access_log_filter import (
+    AgentRequestContextMiddleware,
+    set_request_agent_id,
+)
 from vllm.v1.agent_prefetch import (
     DEFAULT_CHUNK_SIZE,
     AgentPrefixRegistry,
@@ -940,3 +943,8 @@ async def get_agent_registry_stats(raw_request: Request):
 
 def attach_router(app: FastAPI) -> None:
     app.include_router(router)
+    # Must wrap the app, not the router: the holder has to be installed in
+    # the task uvicorn logs from, which is outside anything the route
+    # decorators do. `@with_cancellation` on the chat endpoint runs the
+    # handler in its own task, so without this its agent id never gets back.
+    app.add_middleware(AgentRequestContextMiddleware)

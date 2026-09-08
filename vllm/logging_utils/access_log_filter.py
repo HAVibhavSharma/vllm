@@ -15,19 +15,59 @@ from urllib.parse import urlparse
 # The agent an in-flight request belongs to, for the access log.
 #
 # Uvicorn writes its access line from the ASGI scope, which carries the path
-# and nothing about the body -- so the endpoint has to hand the identity over
-# out of band. A ContextVar is what makes that safe: uvicorn logs from the
-# same task that awaited the handler, so the value set inside the handler is
-# visible when the line is written, and a request that never sets it cannot
-# read another's, because every request runs in its own task context.
-request_agent_id: ContextVar[str | None] = ContextVar(
-    "request_agent_id", default=None
+# and nothing about the body, so the endpoint has to hand the identity over
+# out of band.
+#
+# It holds a *mutable dict*, not the id itself, and that is the whole point.
+# A plain ContextVar only works when the handler runs in the task uvicorn
+# logs from, and `@with_cancellation` breaks exactly that: it runs the
+# handler under `asyncio.create_task`, which copies the context, so a value
+# set inside is invisible to the caller. Measured on a live server -- the
+# undecorated `/v1/agents/prefetch` line carried the agent, the decorated
+# `/v1/agents/chat/completions` line did not.
+#
+# A dict installed *before* the task is created is shared by reference with
+# every child task, so a handler can fill it in from wherever it runs and the
+# logger still sees it. `AgentRequestContextMiddleware` is what installs one
+# per request; without it the fallback below still covers a same-task handler.
+request_agent_ctx: ContextVar[dict | None] = ContextVar(
+    "request_agent_ctx", default=None
 )
 
 
 def set_request_agent_id(agent_id: str | None) -> None:
     """Name the agent this request belongs to, for its access log line."""
-    request_agent_id.set(agent_id or None)
+    holder = request_agent_ctx.get()
+    if holder is None:
+        # No middleware installed one. Works only if this runs in the task
+        # uvicorn logs from, which is the case for an undecorated handler.
+        holder = {}
+        request_agent_ctx.set(holder)
+    holder["agent_id"] = agent_id or None
+
+
+def get_request_agent_id() -> str | None:
+    holder = request_agent_ctx.get()
+    return holder.get("agent_id") if holder else None
+
+
+class AgentRequestContextMiddleware:
+    """Give each request a holder the access logger can read afterwards.
+
+    Pure ASGI on purpose: `BaseHTTPMiddleware` would run the rest of the
+    stack in its own task and reintroduce the isolation this exists to
+    defeat. Installed per request and deliberately never reset -- uvicorn
+    writes its line *after* this returns, and each request already has its
+    own context, so nothing leaks between them.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            request_agent_ctx.set({})
+        await self.app(scope, receive, send)
 
 
 class UvicornAccessLogFilter(logging.Filter):
@@ -103,7 +143,7 @@ class AgentAccessFormatter:
         class _Formatter(AccessFormatter):
             def formatMessage(self, record: logging.LogRecord) -> str:
                 line = super().formatMessage(record)
-                agent = request_agent_id.get()
+                agent = get_request_agent_id()
                 return f"{line} agent={agent}" if agent else line
 
         return _Formatter(*args, **kwargs)
