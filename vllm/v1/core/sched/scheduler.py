@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import os
+import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -170,39 +171,33 @@ class Scheduler(SchedulerInterface):
         # the GPU is one resource: batching means it does not block a real
         # request, but every token it prefills is token budget that step's
         # real work does not get. This caps how much real work it will
-        # overlap.
+        # overlap; unset means no cap, so a phantom prefills in the first
+        # step it reaches regardless of what else is running.
         #
-        # Not `0`. Strictly-idle was the first default and it defeats the
-        # whole point: an engine reaches zero-running exactly when the
-        # previous request finishes, which in an agent workflow is the same
-        # instant the next request is issued. A phantom held until then
-        # prefills in a dead heat with the request it was warming for, and
-        # the lead time the caller went to the trouble of creating is spent
-        # in the waiting queue. Measured on an ODR replay: a seed issued 15s
-        # ahead sat `Deferred` for all 15, and the request it targeted still
-        # paid the prefill as latency.
+        # History, because the two ends of this range fail differently and
+        # the log does not say which is in force. `0` -- strictly idle --
+        # was the first default and defeats the purpose: an engine reaches
+        # zero-running exactly when the previous request finishes, which in
+        # an agent workflow is the same instant the next one is issued, so
+        # the phantom prefills in a dead heat with the request it was
+        # warming for. Measured on an ODR replay: a seed issued 15s ahead
+        # sat `Deferred` for all 15 and its request still paid the prefill
+        # as latency, 1112ms against a 52ms warm-prefix floor.
         #
-        # `2` overlaps a batch that is decoding or lightly loaded. `1` was
-        # enough to fix the strictly-idle failure above, and it is where the
-        # safe part of the trade ends: a decoding step has almost its whole
-        # token budget spare, so a phantom joining it costs that request one
-        # long step -- chunked prefill bounds it via
-        # `long_prefill_token_threshold` -- and buys the next request its
-        # whole prefill.
-        #
-        # Past that the count starts being a poor proxy for what actually
-        # matters, which is how much of the step's token budget real work is
-        # already drawing. On the ODR replay the two are perfectly
-        # correlated in the wrong direction: every window with 2 or 3
-        # running was the burst of concurrent tool summarizations, at
-        # 1300-2200 tok/s of real prefill, while 8 of 12 single-request
-        # windows ran at 0.0. So raising this admits phantoms precisely
-        # where the budget is already contended, and the deferral it
-        # bypasses is the one case it was built for. Watch the *cold*
-        # requests' TTFT when raising it, not the hit rate -- the hit rate
-        # cannot see the cost.
-        self._prefetch_prefill_max_running = int(
-            os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "2") or 2
+        # Uncapped is the other end, and its cost is real but invisible to
+        # the metric usually read here. The hit rate rises either way -- the
+        # phantom lands regardless -- while what moves is the TTFT of
+        # whatever cold request was prefilling alongside it. On the same
+        # replay, every window with more than one request running was the
+        # burst of concurrent tool summarizations at 1300-2200 tok/s of real
+        # prefill, and that burst is 80% of the run's prompt tokens. Set a
+        # finite value to restore the gate; watch cold-request TTFT, not the
+        # hit rate, when changing it.
+        _prefill_cap = os.getenv("VLLM_PREFETCH_PREFILL_MAX_RUNNING", "").strip()
+        self._prefetch_prefill_max_running = (
+            sys.maxsize
+            if not _prefill_cap or int(_prefill_cap) < 0
+            else int(_prefill_cap)
         )
         # A deferred phantom is not free to wait forever: a warm that lands
         # after the request it was for is pure cost. Past this many seconds it
