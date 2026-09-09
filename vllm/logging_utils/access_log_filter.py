@@ -51,6 +51,27 @@ def get_request_agent_id() -> str | None:
     return holder.get("agent_id") if holder else None
 
 
+def set_request_issuer(issuer: str | None) -> None:
+    """Name what launched this request, for its access log line.
+
+    Two independent callers warm the same agents -- an in-process predictor
+    inside the graph runtime, and a workflow-level oracle outside it -- and
+    the access line is otherwise identical for both. Which one issued a given
+    prefetch is not recoverable from anything else in the log, so it is
+    carried here alongside the agent id.
+    """
+    holder = request_agent_ctx.get()
+    if holder is None:
+        holder = {}
+        request_agent_ctx.set(holder)
+    holder["issuer"] = issuer or None
+
+
+def get_request_issuer() -> str | None:
+    holder = request_agent_ctx.get()
+    return holder.get("issuer") if holder else None
+
+
 class AgentRequestContextMiddleware:
     """Give each request a holder the access logger can read afterwards.
 
@@ -133,8 +154,9 @@ class AgentAccessFormatter:
     import uvicorn -- it is imported by the CLI path too, where uvicorn may
     not be installed.
 
-    The field is appended rather than interpolated into the format string so
-    a line for a non-agent endpoint is byte-identical to what it was before.
+    The fields are appended rather than interpolated into the format string
+    so a line for a non-agent endpoint is byte-identical to what it was
+    before.
     """
 
     def __new__(cls, *args, **kwargs):
@@ -144,7 +166,12 @@ class AgentAccessFormatter:
             def formatMessage(self, record: logging.LogRecord) -> str:
                 line = super().formatMessage(record)
                 agent = get_request_agent_id()
-                return f"{line} agent={agent}" if agent else line
+                if agent:
+                    line = f"{line} agent={agent}"
+                issuer = get_request_issuer()
+                if issuer:
+                    line = f"{line} launched by {issuer}"
+                return line
 
         return _Formatter(*args, **kwargs)
 

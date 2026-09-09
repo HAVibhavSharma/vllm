@@ -236,3 +236,17 @@ class AgentPrefetchRequest(BaseModel):
         "the index key. Defaults server-side to the empty string, which is "
         "what `use_call_type=False` keying uses."
     )
+
+    # Not part of the index key and not read by any policy -- purely so the
+    # server log can say who asked. Two callers warm the same agents with
+    # near-identical payloads (an in-process predictor inside the graph
+    # runtime, a workflow-level oracle outside it), and without this their
+    # requests are indistinguishable in the log, which makes "which arm
+    # produced this hit" unanswerable after a run.
+    issuer: str | None = Field(
+        default=None, max_length=64,
+        description="Free-form label for what issued this prefetch, echoed "
+        "on the access log line as `launched by <issuer>` and in the "
+        "prefetch INFO line. Conventionally `langgraph` for the in-process "
+        "predictor and `workflow` for a caller above the graph runtime."
+    )

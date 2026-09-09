@@ -52,6 +52,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.access_log_filter import (
     AgentRequestContextMiddleware,
     set_request_agent_id,
+    set_request_issuer,
 )
 from vllm.v1.agent_prefetch import (
     DEFAULT_CHUNK_SIZE,
@@ -607,8 +608,10 @@ async def prefetch_agent_cache(
     started_ns = time.monotonic_ns()
     # Named on this request's access line, so a prefetch can be placed
     # against the chat completion it was meant to warm without joining two
-    # logs by timestamp.
+    # logs by timestamp -- and, when the caller says so, which of the two
+    # independent prefetch callers issued it.
     set_request_agent_id(request.agent_id)
+    set_request_issuer(request.issuer)
 
     chat_handler = _chat_handler(raw_request)
     if chat_handler is None:
@@ -701,13 +704,16 @@ async def prefetch_agent_cache(
 
     logger.info(
         "agent_prefetch: prefetch request for agent=%s kind=%s seeded=%s "
-        "top_k=%s available=%d wait=%s identity=%s",
+        "top_k=%s available=%d wait=%s issuer=%s identity=%s",
         request.agent_id,
         request.agent_kind,
         seeded,
         top_k_repr,
         available,
         request.wait,
+        # Which of the two callers this came from. `unknown` is a caller that
+        # predates the field, not a third one.
+        request.issuer or "unknown",
         # Logged on every call, not once: which prefetches carry an identity
         # and which do not is a per-call property, and reading it off the log
         # is the only way to tell a warmed-and-protected prefix from a warmed
