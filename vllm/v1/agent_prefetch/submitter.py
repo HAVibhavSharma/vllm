@@ -23,6 +23,8 @@ not blocked on the prefetch finishing.
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +35,25 @@ if TYPE_CHECKING:
     from vllm.engine.protocol import EngineClient
 
 logger = init_logger(__name__)
+
+# A phantom's *end* is otherwise unobservable. The HTTP access line is the
+# submit (the endpoint answers with `wait=False`), and `kv_hbm_ttft` skips
+# phantoms on purpose -- `NodeEvictionController.on_request_finished` gates on
+# `ttft_chat_completions_only` so the policy's own warming traffic cannot
+# flatter its TTFT average. So without this there is no way to tell a warm
+# that landed before its request from one the request waited behind, which is
+# exactly the difference between "the prefetch bought lead" and "the prefetch
+# moved the prefill 90ms earlier and the request queued behind it".
+#
+# On by default because the question above is the one these runs are for; set
+# `VLLM_PREFETCH_LOG_SPANS=0` to fall back to debug at real want volume, where
+# this is one line per phantom.
+_LOG_SPANS = os.getenv("VLLM_PREFETCH_LOG_SPANS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+_span_log = logger.info if _LOG_SPANS else logger.debug
 
 
 def _short_hex(prefix_hash: bytes, n: int = 16) -> str:
@@ -183,13 +204,15 @@ class PhantomPrefetchSubmitter:
             # existed — and those count asyncio tasks, not engine requests. A
             # phantom that never reaches the scheduler is then
             # indistinguishable from one that ran: both report
-            # `submitted=1 completed=1`. Debug, not info: at real want volume
-            # this is one line per phantom.
-            logger.debug(
-                "agent_prefetch: submitting phantom %s (%d prompt tokens, "
-                "identity=%s)",
+            # `submitted=1 completed=1`. Level is `_span_log` -- see
+            # `VLLM_PREFETCH_LOG_SPANS`.
+            started = time.perf_counter()
+            _span_log(
+                "agent_prefetch_start req=%s prompt_tokens=%d agent=%s "
+                "identity=%s",
                 request_id,
                 len(token_ids),
+                agent_id,
                 params.extra_args,
             )
             gen = self._engine_client.generate(prompt, params, request_id)
@@ -200,8 +223,19 @@ class PhantomPrefetchSubmitter:
             # cached.
             async for _ in gen:
                 pass
-            logger.debug(
-                "agent_prefetch: phantom %s finished in engine", request_id
+            # The line's timestamp is the phantom's end, and `elapsed_ms`
+            # carries its start, so a single line pairs against the target's
+            # access line without joining two. `_finalize_prefetch_only_request`
+            # has already registered the prefix in APC by the time the
+            # generator completes, so this instant is also when the blocks
+            # became hittable.
+            _span_log(
+                "agent_prefetch_end req=%s prompt_tokens=%d agent=%s "
+                "elapsed_ms=%.1f",
+                request_id,
+                len(token_ids),
+                agent_id,
+                (time.perf_counter() - started) * 1000.0,
             )
         except asyncio.CancelledError:
             raise
