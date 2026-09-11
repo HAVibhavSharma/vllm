@@ -19,11 +19,14 @@ from typing import Any, Literal, cast
 import vllm.envs as envs
 from vllm.logging_utils import ColoredFormatter, NewLineFormatter
 
+# Milliseconds and a full date, so a server log line can be joined against the
+# epoch timestamps in the request/scheduler/eviction JSONLs. Second resolution
+# is not enough: an engine step is ~10ms, so whole batches share a second.
 _FORMAT = (
-    f"{envs.VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s "
+    f"{envs.VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s.%(msecs)03d "
     "[%(fileinfo)s:%(lineno)d] %(message)s"
 )
-_DATE_FORMAT = "%m-%d %H:%M:%S"
+_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def _use_color() -> bool:
