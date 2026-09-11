@@ -1360,6 +1360,13 @@ class FileStatLogger(StatLoggerBase):
             }
             self._csv_writer.writerow(row)
             self._jsonl_file.write(json.dumps(row) + "\n")
+            # Flushed per request, not left to the atexit handler. A benchmark
+            # reads these files while the server is still serving, and an
+            # unflushed tail is not a late row -- it is a row that is missing,
+            # with nothing to say it ever existed. One flush per finished
+            # request is a handful per second at most.
+            self._csv_file.flush()
+            self._jsonl_file.flush()
 
     def log_engine_initialized(self):
         pass
