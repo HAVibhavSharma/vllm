@@ -199,6 +199,16 @@ def build_app(
 
     attach_kv_metrics_router(app)
 
+    # Same reasoning: a client-side marker is only useful if it lands on the
+    # server's own clock, in the server's own stream. Tool spans are
+    # workflow-side work every arm does identically, so an arm without this
+    # endpoint drops the one measurement whose value is entirely comparative.
+    from vllm.entrypoints.openai.echo_router import (
+        attach_router as attach_echo_router,
+    )
+
+    attach_echo_router(app)
+
     from vllm.entrypoints.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
     )
