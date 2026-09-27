@@ -854,41 +854,13 @@ class Scheduler(SchedulerInterface):
                             ext_tokens == 0
                             and self._is_prefetch_only_request(request)
                             and self._prefetch_may_prefill_on_miss(request)
-                            and num_running_real
-                            > self._prefetch_prefill_max_running
-                        ):
-                            # Allowed to prefill, but not into this step: real
-                            # requests are running and the prefill would spend
-                            # their token budget. Push it back and reconsider
-                            # next step -- the gap it was issued into usually
-                            # arrives within a few. Past the deadline it is
-                            # finished as a miss instead, because a warm that
-                            # lands after its request is worse than no warm.
-                            deferred_since = self._prefetch_deferred_since.get(
-                                request_id
+                            and self._defer_phantom_prefill(
+                                request,
+                                request_queue,
+                                step_skipped_waiting,
+                                num_running_real,
                             )
-                            now = time.monotonic()
-                            if deferred_since is None:
-                                self._prefetch_deferred_since[request_id] = now
-                                self._prefetch_prefill_deferrals += 1
-                            elif (
-                                now - deferred_since
-                                > self._prefetch_prefill_defer_timeout_s
-                            ):
-                                self._prefetch_prefill_expired += 1
-                                self._prefetch_deferred_since.pop(request_id, None)
-                                logger.debug(
-                                    "agent_prefetch: phantom %s waited %.1fs for "
-                                    "an idle step and was dropped without "
-                                    "prefilling",
-                                    request_id,
-                                    now - deferred_since,
-                                )
-                                request_queue.pop_request()
-                                self._prefetch_only_misses.append(request)
-                                continue
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
+                        ):
                             continue
                         self._prefetch_deferred_since.pop(request_id, None)
 
@@ -998,6 +970,20 @@ class Scheduler(SchedulerInterface):
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
+                    #
+                    # A phantom only gets here to prefill what its load did not
+                    # cover (`_prefetch_prefills_rest`), and that prefill is
+                    # held to the same rule as a miss's: not into a step whose
+                    # budget real requests are spending.
+                    if self._is_prefetch_only_request(
+                        request
+                    ) and self._defer_phantom_prefill(
+                        request,
+                        request_queue,
+                        step_skipped_waiting,
+                        num_running_real,
+                    ):
+                        continue
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
@@ -2490,9 +2476,16 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                if self._is_prefetch_only_request(req):
+                if self._is_prefetch_only_request(
+                    req
+                ) and not self._prefetch_prefills_rest(req):
                     self._finalize_prefetch_only_request(req, outputs)
                 else:
+                    # A seeding phantom whose prefix LMCache held only part
+                    # of goes on to prefill the rest, the way a miss does; see
+                    # `_prefetch_prefills_rest`. The ordinary remote-KV path
+                    # caches the loaded blocks first, so the part that was
+                    # found is warm whatever happens to the rest.
                     self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
@@ -2518,6 +2511,74 @@ class Scheduler(SchedulerInterface):
         """
         params = request.kv_transfer_params
         return bool(params and params.get("prefill_on_miss"))
+
+    def _defer_phantom_prefill(
+        self,
+        request: Request,
+        request_queue,
+        step_skipped_waiting,
+        num_running_real: int,
+    ) -> bool:
+        """Hold a phantom's prefill out of a busy step; True if it was held.
+
+        Allowed to prefill, but not into this step: real requests are running
+        and the prefill would spend their token budget. Push it back and
+        reconsider next step -- the gap it was issued into usually arrives
+        within a few. Past VLLM_PREFETCH_PREFILL_DEFER_TIMEOUT_S it is finished
+        instead, because a warm that lands after its request is worse than no
+        warm; whatever it had already loaded stays in the prefix cache.
+
+        True means the request has been taken off `request_queue` and the
+        caller moves on to the next one.
+        """
+        request_id = request.request_id
+        if num_running_real <= self._prefetch_prefill_max_running:
+            self._prefetch_deferred_since.pop(request_id, None)
+            return False
+        deferred_since = self._prefetch_deferred_since.get(request_id)
+        now = time.monotonic()
+        if deferred_since is None:
+            self._prefetch_deferred_since[request_id] = now
+            self._prefetch_prefill_deferrals += 1
+        elif now - deferred_since > self._prefetch_prefill_defer_timeout_s:
+            self._prefetch_prefill_expired += 1
+            self._prefetch_deferred_since.pop(request_id, None)
+            logger.debug(
+                "agent_prefetch: phantom %s waited %.1fs for an idle step and "
+                "was dropped without prefilling (%d tokens already computed)",
+                request_id,
+                now - deferred_since,
+                request.num_computed_tokens,
+            )
+            request_queue.pop_request()
+            self._prefetch_only_misses.append(request)
+            return True
+        request_queue.pop_request()
+        step_skipped_waiting.prepend_request(request)
+        return True
+
+    def _prefetch_prefills_rest(self, request: Request) -> bool:
+        """Whether a phantom whose LMCache load just finished goes on to prefill.
+
+        Only a seeding phantom (`prefill_on_miss`), and only while at least a
+        block of its prompt is still uncomputed. Before this, the choice was
+        made on the lookup alone: a complete miss prefilled, any hit at all
+        loaded and finished. So a seed whose first chunks happened to be in
+        LMCache -- a 48-token template head another warm had stored, the
+        previous version of the same growing prompt -- loaded those chunks and
+        dropped everything after them. Measured on an ODR batch: two of four
+        final-report seeds, 2928 and 6368 tokens, left the real request a
+        48-token hit. And a seed that extends the last one by the newest
+        messages is a partial hit by construction, so no incremental seed
+        could ever have prefilled its extension.
+
+        Less than a block left is not worth a step: it is the prompt's own
+        partial tail, which the request that sends it recomputes anyway.
+        """
+        if not self._prefetch_may_prefill_on_miss(request):
+            return False
+        remaining = request.num_prompt_tokens - request.num_computed_tokens
+        return remaining >= self.block_size
 
     def _finish_prefetch_only_misses(
         self,

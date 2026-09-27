@@ -132,6 +132,22 @@ class AgentPrefetchRequest(BaseModel):
         "Mutually exclusive with ``text``. ``text_role`` does not apply: each "
         "message carries its own role."
     )
+    tools: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="The ``tools`` the real request will send, exactly as it "
+        "sends them. The chat template renders them into the prompt -- for "
+        "most templates inside the first system block -- so a seed for a "
+        "tool-bound agent rendered without them diverges from the real "
+        "request in its first chunk and warms blocks nothing hits. Omit for "
+        "an agent that calls the model without tools."
+    )
+    tool_choice: str | dict[str, Any] | None = Field(
+        default=None,
+        description="The real request's ``tool_choice``, for the one case "
+        "it changes the render: a server started with "
+        "``--exclude-tools-when-tool-choice-none`` drops the tools block when "
+        "it is ``none``."
+    )
     text_role: Literal["system", "user"] = Field(
         default="system",
         description="Role to wrap ``text`` in before rendering. The chat "
@@ -181,9 +197,11 @@ class AgentPrefetchRequest(BaseModel):
         "decoding request was in, and at 0 it spends an idle step a later "
         "real request could have had to itself. Every setting also "
         "materialises blocks that push others out of HBM.\n\n"
-        "No effect when LMCache *does* hold the prefix: that path never "
-        "reaches the abort, and the phantom terminates before prefill as "
-        "usual."
+        "When LMCache holds the prefix whole, the phantom loads it and "
+        "terminates before prefill as usual. When it holds only the leading "
+        "part -- a shared template head, the previous version of a growing "
+        "prompt -- the phantom loads that part and then prefills the rest, "
+        "under the same throttle."
     )
     @model_validator(mode="after")
     def _one_seed_source(self) -> "AgentPrefetchRequest":

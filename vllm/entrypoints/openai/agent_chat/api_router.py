@@ -325,11 +325,28 @@ def _resolve_prefetch_cache_salt(req: AgentPrefetchRequest) -> str:
     return req.agent_cache_salt or f"agent::{req.agent_id}"
 
 
+def _tool_fields(tools: list[dict[str, Any]] | None, tool_choice: Any) -> dict[str, Any]:
+    """The seed's `tools` / `tool_choice`, set only when the caller sent them.
+
+    Left out otherwise rather than passed as None: `tool_choice` has a default
+    of its own on the chat request, and a seed must render the way the real
+    request does, which is with whatever that request left unset left unset.
+    """
+    fields: dict[str, Any] = {}
+    if tools:
+        fields["tools"] = tools
+    if tool_choice is not None:
+        fields["tool_choice"] = tool_choice
+    return fields
+
+
 async def _render_seed_text_to_token_ids(
     chat_handler: "OpenAIServingChat",
     model_name: str,
     text: str,
     role: str = "system",
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
 ) -> list[int] | None:
     """Wrap ``text`` as a message of ``role`` and run it through the same
     renderer path the chat endpoint uses, returning the token ids.
@@ -356,6 +373,7 @@ async def _render_seed_text_to_token_ids(
             model=model_name,
             messages=[{"role": role, "content": text}],
             chat_template_kwargs={"add_generation_prompt": False},
+            **_tool_fields(tools, tool_choice),
         )
     except Exception:
         logger.exception(
@@ -402,6 +420,8 @@ async def _render_seed_messages_to_token_ids(
     chat_handler: "OpenAIServingChat",
     model_name: str,
     messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
 ) -> list[int] | None:
     """Render a whole conversation the same way the chat endpoint would.
 
@@ -426,6 +446,7 @@ async def _render_seed_messages_to_token_ids(
             model=model_name,
             messages=messages,
             chat_template_kwargs={"add_generation_prompt": False},
+            **_tool_fields(tools, tool_choice),
         )
     except Exception:
         logger.exception(
@@ -650,6 +671,8 @@ async def prefetch_agent_cache(
                 chat_handler,
                 chat_handler.model_config.model,
                 request.messages,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
             )
         else:
             token_ids = await _render_seed_text_to_token_ids(
@@ -657,6 +680,8 @@ async def prefetch_agent_cache(
                 chat_handler.model_config.model,
                 request.text,
                 role=request.text_role,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
             )
         if token_ids is None:
             return JSONResponse(
