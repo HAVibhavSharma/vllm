@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -88,6 +89,61 @@ def _full_hit_only_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+# Prefill/decode disaggregation over a shared LMCache server.
+#
+# Two engines connect to one LMCache MP server: the prefill engine computes a
+# prompt with max_tokens=1 and stores its KV as a side effect, then the decode
+# engine is sent the same prompt and loads that KV instead of computing it. The
+# proxy in front of them tells the decode leg how many prompt tokens the
+# prefill leg computed, as `kv_transfer_params[PD_EXPECT_TOKENS_PARAM]`.
+#
+# That number is needed because the handoff is a race. The prefill leg's store
+# is submitted inside the forward step that samples its one token, and the D2H
+# copy can still be in flight when the HTTP response goes out; LMCache reports
+# a chunk whose write has not finished as absent (`l1_manager`: readable only
+# while not write-locked), and a lookup stops at the first absent chunk. On a
+# long prompt the copy can outlast the proxy's round trip, so without a wait
+# the decode engine would silently recompute most of the prompt -- a P/D stack
+# that prefills everything twice.
+#
+# So a lookup that comes back shorter than what the prefill leg stored is
+# released and repeated, every VLLM_PD_HANDOFF_POLL_S, until it covers the
+# prefix or VLLM_PD_HANDOFF_WAIT_S runs out. On a timeout the request takes
+# the partial hit and prefills the rest, which is correct and only slower, and
+# the `pd_handoff:` line records which of the two happened.
+#
+# Opt-in by the request: without the parameter nothing here runs, so a
+# colocated engine on this build behaves exactly as before.
+PD_EXPECT_TOKENS_PARAM = "pd_expect_tokens"
+PD_HANDOFF_WAIT_ENV_VAR = "VLLM_PD_HANDOFF_WAIT_S"
+PD_HANDOFF_POLL_ENV_VAR = "VLLM_PD_HANDOFF_POLL_S"
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+
+
+@dataclass
+class _PDHandoff:
+    """One decode-leg request waiting for its prefill leg's KV to land."""
+
+    expect_tokens: int
+    # Chunk-aligned: the most a lookup can return for this prompt.
+    target_tokens: int
+    started: float
+    deadline: float
+    next_lookup: float = 0.0
+    lookups: int = 0
+    settled: bool = False
 
 
 # Helper functions
@@ -542,6 +598,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 heartbeat_interval,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            # Decode-leg requests of a P/D pair, keyed by request id. Kept
+            # after the wait settles so a request sent back to waiting (an
+            # allocation failure) is not made to wait a second time.
+            self._pd_handoffs: dict[str, _PDHandoff] = {}
+            self._pd_wait_s = _env_seconds(PD_HANDOFF_WAIT_ENV_VAR, 5.0)
+            self._pd_poll_s = _env_seconds(PD_HANDOFF_POLL_ENV_VAR, 0.005)
             # Full-hit-only mode: report partial prefix hits as misses so KV
             # is only loaded when the whole chunk-aligned prefix is available.
             self._full_hit_only = _full_hit_only_enabled()
@@ -808,6 +870,13 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
+        handoff = self._pd_handoff(request, num_computed_tokens)
+        if handoff is not None and time.monotonic() < handoff.next_lookup:
+            # Between polls: the scheduler asks every step, and a lookup per
+            # step would be a ZMQ round trip per step for as long as the
+            # prefill leg's store is in flight.
+            return None, True
+
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=list(request.all_token_ids),
@@ -816,6 +885,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
+            return None, True
+
+        if handoff is not None and self._pd_retry(request, tracker, handoff, ret):
             return None, True
 
         if ret == 0:
@@ -1228,6 +1300,121 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if records:
             self.scheduler_adapter.report_block_allocations(records)
 
+    def _pd_handoff(
+        self, request: "Request", num_computed_tokens: int
+    ) -> _PDHandoff | None:
+        """The handoff this decode-leg request is still waiting on, if any.
+
+        None for every request that did not come through a P/D proxy, and for
+        one whose wait has already settled.
+        """
+        handoff = self._pd_handoffs.get(request.request_id)
+        if handoff is not None:
+            return None if handoff.settled else handoff
+
+        params = getattr(request, "kv_transfer_params", None) or {}
+        raw = params.get(PD_EXPECT_TOKENS_PARAM)
+        if raw is None:
+            return None
+        try:
+            expect = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "pd_handoff: req=%s ignoring %s=%r (not an integer)",
+                request.request_id,
+                PD_EXPECT_TOKENS_PARAM,
+                raw,
+            )
+            return None
+
+        chunk_tokens = (
+            self.scheduler_adapter.num_blocks_per_chunk() * self.vllm_block_size
+        )
+        # The lookup is submitted over the chunk-aligned prompt, so that is
+        # the most it can ever return -- waiting for more would wait forever.
+        aligned_end = (len(request.all_token_ids) // chunk_tokens) * chunk_tokens
+        target = (min(expect, aligned_end) // chunk_tokens) * chunk_tokens
+        now = time.monotonic()
+        handoff = _PDHandoff(
+            expect_tokens=expect,
+            target_tokens=target,
+            started=now,
+            deadline=now + self._pd_wait_s,
+        )
+        self._pd_handoffs[request.request_id] = handoff
+        if target <= num_computed_tokens:
+            # This engine's own prefix cache already covers everything the
+            # prefill leg stored -- a later turn of a conversation it decoded.
+            self._pd_settle(request, handoff, 0, num_computed_tokens, "local")
+            return None
+        return handoff
+
+    def _pd_retry(
+        self,
+        request: "Request",
+        tracker: LMCacheMPRequestTracker,
+        handoff: _PDHandoff,
+        hit_tokens: int,
+    ) -> bool:
+        """Whether to drop this lookup and look again later.
+
+        True releases the lookup -- its read locks and its cached result, so
+        the next call submits a fresh one -- and asks the scheduler to come
+        back. False settles the wait and lets `hit_tokens` stand.
+        """
+        if hit_tokens >= handoff.target_tokens:
+            self._pd_settle(request, handoff, hit_tokens, 0, "full")
+            return False
+        now = time.monotonic()
+        if now >= handoff.deadline:
+            self._pd_settle(request, handoff, hit_tokens, 0, "timeout")
+            return False
+
+        if hit_tokens > 0:
+            # The vendored fallback adapter has no free_lookup_locks; without
+            # it the locks expire on their TTL instead.
+            free_lookup_locks = getattr(
+                self.scheduler_adapter, "free_lookup_locks", None
+            )
+            if free_lookup_locks is not None:
+                free_lookup_locks(
+                    token_ids=list(request.all_token_ids),
+                    start=0,
+                    end=hit_tokens,
+                    request_id=request.request_id,
+                    cache_salt=tracker.cache_salt,
+                )
+        self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+        handoff.lookups += 1
+        handoff.next_lookup = now + self._pd_poll_s
+        return True
+
+    def _pd_settle(
+        self,
+        request: "Request",
+        handoff: _PDHandoff,
+        hit_tokens: int,
+        local_tokens: int,
+        outcome: str,
+    ) -> None:
+        handoff.settled = True
+        # One line per decode-leg request, in `key=value` form so the harness
+        # can read the handoff back without a schema: `outcome=timeout` is a
+        # request that prefilled part of its prompt a second time.
+        log = logger.warning if outcome == "timeout" else logger.info
+        log(
+            "pd_handoff: req=%s outcome=%s expect_tokens=%d target_tokens=%d "
+            "hit_tokens=%d local_tokens=%d waited_ms=%.1f lookups=%d",
+            request.request_id,
+            outcome,
+            handoff.expect_tokens,
+            handoff.target_tokens,
+            hit_tokens,
+            local_tokens,
+            (time.monotonic() - handoff.started) * 1000.0,
+            handoff.lookups + (0 if outcome == "local" else 1),
+        )
+
     def _get_request_tracker(self, request_id: str) -> LMCacheMPRequestTracker:
         assert request_id in self.request_trackers, (
             f"Request tracker for request_id {request_id} not found. "
@@ -1263,6 +1450,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         Clean up request tracker and associated lookup future for a request.
         This should be called when a request is finished to prevent memory leak.
         """
+        self._pd_handoffs.pop(request_id, None)
         # Clean up request tracker
         if self.request_trackers.pop(request_id, None):
             logger.debug(
