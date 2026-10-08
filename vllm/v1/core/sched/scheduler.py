@@ -206,6 +206,18 @@ class Scheduler(SchedulerInterface):
         self._prefetch_prefill_defer_timeout_s = float(
             os.getenv("VLLM_PREFETCH_PREFILL_DEFER_TIMEOUT_S", "30") or 30
         )
+        # Stricter than the running cap: a phantom prefills only in a step no
+        # real request needs for prefill -- none waiting, none running with
+        # prompt left to compute. Decode does not count: it spends a token
+        # per request, and measured on an ODR batch a prefill beside decode
+        # runs at full speed (2,533 against 2,461 tok/s alone) while one
+        # beside a phantom's prefill runs at half (1,299). Those collisions
+        # were mostly a seed prefilling beside the very request that issued
+        # it, ~110s of real prefill over 50 questions. Applies to a phantom
+        # still mid-prefill too: a real request arriving pauses it.
+        self._prefetch_prefill_idle_only = (
+            os.getenv("VLLM_PREFETCH_PREFILL_IDLE_ONLY", "0").strip() == "1"
+        )
         self._prefetch_deferred_since: dict[str, float] = {}
         self._prefetch_prefill_deferrals = 0
         self._prefetch_prefill_expired = 0
@@ -515,10 +527,26 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Whether a real request needs prefill this step, decided once; see
+        # `_prefetch_prefill_idle_only`.
+        real_prefill_pending = (
+            self._prefetch_prefill_idle_only and self._real_prefill_pending()
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                real_prefill_pending
+                and self._is_prefetch_only_request(request)
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                # A phantom mid-prefill yields the step to the real prefill;
+                # it keeps its blocks and resumes in the next idle step.
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -859,6 +887,7 @@ class Scheduler(SchedulerInterface):
                                 request_queue,
                                 step_skipped_waiting,
                                 num_running_real,
+                                real_prefill_pending,
                             )
                         ):
                             continue
@@ -982,6 +1011,7 @@ class Scheduler(SchedulerInterface):
                         request_queue,
                         step_skipped_waiting,
                         num_running_real,
+                        real_prefill_pending,
                     ):
                         continue
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
@@ -2518,6 +2548,7 @@ class Scheduler(SchedulerInterface):
         request_queue,
         step_skipped_waiting,
         num_running_real: int,
+        real_prefill_pending: bool = False,
     ) -> bool:
         """Hold a phantom's prefill out of a busy step; True if it was held.
 
@@ -2532,7 +2563,10 @@ class Scheduler(SchedulerInterface):
         caller moves on to the next one.
         """
         request_id = request.request_id
-        if num_running_real <= self._prefetch_prefill_max_running:
+        if (
+            not real_prefill_pending
+            and num_running_real <= self._prefetch_prefill_max_running
+        ):
             self._prefetch_deferred_since.pop(request_id, None)
             return False
         deferred_since = self._prefetch_deferred_since.get(request_id)
@@ -2556,6 +2590,25 @@ class Scheduler(SchedulerInterface):
         request_queue.pop_request()
         step_skipped_waiting.prepend_request(request)
         return True
+
+    def _real_prefill_pending(self) -> bool:
+        """Whether a real request needs prefill this step.
+
+        Waiting, or running with prompt tokens left to compute. A running
+        request that is only decoding does not count: decode spends a token
+        per step and does not slow a prefill beside it.
+        """
+        for request in self.running:
+            if (
+                not self._is_prefetch_only_request(request)
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                return True
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if not self._is_prefetch_only_request(request):
+                    return True
+        return False
 
     def _prefetch_prefills_rest(self, request: Request) -> bool:
         """Whether a phantom whose LMCache load just finished goes on to prefill.
