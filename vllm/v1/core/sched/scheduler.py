@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -152,6 +153,24 @@ class Scheduler(SchedulerInterface):
         # position 0 (if any) corresponds to num_external_computed_tokens
         # — included here too so the per-step run advance is symmetric.
         self._external_runs: dict[str, list[tuple[int, int]]] = {}
+        # Finished requests whose blocks a KV connector still holds (an
+        # LMCache store copying out of them, a NIXL read by the decode
+        # engine), by when the hold began. Only a step collects the
+        # connector's "done" notice, and an engine with nothing else to do
+        # stops stepping -- so the last such request before a quiet spell
+        # held its blocks until new traffic arrived, and an HBM flush in that
+        # spell was refused. A P/D prefill leg (max_tokens=1) finishes in the
+        # very step that submits its store, which made it the common case.
+        # Counting these as work keeps the engine stepping, with no model
+        # run, until the notices are in. Past the cap a hold stops counting,
+        # so a notice that never arrives cannot keep the loop alive forever;
+        # it is above NIXL's own 480s abort timeout, which frees its blocks
+        # through the same path.
+        self._delayed_free_since: dict[str, float] = {}
+        self._delayed_free_poll_max_s = float(
+            os.getenv("VLLM_DELAYED_FREE_POLL_MAX_S", "600") or 600
+        )
+        self._delayed_free_overdue_logged: set[str] = set()
         self.ec_connector = None
         if self.vllm_config.ec_transfer_config is not None:
             self.ec_connector = ECConnectorFactory.create_connector(
@@ -2008,6 +2027,8 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        else:
+            self._delayed_free_since.setdefault(request_id, time.monotonic())
 
         return kv_xfer_params
 
@@ -2016,6 +2037,35 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
         self._external_runs.pop(request.request_id, None)
+        self._delayed_free_since.pop(request.request_id, None)
+        self._delayed_free_overdue_logged.discard(request.request_id)
+
+    def has_delayed_free_blocks(self) -> bool:
+        """Whether a finished request's blocks wait on a connector notice.
+
+        True while any such hold is younger than the cap. An overdue hold is
+        logged once and no longer counts; its blocks are still freed if the
+        notice comes in on a later step.
+        """
+        if not self._delayed_free_since:
+            return False
+        now = time.monotonic()
+        pending = False
+        for request_id, since in self._delayed_free_since.items():
+            if now - since <= self._delayed_free_poll_max_s:
+                pending = True
+            elif request_id not in self._delayed_free_overdue_logged:
+                self._delayed_free_overdue_logged.add(request_id)
+                logger.warning(
+                    "Request %s has held its KV blocks for %.0fs waiting on "
+                    "the KV connector; no longer stepping the engine for it "
+                    "(VLLM_DELAYED_FREE_POLL_MAX_S=%g)",
+                    request_id, now - since, self._delayed_free_poll_max_s,
+                )
+        return pending
+
+    def has_requests(self) -> bool:
+        return super().has_requests() or self.has_delayed_free_blocks()
 
     @property
     def pause_state(self) -> PauseState:

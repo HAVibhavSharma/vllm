@@ -1283,6 +1283,14 @@ class EngineCoreProc(EngineCore):
         # Without this, the tight polling loop can starve background threads.
         if not model_executed and self.scheduler.has_unfinished_requests():
             time.sleep(0.001)
+        elif not model_executed and getattr(
+            self.scheduler, "has_delayed_free_blocks", lambda: False
+        )():
+            # Only waiting for a KV connector's "done" notice to free a
+            # finished request's blocks. Each step runs no model, only polls
+            # the connector; a store or a NIXL read takes milliseconds, so a
+            # short sleep keeps the poll from spinning a core meanwhile.
+            time.sleep(0.005)
 
         return model_executed
 
