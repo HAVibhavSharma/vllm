@@ -71,6 +71,15 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+
+def _optional_int_env(name: str) -> int | None:
+    """A positive integer from the environment, or None when unset or <= 0."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -218,6 +227,26 @@ class Scheduler(SchedulerInterface):
         self._prefetch_prefill_idle_only = (
             os.getenv("VLLM_PREFETCH_PREFILL_IDLE_ONLY", "0").strip() == "1"
         )
+        # Two bounds on what a phantom's prefill may cost, both off unless
+        # set. Measured on a 10-question SWE-bench Lite run, where the GPU has
+        # a real request in flight 99% of the time and tool calls leave no
+        # gap to hide a warm in: two phantoms of ~110k tokens took ~87s each
+        # and held real requests in the queue for as long, and phantoms
+        # prefilling beside decodes slowed decode by ~6%.
+        #   MAX_TOKENS  a phantom with more than this many tokens left to
+        #               compute is finished as a miss without prefilling --
+        #               a warm that costs more than the gap before its
+        #               request is pure cost.
+        #   STEP_TOKENS while any real request is running, a phantom computes
+        #               at most this many tokens per step, so the step a
+        #               decode shares with it stays short.
+        self._prefetch_prefill_max_tokens = _optional_int_env(
+            "VLLM_PREFETCH_PREFILL_MAX_TOKENS"
+        )
+        self._prefetch_prefill_step_tokens = _optional_int_env(
+            "VLLM_PREFETCH_PREFILL_STEP_TOKENS"
+        )
+        self._prefetch_prefill_too_large = 0
         self._prefetch_deferred_since: dict[str, float] = {}
         self._prefetch_prefill_deferrals = 0
         self._prefetch_prefill_expired = 0
@@ -551,6 +580,12 @@ class Scheduler(SchedulerInterface):
             self._prefetch_prefill_idle_only and self._real_prefill_pending()
         )
 
+        # Real requests running at the start of the step; a phantom beside
+        # any of them is held to `_prefetch_prefill_step_tokens`.
+        num_real_at_step_start = sum(
+            1 for r in self.running if not self._is_prefetch_only_request(r)
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -603,6 +638,9 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = self._cap_phantom_step_tokens(
+                request, num_new_tokens, num_real_at_step_start
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -900,6 +938,18 @@ class Scheduler(SchedulerInterface):
                             ext_tokens == 0
                             and self._is_prefetch_only_request(request)
                             and self._prefetch_may_prefill_on_miss(request)
+                            and self._drop_oversized_phantom(
+                                request,
+                                request_queue,
+                                request.num_tokens - num_new_local_computed_tokens,
+                            )
+                        ):
+                            continue
+
+                        if (
+                            ext_tokens == 0
+                            and self._is_prefetch_only_request(request)
+                            and self._prefetch_may_prefill_on_miss(request)
                             and self._defer_phantom_prefill(
                                 request,
                                 request_queue,
@@ -1022,14 +1072,19 @@ class Scheduler(SchedulerInterface):
                     # cover (`_prefetch_prefills_rest`), and that prefill is
                     # held to the same rule as a miss's: not into a step whose
                     # budget real requests are spending.
-                    if self._is_prefetch_only_request(
-                        request
-                    ) and self._defer_phantom_prefill(
-                        request,
-                        request_queue,
-                        step_skipped_waiting,
-                        num_running_real,
-                        real_prefill_pending,
+                    if self._is_prefetch_only_request(request) and (
+                        self._drop_oversized_phantom(
+                            request,
+                            request_queue,
+                            request.num_tokens - request.num_computed_tokens,
+                        )
+                        or self._defer_phantom_prefill(
+                            request,
+                            request_queue,
+                            step_skipped_waiting,
+                            num_running_real,
+                            real_prefill_pending,
+                        )
                     ):
                         continue
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
@@ -1073,6 +1128,9 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = self._cap_phantom_step_tokens(
+                        request, num_new_tokens, num_running_real
+                    )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -2590,6 +2648,43 @@ class Scheduler(SchedulerInterface):
         """
         params = request.kv_transfer_params
         return bool(params and params.get("prefill_on_miss"))
+
+    def _drop_oversized_phantom(
+        self, request: Request, request_queue, num_to_compute: int
+    ) -> bool:
+        """Finish a phantom whose prefill exceeds the size cap; True if it was.
+
+        Same outcome as a deferral that expired: taken off `request_queue`
+        and finished as a miss, keeping whatever it had already loaded.
+        """
+        cap = self._prefetch_prefill_max_tokens
+        if cap is None or num_to_compute <= cap:
+            return False
+        self._prefetch_prefill_too_large += 1
+        logger.debug(
+            "agent_prefetch: phantom %s needs %d tokens of prefill, over "
+            "VLLM_PREFETCH_PREFILL_MAX_TOKENS=%d; dropped without prefilling",
+            request.request_id,
+            num_to_compute,
+            cap,
+        )
+        request_queue.pop_request()
+        self._prefetch_deferred_since.pop(request.request_id, None)
+        self._prefetch_only_misses.append(request)
+        return True
+
+    def _cap_phantom_step_tokens(
+        self, request: Request, num_new_tokens: int, num_running_real: int
+    ) -> int:
+        """Hold a phantom's chunk to the per-step cap while real work runs."""
+        cap = self._prefetch_prefill_step_tokens
+        if (
+            cap is None
+            or num_running_real == 0
+            or not self._is_prefetch_only_request(request)
+        ):
+            return num_new_tokens
+        return min(num_new_tokens, cap)
 
     def _defer_phantom_prefill(
         self,
