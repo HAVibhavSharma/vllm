@@ -1416,12 +1416,22 @@ class FileStatLogger(StatLoggerBase):
         """
         if scheduler_stats is None:
             return
+        phantoms = scheduler_stats.phantom_queue
         key = (
             scheduler_stats.num_running_reqs,
             scheduler_stats.num_waiting_reqs,
             scheduler_stats.num_skipped_waiting_reqs,
             scheduler_stats.num_scheduled_reqs,
             scheduler_stats.num_new_scheduled_reqs,
+            # Every phantom event writes a row, but not the `held_*` counts,
+            # which move on every step a phantom waits and would write one
+            # row per step.
+            tuple(
+                sorted(
+                    (k, v) for k, v in (phantoms or {}).items()
+                    if not k.startswith("held_")
+                )
+            ),
         )
         now = time.time()
         if key == self._last_sched_key and now - self._last_sched_write < (
@@ -1452,6 +1462,7 @@ class FileStatLogger(StatLoggerBase):
                     "num_preempted_reqs": num_preempted,
                     "num_finished_reqs": num_finished,
                     "kv_cache_usage": scheduler_stats.kv_cache_usage,
+                    **({"phantom_queue": phantoms} if phantoms else {}),
                 }
             )
             + "\n"

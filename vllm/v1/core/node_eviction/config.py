@@ -49,6 +49,21 @@ class NodeEvictionConfig:
     than what flag-off does — "off" has to stay byte-identical to upstream or
     the baseline measures the wrong thing."""
 
+    basic: bool = False
+    """The basic mode (plan/new-eviction/13-phantom-queue.md, part 6): no
+    scored reordering, but the blocks a phantom prefetch warmed are evicted
+    only after every ordinary free block, for `warm_protect_s` or until a real
+    request uses them.
+
+    Set by `VLLM_NODE_EVICTION_BASIC=1`, which forces `enabled` on and
+    `splice_max_blocks` to 0 like observe mode, and is exclusive with it:
+    observe mode is the claim that the arm changes nothing, and this changes
+    which block is evicted."""
+
+    warm_protect_s: float = 10.0
+    """How long a warmed block nobody has used stays protected; the edge case
+    of a wrong prediction. Set by `VLLM_NODE_EVICTION_WARM_PROTECT_S`."""
+
     # --- Identity (03 §1) -------------------------------------------------
     use_call_type: bool = True
     """Key the index at `(job_id, node, call_type)`. Set False if the
@@ -358,6 +373,20 @@ class NodeEvictionConfig:
             cfg.observe_only = True
             cfg.enabled = True
             cfg.splice_max_blocks = 0
+
+        if envs.VLLM_NODE_EVICTION_BASIC:
+            if cfg.observe_only:
+                raise ValueError(
+                    "VLLM_NODE_EVICTION_BASIC and VLLM_NODE_EVICTION_OBSERVE "
+                    "are exclusive: observe mode changes nothing, basic mode "
+                    "changes which block is evicted"
+                )
+            # Like observe mode, the scored splice is off whatever the file
+            # says; only the warmed-block protection reorders anything.
+            cfg.basic = True
+            cfg.enabled = True
+            cfg.splice_max_blocks = 0
+            cfg.warm_protect_s = envs.VLLM_NODE_EVICTION_WARM_PROTECT_S
 
         return cfg
 

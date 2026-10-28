@@ -106,7 +106,14 @@ def maybe_build_controller(
         return None
 
     controller.start()
-    if config.observe_only:
+    if config.basic:
+        logger.info(
+            "Node-aware KV eviction in BASIC mode: no scored reordering; "
+            "blocks a phantom prefetch warmed are evicted only after every "
+            "ordinary free block, until used or for %.0fs (variant=basic).",
+            config.warm_protect_s,
+        )
+    elif config.observe_only:
         logger.info(
             "Node-aware KV eviction in OBSERVE-ONLY mode: the free queue is "
             "never reordered and eviction stays LRU. Bookkeeping and the "

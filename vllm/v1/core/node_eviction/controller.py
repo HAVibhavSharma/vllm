@@ -768,7 +768,12 @@ class NodeEvictionController:
         `splice_max_blocks: 0` in the JSON is behaviourally the same arm and
         used to report itself as `node_eviction`, which made the two runs
         indistinguishable in the field the timeline tool keys on.
+
+        Basic mode is checked first: it has no splice either, but it does
+        reorder eviction, so it must not report itself as the baseline.
         """
+        if self.config.basic:
+            return "basic"
         return (
             "baseline"
             if self.config.observe_only or self.config.splice_max_blocks <= 0
@@ -1106,6 +1111,7 @@ class NodeEvictionController:
         out["metrics_epoch"] = self.metrics_epoch
         out["epoch_age_s"] = self.epoch_age_s
         out["observe_only"] = self.config.observe_only
+        out["basic"] = self.config.basic
         if self.snapshot_source is not None:
             for name, value in self.snapshot_source.stats().items():
                 out[f"source_{name}"] = value

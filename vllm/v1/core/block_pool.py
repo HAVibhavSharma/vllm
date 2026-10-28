@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -186,6 +187,20 @@ class BlockPool:
         # `is not None` check and the pool behaves exactly as upstream.
         self.node_eviction = None
 
+        # Basic node-eviction mode (plan/new-eviction/13-phantom-queue.md,
+        # part 6): block id -> monotonic deadline, for the cached blocks a
+        # phantom prefetch warmed. They stay in the free queue, so every
+        # invariant of it holds; `_take_free_blocks` only skips them while an
+        # ordinary free block is left. Empty unless that mode is on.
+        self.warm_protect_s = 0.0
+        self._warm_until: dict[int, float] = {}
+        self.warm_stats = {
+            "warm_protected": 0,
+            "warm_used": 0,
+            "warm_expired": 0,
+            "warm_taken_under_contention": 0,
+        }
+
     def attach_node_eviction(self, controller) -> None:
         """Turn on the node-aware eviction policy for this pool.
 
@@ -203,6 +218,64 @@ class BlockPool:
             for block in queue.get_all_free_blocks()
             if block.block_hash is None
         )
+        if controller.config.basic:
+            self.warm_protect_s = controller.config.warm_protect_s
+
+    def protect_warm(self, block_ids: Iterable[int]) -> int:
+        """Mark blocks a finished phantom warmed; the number marked.
+
+        Only a cached block back in the free queue can be evicted at all, so
+        anything else -- still shared with a running request, or the prompt's
+        partial tail with no hash -- is left alone.
+        """
+        if self.warm_protect_s <= 0:
+            return 0
+        deadline = time.monotonic() + self.warm_protect_s
+        marked = 0
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            if block.is_null or block.ref_cnt != 0 or block.block_hash is None:
+                continue
+            self._warm_until[block_id] = deadline
+            marked += 1
+        self.warm_stats["warm_protected"] += marked
+        return marked
+
+    def _take_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """`num_blocks` from the head of the free queue, warmed blocks last.
+
+        Ordinary free blocks are taken in LRU order as upstream does; a
+        protected warmed block is passed over and put back at the head, in
+        order. Only when no ordinary block is left does a warmed one go,
+        oldest first: under contention the real allocation wins and the
+        prefetch is what is lost. The caller has checked that `num_blocks`
+        are free, warmed ones included.
+        """
+        if not self._warm_until:
+            return self.free_block_queue.popleft_n(num_blocks)
+        now = time.monotonic()
+        queue = self.free_block_queue
+        taken: list[KVCacheBlock] = []
+        held: list[KVCacheBlock] = []
+        while len(taken) < num_blocks and queue.num_free_blocks > 0:
+            block = queue.popleft()
+            deadline = self._warm_until.get(block.block_id)
+            if deadline is None:
+                taken.append(block)
+            elif deadline <= now:
+                del self._warm_until[block.block_id]
+                self.warm_stats["warm_expired"] += 1
+                taken.append(block)
+            else:
+                held.append(block)
+        while len(taken) < num_blocks:
+            block = held.pop(0)
+            del self._warm_until[block.block_id]
+            self.warm_stats["warm_taken_under_contention"] += 1
+            taken.append(block)
+        if held:
+            queue.appendleft_n(held)
+        return taken
 
     @property
     def num_free_fresh(self) -> int:
@@ -368,7 +441,7 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = self._take_free_blocks(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -407,6 +480,8 @@ class BlockPool:
             return False
 
         popped = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
+        # Its contents are going; a protection on it would guard nothing.
+        self._warm_until.pop(block.block_id, None)
 
         if self.node_eviction is not None:
             # Ground truth for the policy is free one frame later: this block
@@ -458,6 +533,13 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+            if self._warm_until:
+                # A hit ends a warmed block's protection: from here on it is
+                # the hitting request's, and ordinary once that one frees it.
+                deadline = self._warm_until.pop(block.block_id, None)
+                if deadline is not None:
+                    used = deadline > time.monotonic()
+                    self.warm_stats["warm_used" if used else "warm_expired"] += 1
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -517,6 +599,7 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self._warm_until.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

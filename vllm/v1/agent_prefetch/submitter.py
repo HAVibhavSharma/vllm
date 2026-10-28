@@ -56,6 +56,19 @@ _LOG_SPANS = os.getenv("VLLM_PREFETCH_LOG_SPANS", "1").strip().lower() not in {
 _span_log = logger.info if _LOG_SPANS else logger.debug
 
 
+# Under `--scheduling-policy priority` a lower value is served first, and a
+# request with none gets 0 -- ahead of every replayed real call but the first,
+# and the last a preemption would pick. A phantom is speculative, so it goes
+# last. Only under that policy: any other refuses a non-zero priority.
+_PHANTOM_PRIORITY = 2**31 - 1
+
+
+def _phantom_priority(engine_client: "EngineClient") -> int:
+    config = getattr(engine_client, "vllm_config", None)
+    policy = getattr(getattr(config, "scheduler_config", None), "policy", "fcfs")
+    return _PHANTOM_PRIORITY if policy == "priority" else 0
+
+
 def _short_hex(prefix_hash: bytes, n: int = 16) -> str:
     return prefix_hash.hex()[:n]
 
@@ -80,6 +93,7 @@ class PhantomPrefetchSubmitter:
         max_inflight_per_agent: int = 64,
     ) -> None:
         self._engine_client = engine_client
+        self._priority = _phantom_priority(engine_client)
         self._max_inflight_per_agent = max_inflight_per_agent
         # Per-agent in-flight tracking. Used only for the local
         # idempotency guard and observability; the engine itself
@@ -215,7 +229,9 @@ class PhantomPrefetchSubmitter:
                 agent_id,
                 params.extra_args,
             )
-            gen = self._engine_client.generate(prompt, params, request_id)
+            gen = self._engine_client.generate(
+                prompt, params, request_id, priority=self._priority
+            )
             # Consume the generator until the engine finishes. We don't
             # use the outputs; the engine handles APC registration in
             # _finalize_prefetch_only_request before sending the final

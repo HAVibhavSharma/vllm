@@ -268,6 +268,53 @@ class Scheduler(SchedulerInterface):
             os.getenv("VLLM_DELAYED_FREE_POLL_MAX_S", "600") or 600
         )
         self._delayed_free_overdue_logged: set[str] = set()
+        # The phantom queue (plan/new-eviction/13-phantom-queue.md). Phantom
+        # prefetches wait here instead of in `waiting`, newest last, and one is
+        # moved into `waiting` only at the start of a step in which no real
+        # request is waiting, the phantom slot is free and memory stays spare
+        # for live requests (`_admit_phantom`). A phantom still unadmitted at
+        # the end of that step comes back (`_return_unadmitted_phantoms`), so
+        # the real queues hold one only while it holds blocks. Off unless
+        # VLLM_PHANTOM_QUEUE=1; with it off, phantoms share `waiting` as before.
+        self._phantom_queue = os.getenv("VLLM_PHANTOM_QUEUE", "0").strip() == "1"
+        self.phantom_waiting: list[Request] = []
+        self._phantom_enqueued_at: dict[str, float] = {}
+        self._phantom_timeout_s = float(
+            os.getenv("VLLM_PHANTOM_QUEUE_TIMEOUT_S", "30") or 30
+        )
+        # Blocks kept free per live request: about what one generates while a
+        # phantom loads. Not from max_tokens, which pinned replay takes from
+        # the trace -- the rule has to behave the same in replay and live.
+        self._phantom_reserve_blocks = int(
+            os.getenv("VLLM_PHANTOM_QUEUE_RESERVE_BLOCKS", "4") or 4
+        )
+        self._phantom_max_loading = max(
+            1, int(os.getenv("VLLM_PHANTOM_QUEUE_MAX_LOADING", "1") or 1)
+        )
+        # Finished without running, expired or overtaken by their request;
+        # drained in update_from_output, which has the outputs to report them.
+        self._phantoms_to_drop: list[Request] = []
+        self._phantom_admitting: Request | None = None
+        # Phantoms holding blocks at the start of the step, for the counters
+        # that say whether one ever stood in a real request's way.
+        self._step_phantoms_holding = 0
+        self._phantom_stats = dict.fromkeys(
+            (
+                "admitted",
+                "expired",
+                "dropped_on_arrival",
+                "held_real_waiting",
+                "held_slot",
+                "held_memory",
+                "real_blocked_with_phantom",
+                "real_preempted_with_phantom",
+            ),
+            0,
+        )
+        if self._phantom_queue:
+            # Part 3: a seed computes only in a step no real prefill needs,
+            # whatever VLLM_PREFETCH_PREFILL_IDLE_ONLY says.
+            self._prefetch_prefill_idle_only = True
         self.ec_connector = None
         if self.vllm_config.ec_transfer_config is not None:
             self.ec_connector = ECConnectorFactory.create_connector(
@@ -365,6 +412,16 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        if self.kv_cache_manager.block_pool.warm_protect_s > 0 and not (
+            self._phantom_queue
+        ):
+            # Protecting warmed blocks is only safe once phantoms are admitted
+            # into spare memory alone; on the shared queue it would protect
+            # blocks a phantom took from under a real request.
+            raise ValueError(
+                "VLLM_NODE_EVICTION_BASIC=1 needs VLLM_PHANTOM_QUEUE=1 "
+                "(plan/new-eviction/13-phantom-queue.md)"
+            )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None and hasattr(
@@ -574,6 +631,10 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Before anything below reads `waiting`: an admitted phantom goes
+        # through this step's ordinary admission path.
+        self._admit_phantom()
+
         # Whether a real request needs prefill this step, decided once; see
         # `_prefetch_prefill_idle_only`.
         real_prefill_pending = (
@@ -738,6 +799,10 @@ class Scheduler(SchedulerInterface):
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
+                    if self._step_phantoms_holding and not (
+                        self._is_prefetch_only_request(preempted_req)
+                    ):
+                        self._phantom_stats["real_preempted_with_phantom"] += 1
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
                         break
@@ -1196,6 +1261,10 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if self._step_phantoms_holding and not (
+                        self._is_prefetch_only_request(request)
+                    ):
+                        self._phantom_stats["real_blocked_with_phantom"] += 1
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1285,6 +1354,10 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+        # Outside the block above: a step that preempted never ran the waiting
+        # loop, and the phantom admitted into it has to come back all the same.
+        self._return_unadmitted_phantoms()
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1941,6 +2014,9 @@ class Scheduler(SchedulerInterface):
 
         if self._prefetch_only_misses:
             self._finish_prefetch_only_misses(outputs)
+        if self._phantoms_to_drop:
+            dropped, self._phantoms_to_drop = self._phantoms_to_drop, []
+            self._finish_phantoms_unrun(dropped, outputs)
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
@@ -2190,7 +2266,13 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
+            if self._phantom_queue and self._is_prefetch_only_request(request):
+                self.phantom_waiting.append(request)
+                self._phantom_enqueued_at[request.request_id] = time.monotonic()
+            else:
+                self._enqueue_waiting_request(request)
+                if self.phantom_waiting:
+                    self._drop_phantoms_for(request)
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
@@ -2242,6 +2324,13 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            if self.phantom_waiting:
+                gone = {r.request_id for r in waiting_requests_to_remove}
+                self.phantom_waiting = [
+                    r for r in self.phantom_waiting if r.request_id not in gone
+                ]
+            for request in waiting_requests_to_remove:
+                self._phantom_enqueued_at.pop(request.request_id, None)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -2283,7 +2372,19 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        block_pool = self.kv_cache_manager.block_pool
+        warmed: list[int] = []
+        if block_pool.warm_protect_s > 0 and self._is_prefetch_only_request(request):
+            # Basic eviction, part 6: what this phantom loaded is protected
+            # once freed. Read before the free, which forgets the request.
+            warmed = [
+                block_id
+                for group in self.kv_cache_manager.get_block_ids(request.request_id)
+                for block_id in group
+            ]
         self.kv_cache_manager.free(request)
+        if warmed:
+            block_pool.protect_warm(warmed)
         del self.requests[request.request_id]
         self._external_runs.pop(request.request_id, None)
         self._delayed_free_since.pop(request.request_id, None)
@@ -2331,6 +2432,7 @@ class Scheduler(SchedulerInterface):
         num_waiting = (
             len(self.waiting)
             + len(self.skipped_waiting)
+            + len(self.phantom_waiting)
             - self.num_waiting_for_streaming_input
         )
         return num_waiting + len(self.running)
@@ -2442,6 +2544,7 @@ class Scheduler(SchedulerInterface):
             num_prefetch_prefill_deferred=len(self._prefetch_deferred_since),
             num_prefetch_prefill_deferrals=self._prefetch_prefill_deferrals,
             num_prefetch_prefill_expired=self._prefetch_prefill_expired,
+            phantom_queue=self._phantom_queue_stats(),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
@@ -2811,15 +2914,28 @@ class Scheduler(SchedulerInterface):
             "occurrences are logged at debug (see "
             "prefetch_only_misses_total)."
         )
+        self._finish_phantoms_unrun(
+            misses, outputs, "no LMCache KV -- skipping prefill"
+        )
 
-        for request in misses:
+    def _finish_phantoms_unrun(
+        self,
+        phantoms: list[Request],
+        outputs: dict[int, list[EngineCoreOutput]],
+        why: str = "dropped from the phantom queue",
+    ) -> None:
+        """Finish phantoms that never ran, in the shape of a finished one.
+
+        The misses above, and the phantom queue's expired and overtaken ones.
+        """
+        for request in phantoms:
             if request.is_finished():
                 continue
             logger.debug(
-                "agent_prefetch: no LMCache KV for phantom %s (%d prompt "
-                "tokens) -- skipping prefill",
+                "agent_prefetch: phantom %s (%d prompt tokens): %s",
                 request.request_id,
                 request.num_tokens,
+                why,
             )
             self.finish_requests(
                 request.request_id, RequestStatus.FINISHED_STOPPED
@@ -2833,6 +2949,147 @@ class Scheduler(SchedulerInterface):
                     trace_headers=request.trace_headers,
                 )
             )
+
+    # -- The phantom queue (plan/new-eviction/13-phantom-queue.md) ----------
+
+    def _phantoms_holding_blocks(self) -> int:
+        """Phantoms with blocks: loading their KV, seeds prefilling, and
+        finished ones whose blocks wait on the connector's save notice."""
+        holding = sum(1 for r in self.running if self._is_prefetch_only_request(r))
+        for queue in (self.waiting, self.skipped_waiting):
+            holding += sum(
+                1
+                for r in queue
+                if self._is_prefetch_only_request(r)
+                and r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            )
+        for request_id in self._delayed_free_since:
+            request = self.requests.get(request_id)
+            if request is not None and self._is_prefetch_only_request(request):
+                holding += 1
+        return holding
+
+    def _admit_phantom(self) -> None:
+        """Move the newest queued phantom into `waiting` if this step allows it.
+
+        Parts 2 and 5. Expired phantoms are dropped first. Then one is admitted
+        only when no real request is waiting, fewer than `_phantom_max_loading`
+        phantoms hold blocks, `running` has room, and the free blocks less an
+        upper bound on the phantom's own -- its whole prompt, cache hits
+        ignored -- still leave `_phantom_reserve_blocks` for every live
+        request. A phantom held back stays queued, and the reason is counted.
+        """
+        # Counted with the queue off too, so the shared-queue arm reports how
+        # often a phantom held blocks when a real request ran short.
+        self._step_phantoms_holding = self._phantoms_holding_blocks()
+        if not self._phantom_queue or not self.phantom_waiting:
+            return
+        now = time.monotonic()
+        kept: list[Request] = []
+        for phantom in self.phantom_waiting:
+            enqueued = self._phantom_enqueued_at.get(phantom.request_id, now)
+            if now - enqueued > self._phantom_timeout_s:
+                self._queue_phantom_drop(phantom, "expired")
+            else:
+                kept.append(phantom)
+        self.phantom_waiting = kept
+        if not kept or self._pause_state != PauseState.UNPAUSED:
+            return
+
+        live = sum(1 for r in self.running if not self._is_prefetch_only_request(r))
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if self._is_prefetch_only_request(request):
+                    continue
+                if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    self._phantom_stats["held_real_waiting"] += 1
+                    return
+                # Admitted and loading its own KV: live, not waiting.
+                live += 1
+        if (
+            self._step_phantoms_holding >= self._phantom_max_loading
+            or len(self.running) >= self.max_num_running_reqs
+        ):
+            self._phantom_stats["held_slot"] += 1
+            return
+        phantom = kept[-1]
+        need = -(-phantom.num_tokens // self.block_size)
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if free - need < self._phantom_reserve_blocks * live:
+            self._phantom_stats["held_memory"] += 1
+            return
+        kept.pop()
+        self._phantom_admitting = phantom
+        self._enqueue_waiting_request(phantom)
+
+    def _return_unadmitted_phantoms(self) -> None:
+        """Part 1: the real queues hold a phantom only while it holds blocks.
+
+        One that did not get its blocks this step -- a seed deferred for want
+        of an idle step, a lookup still pending, a step that preempted and
+        never reached the waiting loop -- goes back to the phantom queue, at
+        the back of the line: otherwise a seed deferred step after step would
+        be the newest every time and the others would never get a turn. Its
+        expiry still counts from when it first arrived.
+        """
+        if not self._phantom_queue:
+            return
+        admitting, self._phantom_admitting = self._phantom_admitting, None
+        for queue in (self.waiting, self.skipped_waiting):
+            back = [
+                r
+                for r in queue
+                if self._is_prefetch_only_request(r)
+                and r.status == RequestStatus.WAITING
+            ]
+            if back:
+                queue.remove_requests(back)
+                self.phantom_waiting[:0] = back
+        if admitting is not None and admitting.status in (
+            RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.RUNNING,
+        ):
+            self._phantom_stats["admitted"] += 1
+            self._phantom_enqueued_at.pop(admitting.request_id, None)
+
+    def _drop_phantoms_for(self, request: Request) -> None:
+        """Part 5: drop the queued phantoms this real request overtook.
+
+        A phantom whose full blocks are `request`'s first blocks was warming a
+        prefix `request` now loads or computes itself. Compared by block hash,
+        which carries the cache salt, so a different salt never matches.
+        """
+        hashes = request.block_hashes
+        if not hashes:
+            return
+        kept: list[Request] = []
+        for phantom in self.phantom_waiting:
+            prefix = phantom.block_hashes
+            n = len(prefix)
+            if prefix and n <= len(hashes) and hashes[:n] == prefix:
+                self._queue_phantom_drop(phantom, "dropped_on_arrival")
+            else:
+                kept.append(phantom)
+        self.phantom_waiting = kept
+
+    def _queue_phantom_drop(self, phantom: Request, reason: str) -> None:
+        """Finish a queued phantom unrun at the next `update_from_output`."""
+        self._phantom_stats[reason] += 1
+        self._phantoms_to_drop.append(phantom)
+
+    def _phantom_queue_stats(self) -> dict[str, int]:
+        """The counters of 13-phantom-queue.md; only the two that say whether
+        a phantom stood in a real request's way when the queue is off."""
+        if not self._phantom_queue:
+            return {
+                k: self._phantom_stats[k]
+                for k in ("real_blocked_with_phantom", "real_preempted_with_phantom")
+            }
+        stats = dict(self._phantom_stats, queued=len(self.phantom_waiting))
+        block_pool = self.kv_cache_manager.block_pool
+        if block_pool.warm_protect_s > 0:
+            stats.update(block_pool.warm_stats)
+        return stats
 
     def _finalize_prefetch_only_request(
         self,

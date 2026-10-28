@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     VLLM_NODE_EVICTION_REDIS_URL: str | None = None
     VLLM_NODE_EVICTION_DECISION_LOG: str | None = None
     VLLM_NODE_EVICTION_OBSERVE: bool = False
+    VLLM_NODE_EVICTION_BASIC: bool = False
+    VLLM_NODE_EVICTION_WARM_PROTECT_S: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -753,6 +755,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runs no policy code at all and therefore emits no line.
     "VLLM_NODE_EVICTION_OBSERVE": lambda: bool(
         int(os.getenv("VLLM_NODE_EVICTION_OBSERVE", "0"))
+    ),
+    # Basic mode: no scored reordering, but blocks a phantom prefetch warmed
+    # are evicted only after every ordinary free block, until a real request
+    # uses them or VLLM_NODE_EVICTION_WARM_PROTECT_S passes. Needs
+    # VLLM_PHANTOM_QUEUE=1. See plan/new-eviction/13-phantom-queue.md.
+    "VLLM_NODE_EVICTION_BASIC": lambda: bool(
+        int(os.getenv("VLLM_NODE_EVICTION_BASIC", "0"))
+    ),
+    "VLLM_NODE_EVICTION_WARM_PROTECT_S": lambda: float(
+        os.getenv("VLLM_NODE_EVICTION_WARM_PROTECT_S", "10") or 10
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls

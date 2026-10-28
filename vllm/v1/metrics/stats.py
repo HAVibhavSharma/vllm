@@ -192,6 +192,11 @@ class SchedulerStats:
     num_prefetch_prefill_deferrals: int = 0
     num_prefetch_prefill_expired: int = 0
 
+    # The phantom queue's cumulative counters (plan/new-eviction/
+    # 13-phantom-queue.md, "What is counted"); with the queue off, only the
+    # two that say whether a phantom held blocks when a real request ran short.
+    phantom_queue: dict[str, int] | None = None
+
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0
