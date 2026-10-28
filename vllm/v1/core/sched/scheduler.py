@@ -3132,6 +3132,12 @@ class Scheduler(SchedulerInterface):
                     request_id=request_id,
                     new_token_ids=[],
                     finish_reason=FinishReason.STOP,
+                    # What admission found: blocks already in HBM, and blocks
+                    # the load brought from LMCache. A phantom finalized here
+                    # never reaches a scheduled step, the only other place
+                    # these are handed on, so without them its stats row read
+                    # 0 cached and 0 loaded whatever it did.
+                    prefill_stats=request.take_prefill_stats(),
                 )
             )
         logger.debug(

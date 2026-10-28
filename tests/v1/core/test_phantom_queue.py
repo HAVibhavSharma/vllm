@@ -17,7 +17,11 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.node_eviction.config import NodeEvictionConfig
 from vllm.v1.engine import FinishReason
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus
 
 from .utils import create_requests, create_scheduler, mock_kv
@@ -200,6 +204,41 @@ def test_the_counters_reach_the_stats(monkeypatch):
     assert stats is not None
     assert stats.phantom_queue["queued"] == 1
     assert stats.phantom_queue["real_blocked_with_phantom"] == 0
+
+
+def test_a_loaded_phantom_reports_what_it_loaded():
+    """A phantom finalized after its LMCache load never has a scheduled step,
+    which is the only other place prefill stats are handed on; without them
+    its stats row read 0 cached and 0 loaded."""
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=BLOCK_SIZE * 2, is_async=True),
+        block_size=BLOCK_SIZE,
+    )
+    phantom = _make(1, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(phantom)
+
+    output = scheduler.schedule()
+    assert phantom.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+
+    output = scheduler.schedule()
+    loaded = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        kv_connector_output=KVConnectorOutput(finished_recving={"phantom"}),
+    )
+    ecos = scheduler.update_from_output(output, loaded)
+
+    finished = _finished(ecos, "phantom")
+    assert len(finished) == 1
+    stats = finished[0].prefill_stats
+    assert stats is not None
+    assert stats.num_external_cached_tokens == BLOCK_SIZE * 2
+    assert stats.num_local_cached_tokens == 0
 
 
 # -- basic eviction: the block pool --------------------------------------
