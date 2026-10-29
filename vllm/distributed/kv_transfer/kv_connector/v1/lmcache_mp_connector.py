@@ -90,6 +90,40 @@ def _full_hit_only_enabled() -> bool:
     )
 
 
+# Environment variable that coalesces decode-time stores. While a request
+# decodes, each 16-token chunk it completes is otherwise stored in the step that
+# completes it: one store request to the LMCache server per chunk, and without
+# MPS each store takes GPU turns away from vLLM (block-id staging, gathers,
+# events) whatever its size. Set to N > 1, chunks holding only generated tokens
+# wait until N of them are pending and go in one store, and whatever is still
+# pending when the request finishes goes in a final store. Prompt chunks are
+# never held. Read scheduler-side in the vLLM process (this connector).
+DECODE_STORE_CHUNKS_ENV_VAR = "LMCACHE_MP_DECODE_STORE_CHUNKS"
+
+
+def _decode_store_chunks() -> int:
+    """How many generated chunks to collect before storing them.
+
+    Returns:
+        ``LMCACHE_MP_DECODE_STORE_CHUNKS`` as a positive integer; 1 -- a
+        store per chunk, as before -- when it is unset, not an integer or
+        below 1.
+    """
+    raw = os.getenv(DECODE_STORE_CHUNKS_ENV_VAR, "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; storing each decode chunk on its own",
+            DECODE_STORE_CHUNKS_ENV_VAR,
+            raw,
+        )
+        return 1
+    return max(1, value)
+
+
 # Helper functions
 def reformat_block_ids(block_ids: tuple[list[int], ...] | None) -> list[int]:
     if block_ids is None:
@@ -233,6 +267,17 @@ class LMCacheMPRequestTracker:
     # requests.
     num_stored_blocks: int = 0
 
+    # Prompt length, so a decode-time store can tell generated chunks from
+    # prompt chunks (see LMCACHE_MP_DECODE_STORE_CHUNKS).
+    num_prompt_tokens: int = 0
+
+    # Set when the request resumes after a preemption while decode stores
+    # are coalesced. Preemption freed the blocks behind `allocated_block_ids`
+    # (which a resume does not replace), and chunks held back for a later
+    # store would be read from blocks another request may now hold, so such
+    # a request stores nothing more.
+    resumed: bool = False
+
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_blocks: int = 0
     num_lmcache_hit_blocks: int = 0
@@ -255,6 +300,8 @@ class LMCacheMPRequestTracker:
         self.block_hashes = ConstantList(request.block_hashes)
         self.allocated_block_ids = []
         self.num_stored_blocks = 0
+        self.num_prompt_tokens = request.num_prompt_tokens
+        self.resumed = False
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
         self.state = LMCacheMPRequestState.PREFETCHING
@@ -326,12 +373,20 @@ class LMCacheMPRequestMetadata:
     direction: Literal["STORE", "RETRIEVE"]
     op: LoadStoreOp
     cache_salt: str = ""
+    # A finished request's last store. The worker sends it at the start of
+    # the step (`start_load_kv`) instead of after the forward pass
+    # (`wait_for_save`), because the step that carries it often has no
+    # forward pass, and a step without one never calls `wait_for_save`. Its
+    # KV was computed in earlier steps, so it waits on nothing in this one.
+    flush: bool = False
 
     @staticmethod
     def GetStoreMetadata(
         tracker: LMCacheMPRequestTracker,
         blocks_in_chunk: int,
         vllm_block_size: int,
+        min_decode_chunks: int = 1,
+        flush: bool = False,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -340,7 +395,16 @@ class LMCacheMPRequestMetadata:
             tracker: The request tracker to generate the metadata from.
             blocks_in_chunk: the number of blocks in a LMCache data chunk
             vllm_block_size: the block size used in vLLM
+            min_decode_chunks: hold pending chunks that hold only generated
+                tokens until at least this many are pending
+                (LMCACHE_MP_DECODE_STORE_CHUNKS). A chunk with any prompt
+                token in it is stored as soon as it is complete.
+            flush: store whatever is pending regardless, for a request that
+                has finished.
         """
+        if tracker.resumed:
+            return None
+
         # Store the blocks that has block hashes
         # NOTE: the invariant here is that `num_stored_blocks` should
         # always be a multiple of `blocks_in_chunk`
@@ -376,6 +440,16 @@ class LMCacheMPRequestMetadata:
 
         if num_chunks >= 1:
             start = tracker.num_stored_blocks
+            generated_only = start * vllm_block_size >= tracker.num_prompt_tokens
+            if flush and not generated_only:
+                # Nothing the hold below deferred: a pending prompt chunk is
+                # left as it would have been without coalescing.
+                return None
+            if not flush and generated_only and num_chunks < min_decode_chunks:
+                # Only generated tokens are pending, and not enough of them:
+                # they wait for the next store, or the final one. The running
+                # request holds their blocks until then.
+                return None
             end = start + num_chunks * blocks_in_chunk
             block_ids = tracker.allocated_block_ids[start:end]
             start_token_idx = start * vllm_block_size
@@ -393,6 +467,7 @@ class LMCacheMPRequestMetadata:
                 direction="STORE",
                 op=op,
                 cache_salt=tracker.cache_salt,
+                flush=flush,
             )
 
             # Update the request tracker
@@ -551,6 +626,19 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                     "misses and never loaded from LMCache",
                     FULL_HIT_ONLY_ENV_VAR,
                 )
+            # Decode-store coalescing (LMCACHE_MP_DECODE_STORE_CHUNKS). A
+            # finished request's pending chunks become a flush store in the
+            # next step's metadata, and its LMCache session is ended only
+            # once that store is reported done, so the store cannot reopen a
+            # session that was already closed.
+            self._decode_store_chunks = _decode_store_chunks()
+            self._flush_stores: list[LMCacheMPRequestMetadata] = []
+            self._end_session_after_flush: set[str] = set()
+            logger.info(
+                "Decode stores: every %d generated chunk(s) (%s)",
+                self._decode_store_chunks,
+                DECODE_STORE_CHUNKS_ENV_VAR,
+            )
         elif self.role == KVConnectorRole.WORKER:
             self.worker_adapter = create_worker_adapter(
                 server_url,
@@ -614,6 +702,20 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+
+        # A finished request's last store goes here rather than in
+        # `wait_for_save`: see `LMCacheMPRequestMetadata.flush`.
+        flushes = [m for m in metadata.requests if m.direction == "STORE" and m.flush]
+        # The adapter marks a request stored as soon as any one of its stores
+        # completes, and reports it in finished_sending once the engine says
+        # it finished -- so an earlier, completed store would let this step's
+        # `get_finished` free the blocks the flush is still reading. Clear
+        # the mark; the flush's own completion sets it again.
+        finished_stores = getattr(self.worker_adapter, "finished_stores", None)
+        if finished_stores is not None:
+            for m in flushes:
+                finished_stores.discard(m.request_id)
+        self._submit_stores(flushes)
 
         request_ids = []
         ops = []
@@ -679,6 +781,20 @@ class LMCacheMPConnector(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, LMCacheMPConnectorMetadata)
+
+        self._submit_stores(
+            [
+                m
+                for m in metadata.requests
+                if m.direction == "STORE" and not m.flush
+            ]
+        )
+
+    def _submit_stores(self, metas: list[LMCacheMPRequestMetadata]) -> None:
+        """Send these stores to LMCache, after the work already enqueued on
+        the current stream."""
         # In MLA scenario, only the first rank of the pipeline group
         # needs to save the KV cache.
         if (
@@ -687,20 +803,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         ):
             return
 
-        metadata = self._get_connector_metadata()
-        assert isinstance(metadata, LMCacheMPConnectorMetadata)
-
-        request_ids = []
-        ops = []
-        cache_salts = []
-        for meta in metadata.requests:
-            if meta.direction != "STORE":
-                continue
-            request_ids.append(meta.request_id)
-            ops.append(meta.op)
-            cache_salts.append(meta.cache_salt)
-
-        if len(request_ids) == 0:
+        if len(metas) == 0:
             return
 
         with torch.cuda.stream(torch.cuda.current_stream()):
@@ -708,7 +811,10 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             event.record()
 
         self.worker_adapter.batched_submit_store_requests(
-            request_ids, ops, event, cache_salts=cache_salts
+            [m.request_id for m in metas],
+            [m.op for m in metas],
+            event,
+            cache_salts=[m.cache_salt for m in metas],
         )
 
     def get_finished(
@@ -963,6 +1069,14 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         """
         metadata = LMCacheMPConnectorMetadata()
 
+        # Requests that finished since the last step, with chunks still
+        # pending. This step's scheduler output is the first to list them in
+        # `finished_req_ids`, so the worker sends the store before it can
+        # report them finished and their blocks are freed.
+        for flush in self._flush_stores:
+            metadata.add_request_metadata(flush)
+        self._flush_stores = []
+
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
@@ -983,6 +1097,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        # A flushed request's last store is done: close its session now.
+        if self._end_session_after_flush:
+            for req_id in connector_output.finished_sending or ():
+                if req_id in self._end_session_after_flush:
+                    self._end_session_after_flush.discard(req_id)
+                    self.scheduler_adapter.end_session(req_id)
         return
 
     def request_finished(
@@ -1023,10 +1143,31 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 num_extra_cached_blocks * self.vllm_block_size
             )
 
+        # Generated chunks still held back by LMCACHE_MP_DECODE_STORE_CHUNKS
+        # go in one last store, sent in the next step. The blocks stay
+        # allocated until the worker reports this request in finished_sending,
+        # which it cannot do before that store is done.
+        flush = None
+        if self._decode_store_chunks > 1:
+            tracker = self.request_trackers.get(request.request_id)
+            if tracker is not None:
+                flush = LMCacheMPRequestMetadata.GetStoreMetadata(
+                    tracker,
+                    self.scheduler_adapter.num_blocks_per_chunk(),
+                    self.vllm_block_size,
+                    flush=True,
+                )
+        if flush is not None:
+            self._flush_stores.append(flush)
+
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
-        # Notify LMCache to end the session for this request
-        self.scheduler_adapter.end_session(request.request_id)
+        # Notify LMCache to end the session for this request -- after the
+        # flush store, if there is one (`update_connector_output`).
+        if flush is not None:
+            self._end_session_after_flush.add(request.request_id)
+        else:
+            self.scheduler_adapter.end_session(request.request_id)
 
         # Always delay block free until the worker reports finished_sending.
         # For requests that *did* store this is required for correctness. For
@@ -1148,7 +1289,10 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
-                request_tracker, blocks_per_chunk, self.vllm_block_size
+                request_tracker,
+                blocks_per_chunk,
+                self.vllm_block_size,
+                min_decode_chunks=self._decode_store_chunks,
             )
             if r_meta is not None:
                 metadata.add_request_metadata(r_meta)
@@ -1168,6 +1312,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             new_block_ids = reformat_block_ids(cached_reqs.new_block_ids[idx])
             if request_id not in cached_reqs.resumed_req_ids:
                 request_tracker.append_block_ids(new_block_ids)
+            elif self._decode_store_chunks > 1:
+                # See LMCacheMPRequestTracker.resumed.
+                request_tracker.resumed = True
 
             # Use the incremental num_scheduled_tokens to
             # stay consistent with _process_new_requests.
@@ -1175,7 +1322,10 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
-                request_tracker, blocks_per_chunk, self.vllm_block_size
+                request_tracker,
+                blocks_per_chunk,
+                self.vllm_block_size,
+                min_decode_chunks=self._decode_store_chunks,
             )
 
             if r_meta is not None:
