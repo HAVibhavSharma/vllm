@@ -93,9 +93,11 @@ their per-step chunk.
 
 Oldest first, like any queue. Phantoms are sent a similar time ahead of
 their requests, so the oldest is for the request due soonest, and serving it
-first is earliest-deadline-first. Stale phantoms do not need the order to
-handle them: §5 drops one whose request has arrived, or that has waited too
-long.
+first is earliest-deadline-first. Strictly, the oldest that fits: a phantom
+too big for the free blocks is passed over for a smaller one behind it,
+rather than holding the whole queue until it expires. Stale phantoms do not
+need the order to handle them: §5 drops one whose request has arrived, or
+that has waited too long.
 
 This was newest first until 30 Oct, on the argument that the most recent
 prediction is the likeliest to match the next real request. The run said

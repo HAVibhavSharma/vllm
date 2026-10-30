@@ -2971,13 +2971,16 @@ class Scheduler(SchedulerInterface):
         return holding
 
     def _admit_phantom(self) -> None:
-        """Move the oldest queued phantom into `waiting` if this step allows it.
+        """Move the oldest queued phantom that fits into `waiting`, if this
+        step allows one.
 
         Oldest first because phantoms are sent a similar time ahead of their
         requests, so the oldest is for the request due soonest. Newest first
         made that one wait: on batch50_20261029_233318, of the phantoms sent
         while another was still loading, the older one's request came first
-        8 times in 9.
+        8 times in 9. The oldest that fits, not the oldest: one too big for
+        the free blocks would otherwise hold up every smaller one behind it
+        until it expired.
 
         Parts 2 and 5. Expired phantoms are dropped first. Then one is admitted
         only when no real request is waiting, fewer than `_phantom_max_loading`
@@ -3019,13 +3022,15 @@ class Scheduler(SchedulerInterface):
         ):
             self._phantom_stats["held_slot"] += 1
             return
-        phantom = kept[0]
-        need = -(-phantom.num_tokens // self.block_size)
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        if free - need < self._phantom_reserve_blocks * live:
+        for index, phantom in enumerate(kept):
+            need = -(-phantom.num_tokens // self.block_size)
+            if free - need >= self._phantom_reserve_blocks * live:
+                break
+        else:
             self._phantom_stats["held_memory"] += 1
             return
-        kept.pop(0)
+        kept.pop(index)
         self._phantom_admitting = phantom
         self._enqueue_waiting_request(phantom)
 

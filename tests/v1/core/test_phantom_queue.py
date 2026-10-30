@@ -163,6 +163,7 @@ def test_a_phantom_leaves_memory_for_live_requests(monkeypatch):
     assert "big" not in held.num_scheduled_tokens
     assert scheduler._phantom_stats["held_memory"] == 1
 
+    # `big` is older but still does not fit, so it must not hold up `small`.
     small = _make(3, "small", BLOCK_SIZE * 6, phantom=True)
     scheduler.add_request(small)
     admitted = scheduler.schedule()
@@ -199,7 +200,16 @@ def test_a_real_request_overtakes_its_phantom(monkeypatch):
 
     output = scheduler.schedule()
     assert "real" in output.num_scheduled_tokens
-    ecos = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    # `real` was scheduled, so the step's output has to carry it.
+    ran = ModelRunnerOutput(
+        req_ids=["real"],
+        req_id_to_index={"real": 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    ecos = scheduler.update_from_output(output, ran)
     assert phantom.status == RequestStatus.FINISHED_STOPPED
     assert len(_finished(ecos, "phantom")) == 1
 
