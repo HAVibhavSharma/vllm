@@ -91,13 +91,21 @@ their per-step chunk.
 
 ### 4. Order
 
-Newest first. The most recent prediction is the likeliest to match the next
-real request, and the oldest is the likeliest to be stale.
+Oldest first, like any queue. Phantoms are sent a similar time ahead of
+their requests, so the oldest is for the request due soonest, and serving it
+first is earliest-deadline-first. Stale phantoms do not need the order to
+handle them: §5 drops one whose request has arrived, or that has waited too
+long.
+
+This was newest first until 30 Oct, on the argument that the most recent
+prediction is the likeliest to match the next real request. The run said
+otherwise: on batch50_20261029_233318, of the phantoms sent while another was
+still loading, the older one's request arrived first 8 times in 9.
 
 A phantom that was admitted but did not get its blocks goes back to the
 *end* of the line. That covers a seed deferred for want of an idle step, or
 an LMCache lookup still pending. Otherwise a seed deferred step after step
-would be the newest every time, and no other phantom would get a turn. Its
+would be the oldest every time, and no other phantom would get a turn. Its
 expiry still counts from when it first arrived.
 
 ### 5. Dropping stale phantoms

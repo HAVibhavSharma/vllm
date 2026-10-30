@@ -102,7 +102,7 @@ def test_a_phantom_waits_while_a_real_request_is_waiting(monkeypatch):
     assert scheduler._phantom_stats["admitted"] == 1
 
 
-def test_one_phantom_at_a_time_newest_first(monkeypatch):
+def test_one_phantom_at_a_time_oldest_first(monkeypatch):
     scheduler = _scheduler(monkeypatch)
     older = _make(1, "older", BLOCK_SIZE * 4, phantom=True)
     newer = _make(2, "newer", BLOCK_SIZE * 4, phantom=True)
@@ -110,15 +110,30 @@ def test_one_phantom_at_a_time_newest_first(monkeypatch):
     scheduler.add_request(newer)
 
     first = scheduler.schedule()
-    assert "newer" in first.num_scheduled_tokens
-    assert "older" not in first.num_scheduled_tokens
-    assert scheduler.phantom_waiting == [older]
+    assert "older" in first.num_scheduled_tokens
+    assert "newer" not in first.num_scheduled_tokens
+    assert scheduler.phantom_waiting == [newer]
 
-    # `newer` still holds its blocks, so the slot is taken.
+    # `older` still holds its blocks, so the slot is taken.
     second = scheduler.schedule()
-    assert "older" not in second.num_scheduled_tokens
-    assert scheduler.phantom_waiting == [older]
+    assert "newer" not in second.num_scheduled_tokens
+    assert scheduler.phantom_waiting == [newer]
     assert scheduler._phantom_stats["held_slot"] >= 1
+
+
+def test_an_unadmitted_phantom_goes_to_the_back_of_the_line(monkeypatch):
+    # A lookup that has not resolved: the admitted phantom gets no blocks this
+    # step and comes back behind the one that arrived after it.
+    scheduler = _scheduler(monkeypatch)
+    scheduler.connector.get_num_new_matched_tokens = lambda *a, **k: (None, False)
+    older = _make(1, "older", BLOCK_SIZE * 4, phantom=True)
+    newer = _make(2, "newer", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(older)
+    scheduler.add_request(newer)
+
+    output = scheduler.schedule()
+    assert "older" not in output.num_scheduled_tokens
+    assert scheduler.phantom_waiting == [newer, older]
 
 
 def test_a_phantom_never_takes_a_real_requests_slot(monkeypatch):

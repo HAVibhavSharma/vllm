@@ -269,13 +269,14 @@ class Scheduler(SchedulerInterface):
         )
         self._delayed_free_overdue_logged: set[str] = set()
         # The phantom queue (plan/new-eviction/13-phantom-queue.md). Phantom
-        # prefetches wait here instead of in `waiting`, newest last, and one is
-        # moved into `waiting` only at the start of a step in which no real
-        # request is waiting, the phantom slot is free and memory stays spare
-        # for live requests (`_admit_phantom`). A phantom still unadmitted at
-        # the end of that step comes back (`_return_unadmitted_phantoms`), so
-        # the real queues hold one only while it holds blocks. Off unless
-        # VLLM_PHANTOM_QUEUE=1; with it off, phantoms share `waiting` as before.
+        # prefetches wait here instead of in `waiting`, in arrival order, and
+        # the oldest is moved into `waiting` only at the start of a step in
+        # which no real request is waiting, the phantom slot is free and
+        # memory stays spare for live requests (`_admit_phantom`). A phantom
+        # still unadmitted at the end of that step comes back
+        # (`_return_unadmitted_phantoms`), so the real queues hold one only
+        # while it holds blocks. Off unless VLLM_PHANTOM_QUEUE=1; with it off,
+        # phantoms share `waiting` as before.
         self._phantom_queue = os.getenv("VLLM_PHANTOM_QUEUE", "0").strip() == "1"
         self.phantom_waiting: list[Request] = []
         self._phantom_enqueued_at: dict[str, float] = {}
@@ -2970,7 +2971,13 @@ class Scheduler(SchedulerInterface):
         return holding
 
     def _admit_phantom(self) -> None:
-        """Move the newest queued phantom into `waiting` if this step allows it.
+        """Move the oldest queued phantom into `waiting` if this step allows it.
+
+        Oldest first because phantoms are sent a similar time ahead of their
+        requests, so the oldest is for the request due soonest. Newest first
+        made that one wait: on batch50_20261029_233318, of the phantoms sent
+        while another was still loading, the older one's request came first
+        8 times in 9.
 
         Parts 2 and 5. Expired phantoms are dropped first. Then one is admitted
         only when no real request is waiting, fewer than `_phantom_max_loading`
@@ -3012,13 +3019,13 @@ class Scheduler(SchedulerInterface):
         ):
             self._phantom_stats["held_slot"] += 1
             return
-        phantom = kept[-1]
+        phantom = kept[0]
         need = -(-phantom.num_tokens // self.block_size)
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if free - need < self._phantom_reserve_blocks * live:
             self._phantom_stats["held_memory"] += 1
             return
-        kept.pop()
+        kept.pop(0)
         self._phantom_admitting = phantom
         self._enqueue_waiting_request(phantom)
 
@@ -3029,7 +3036,7 @@ class Scheduler(SchedulerInterface):
         of an idle step, a lookup still pending, a step that preempted and
         never reached the waiting loop -- goes back to the phantom queue, at
         the back of the line: otherwise a seed deferred step after step would
-        be the newest every time and the others would never get a turn. Its
+        be the oldest every time and the others would never get a turn. Its
         expiry still counts from when it first arrived.
         """
         if not self._phantom_queue:
@@ -3044,7 +3051,7 @@ class Scheduler(SchedulerInterface):
             ]
             if back:
                 queue.remove_requests(back)
-                self.phantom_waiting[:0] = back
+                self.phantom_waiting.extend(back)
         if admitting is not None and admitting.status in (
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.RUNNING,
