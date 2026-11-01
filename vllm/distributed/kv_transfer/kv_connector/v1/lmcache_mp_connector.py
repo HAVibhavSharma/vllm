@@ -124,6 +124,28 @@ def _decode_store_chunks() -> int:
     return max(1, value)
 
 
+# Environment variable that turns off looking up only past vLLM's own hit. By
+# default a request asks LMCache only about the tokens after its prefix-cache
+# (APC) hit, so LMCache looks up, read-locks and loads just those, and the
+# request does not wait on LMCache loading blocks vLLM already holds -- in run
+# swe_lite10_q1_20261101_235002 calls whose whole prompt was in HBM waited up to
+# 15.5 s for exactly that. "0" restores the lookup from token 0. It needs an
+# LMCache whose scheduler adapter takes `start` and whose server honours the
+# key's start (an adapter with `supports_lookup_start`); with an older one it is
+# off. Read scheduler-side.
+LOOKUP_FROM_VLLM_HIT_ENV_VAR = "LMCACHE_MP_LOOKUP_FROM_VLLM_HIT"
+
+
+def _lookup_from_vllm_hit_enabled() -> bool:
+    """Whether lookups start at vLLM's own hit (on unless set to 0/false/no/off)."""
+    return os.getenv(LOOKUP_FROM_VLLM_HIT_ENV_VAR, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 # Helper functions
 def reformat_block_ids(block_ids: tuple[list[int], ...] | None) -> list[int]:
     if block_ids is None:
@@ -282,6 +304,12 @@ class LMCacheMPRequestTracker:
     num_vllm_hit_blocks: int = 0
     num_lmcache_hit_blocks: int = 0
 
+    # Token index the LMCache lookup starts from: the chunk holding the end of
+    # vLLM's own hit when the lookup was submitted, 0 when it covers the whole
+    # prompt. Only chunks from here on are read-locked by the lookup. None
+    # until the first `get_num_new_matched_tokens` call fixes it.
+    lookup_start: int | None = None
+
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
 
@@ -304,6 +332,7 @@ class LMCacheMPRequestTracker:
         self.resumed = False
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
+        self.lookup_start = None
         self.state = LMCacheMPRequestState.PREFETCHING
         params = getattr(request, "kv_transfer_params", None) or {}
         self.prefetch_only = bool(params.get("prefetch_only", False))
@@ -626,6 +655,17 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                     "misses and never loaded from LMCache",
                     FULL_HIT_ONLY_ENV_VAR,
                 )
+            # Look up only past vLLM's own hit, when the LMCache adapter can.
+            self._lookup_from_vllm_hit = _lookup_from_vllm_hit_enabled() and bool(
+                getattr(self.scheduler_adapter, "supports_lookup_start", False)
+            )
+            logger.info(
+                "LMCache lookups start %s (%s)",
+                "at vLLM's own prefix-cache hit"
+                if self._lookup_from_vllm_hit
+                else "at token 0",
+                LOOKUP_FROM_VLLM_HIT_ENV_VAR,
+            )
             # Decode-store coalescing (LMCACHE_MP_DECODE_STORE_CHUNKS). A
             # finished request's pending chunks become a flush store in the
             # next step's metadata, and its LMCache session is ended only
@@ -914,10 +954,18 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
+        # Ask LMCache only about what vLLM does not already hold: chunks from
+        # the one holding the end of the APC hit. Fixed by the first call,
+        # which is the one that submits the lookup. The result still counts
+        # tokens from 0, the skipped ones included.
+        if tracker.lookup_start is None:
+            tracker.lookup_start = self._lookup_start(num_computed_tokens)
+        lookup_kwargs = {"start": tracker.lookup_start} if tracker.lookup_start else {}
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=list(request.all_token_ids),
             cache_salt=tracker.cache_salt,
+            **lookup_kwargs,
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
@@ -925,6 +973,19 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             return None, True
 
         if ret == 0:
+            return 0, False
+
+        # The APC hit shrank below where the lookup started while it ran, so
+        # the tokens in between were checked nowhere: load nothing.
+        if num_computed_tokens < tracker.lookup_start:
+            if ret > tracker.lookup_start:
+                self.scheduler_adapter.free_lookup_locks(
+                    token_ids=list(request.all_token_ids),
+                    start=tracker.lookup_start,
+                    end=ret,
+                    request_id=request.request_id,
+                    cache_salt=tracker.cache_salt,
+                )
             return 0, False
 
         # Full-hit-only: report a partial prefix hit as a complete miss so KV
@@ -952,7 +1013,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 if free_lookup_locks is not None:
                     free_lookup_locks(
                         token_ids=list(request.all_token_ids),
-                        start=0,
+                        start=tracker.lookup_start,
                         end=ret,
                         request_id=request.request_id,
                         cache_salt=tracker.cache_salt,
@@ -978,6 +1039,16 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
         return need_to_load, need_to_load > 0
+
+    def _lookup_start(self, num_computed_tokens: int) -> int:
+        """Where a request's LMCache lookup starts: the start of the chunk
+        holding the end of vLLM's own hit, or 0 with the feature off."""
+        if not self._lookup_from_vllm_hit:
+            return 0
+        chunk_tokens = (
+            self.scheduler_adapter.num_blocks_per_chunk() * self.vllm_block_size
+        )
+        return (num_computed_tokens // chunk_tokens) * chunk_tokens
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -1042,16 +1113,18 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                     # be freed by vLLM's retrieve.
                     free_end = tracker.num_vllm_hit_blocks * self.vllm_block_size
 
-                if free_end > 0:
+                # Only chunks from the lookup's start were locked.
+                lookup_start = tracker.lookup_start or 0
+                if free_end > lookup_start:
                     self.scheduler_adapter.free_lookup_locks(
                         token_ids=list(tracker.all_token_ids),
-                        start=0,
+                        start=lookup_start,
                         end=free_end,
                         request_id=request.request_id,
                     )
                     logger.debug(
                         "Free locks of tokens %d-%d since it is cached by vLLM.",
-                        0,
+                        lookup_start,
                         free_end,
                     )
 
