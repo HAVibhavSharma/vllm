@@ -29,13 +29,26 @@ from .utils import create_requests, create_scheduler, mock_kv
 BLOCK_SIZE = 16
 
 
+# What langgraph's `derive_agent_id` names a node's calls: the real request
+# and the phantom warming it carry the same one, beside the job id.
+NODE = "langgraph:1:swe_architect:conduct_research"
+OTHER_NODE = "langgraph:1:swe_architect:extract_implementation_plan"
+
+
 def _make(
-    index: int, req_id: str, num_tokens: int, *, phantom: bool = False
+    index: int,
+    req_id: str,
+    num_tokens: int,
+    *,
+    phantom: bool = False,
+    agent: str | None = None,
+    job: str = "1",
 ) -> Request:
     """Request `index` of a batch, so its prompt is `[index] * num_tokens`.
 
     Two requests made with the same index share a prompt prefix; different
-    indices never do.
+    indices never do. With `agent`, it carries `(job, agent)` in its extra
+    args, the key a phantom is matched to its request by.
     """
     request = create_requests(
         num_requests=index + 1,
@@ -46,6 +59,8 @@ def _make(
     )[index]
     if phantom:
         request.kv_transfer_params = {"prefetch_only": True, "cache_salt": "agent::x"}
+    if agent is not None:
+        request.sampling_params.extra_args = {"job_id": job, "agent_id": agent}
     return request
 
 
@@ -188,40 +203,6 @@ def test_an_expired_phantom_is_finished_unrun(monkeypatch):
     assert finished[0].finish_reason == FinishReason.STOP
 
 
-def test_a_real_request_overtakes_its_phantom(monkeypatch):
-    scheduler = _scheduler(monkeypatch)
-    # Same index: the phantom's prompt is the first half of the real one's.
-    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
-    real = _make(0, "real", BLOCK_SIZE * 8)
-    scheduler.add_request(phantom)
-    scheduler.add_request(real)
-    assert not scheduler.phantom_waiting
-    assert scheduler._phantom_stats["dropped_on_arrival"] == 1
-
-    output = scheduler.schedule()
-    assert "real" in output.num_scheduled_tokens
-    # `real` was scheduled, so the step's output has to carry it.
-    ran = ModelRunnerOutput(
-        req_ids=["real"],
-        req_id_to_index={"real": 0},
-        sampled_token_ids=[[0]],
-        logprobs=None,
-        prompt_logprobs_dict={},
-        pooler_output=[],
-    )
-    ecos = scheduler.update_from_output(output, ran)
-    assert phantom.status == RequestStatus.FINISHED_STOPPED
-    assert len(_finished(ecos, "phantom")) == 1
-
-
-def test_a_different_prompt_does_not_drop_a_phantom(monkeypatch):
-    scheduler = _scheduler(monkeypatch)
-    phantom = _make(1, "phantom", BLOCK_SIZE * 4, phantom=True)
-    scheduler.add_request(phantom)
-    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8))
-    assert scheduler.phantom_waiting == [phantom]
-
-
 def _ran(req_id: str) -> ModelRunnerOutput:
     return ModelRunnerOutput(
         req_ids=[req_id],
@@ -233,10 +214,93 @@ def _ran(req_id: str) -> ModelRunnerOutput:
     )
 
 
+def test_a_real_request_overtakes_its_phantom(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=NODE)
+    scheduler.add_request(phantom)
+    scheduler.add_request(real)
+    assert not scheduler.phantom_waiting
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 1
+
+    output = scheduler.schedule()
+    assert "real" in output.num_scheduled_tokens
+    # `real` was scheduled, so the step's output has to carry it.
+    ecos = scheduler.update_from_output(output, _ran("real"))
+    assert phantom.status == RequestStatus.FINISHED_STOPPED
+    assert len(_finished(ecos, "phantom")) == 1
+
+
+def test_another_nodes_request_does_not_drop_a_phantom(monkeypatch):
+    # The same prompt, but another node's call: matched by key, not prompt.
+    scheduler = _scheduler(monkeypatch)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
+    scheduler.add_request(phantom)
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    assert scheduler.phantom_waiting == [phantom]
+
+
+def test_another_questions_request_does_not_drop_a_phantom(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
+    scheduler.add_request(phantom)
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8, agent=NODE, job="2"))
+    assert scheduler.phantom_waiting == [phantom]
+
+
+def test_its_request_with_another_prompt_keeps_a_queued_phantom(monkeypatch):
+    # The key matches but the phantom's prefix is not the request's: kept,
+    # and counted (the predictor built another prefix than the call has).
+    scheduler = _scheduler(monkeypatch)
+    phantom = _make(1, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
+    scheduler.add_request(phantom)
+    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8, agent=NODE))
+    assert scheduler.phantom_waiting == [phantom]
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 0
+    assert scheduler._phantom_stats["key_prompt_mismatch"] == 1
+
+
+def test_a_phantom_after_its_request_with_another_prompt_is_queued(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8, agent=NODE))
+    phantom = _make(1, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
+    scheduler.add_request(phantom)
+    assert scheduler.phantom_waiting == [phantom]
+    assert scheduler._phantom_stats["dropped_after_request"] == 0
+    assert scheduler._phantom_stats["key_prompt_mismatch"] == 1
+
+
+def test_a_phantom_shorter_than_a_block_is_kept(monkeypatch):
+    # No full block of prompt, so nothing to confirm the key's match by.
+    scheduler = _scheduler(monkeypatch)
+    phantom = _make(0, "phantom", BLOCK_SIZE - 1, phantom=True, agent=NODE)
+    scheduler.add_request(phantom)
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8, agent=NODE))
+    assert scheduler.phantom_waiting == [phantom]
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 0
+    assert scheduler._phantom_stats["key_prompt_mismatch"] == 1
+
+
+def test_without_a_key_nothing_is_dropped(monkeypatch):
+    # No ids, or a seed's pattern id: no call to match, whatever the prompt.
+    # Queued as usual, and logged.
+    scheduler = _scheduler(monkeypatch)
+    queued = _make(0, "queued", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(queued)
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8))
+    seed = _make(0, "seed", BLOCK_SIZE * 4, phantom=True,
+                 agent="langgraph:*:**:conduct_research")
+    scheduler.add_request(seed)
+    assert scheduler.phantom_waiting == [queued, seed]
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 0
+    assert scheduler._phantom_stats["dropped_after_request"] == 0
+    assert scheduler._phantom_stats["no_key"] == 2, "both logged and counted"
+
+
 def test_a_phantom_after_its_waiting_request_is_never_queued(monkeypatch):
     scheduler = _scheduler(monkeypatch)
-    real = _make(0, "real", BLOCK_SIZE * 8)
-    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=NODE)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
     scheduler.add_request(real)
     scheduler.add_request(phantom)  # came after its request
     assert not scheduler.phantom_waiting
@@ -252,12 +316,12 @@ def test_a_phantom_after_its_waiting_request_is_never_queued(monkeypatch):
 
 def test_a_phantom_after_its_running_request_is_never_queued(monkeypatch):
     scheduler = _scheduler(monkeypatch)
-    real = _make(0, "real", BLOCK_SIZE * 8)
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=NODE)
     scheduler.add_request(real)
     scheduler.update_from_output(scheduler.schedule(), _ran("real"))
     assert real.status == RequestStatus.RUNNING
 
-    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
     scheduler.add_request(phantom)
     assert not scheduler.phantom_waiting
     assert scheduler._phantom_stats["dropped_after_request"] == 1
@@ -266,19 +330,19 @@ def test_a_phantom_after_its_running_request_is_never_queued(monkeypatch):
 def test_a_phantom_after_its_request_finished_is_queued(monkeypatch):
     # It may be warming the node's next call: kept.
     scheduler = _scheduler(monkeypatch)
-    real = _make(0, "real", BLOCK_SIZE * 8)
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=NODE)
     scheduler.add_request(real)
     scheduler.finish_requests("real", RequestStatus.FINISHED_ABORTED)
-    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
     scheduler.add_request(phantom)
     assert scheduler.phantom_waiting == [phantom]
     assert scheduler._phantom_stats["dropped_after_request"] == 0
 
 
-def test_a_phantom_after_a_different_request_is_queued(monkeypatch):
+def test_a_phantom_after_another_nodes_request_is_queued(monkeypatch):
     scheduler = _scheduler(monkeypatch)
-    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8))
-    phantom = _make(1, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
     scheduler.add_request(phantom)
     assert scheduler.phantom_waiting == [phantom]
 
@@ -286,16 +350,95 @@ def test_a_phantom_after_a_different_request_is_queued(monkeypatch):
 def test_a_phantom_that_started_before_its_request_runs_on(monkeypatch):
     # Admitted and loading when its request arrives: it runs as before.
     scheduler = _scheduler(monkeypatch)
-    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
     scheduler.add_request(phantom)
     output = scheduler.schedule()
     assert "phantom" in output.num_scheduled_tokens
 
-    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8))
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8, agent=NODE))
     assert not phantom.is_finished()
     assert scheduler._phantom_stats["dropped_after_request"] == 0
     assert scheduler._phantom_stats["dropped_on_arrival"] == 0
     assert phantom not in scheduler._phantoms_to_drop
+
+
+def _copying_scheduler(monkeypatch, **env):
+    """LMCache loads asynchronously: an admitted phantom sits in
+    WAITING_FOR_REMOTE_KVS, copying its prefix into the GPU, until the worker
+    reports it received. Prefix caching on, so its blocks can be hit after."""
+    monkeypatch.setenv("VLLM_PHANTOM_QUEUE", "1")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=BLOCK_SIZE * 2, is_async=True),
+        block_size=BLOCK_SIZE,
+        enable_prefix_caching=True,
+    )
+
+
+def _received(*req_ids: str) -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        kv_connector_output=KVConnectorOutput(finished_recving=set(req_ids)),
+    )
+
+
+def _phantom_copying(scheduler) -> Request:
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True, agent=NODE)
+    scheduler.add_request(phantom)
+    output = scheduler.schedule()
+    assert phantom.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    return phantom
+
+
+def test_a_request_waits_for_its_phantoms_copy_and_hits_its_blocks(monkeypatch):
+    scheduler = _copying_scheduler(monkeypatch)
+    phantom = _phantom_copying(scheduler)
+
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=NODE)
+    scheduler.add_request(real)
+    output = scheduler.schedule()
+    assert real.status == RequestStatus.WAITING, "held back while the phantom copies"
+    assert real.prefill_stats is not None and real.prefill_stats.num_prompt_tokens == 0
+    assert scheduler._phantom_stats["waited_for_phantom_copy"] == 1
+
+    scheduler.update_from_output(output, _received("phantom"))  # copy done
+    assert phantom.status == RequestStatus.FINISHED_STOPPED
+
+    scheduler.schedule()
+    assert real.prefill_stats is not None
+    assert real.prefill_stats.num_local_cached_tokens == BLOCK_SIZE * 2, (
+        "the phantom's blocks, not a copy of its own"
+    )
+    assert scheduler._phantom_stats["waited_for_phantom_copy"] == 1
+
+
+def test_another_nodes_request_does_not_wait_for_a_phantoms_copy(monkeypatch):
+    scheduler = _copying_scheduler(monkeypatch)
+    _phantom_copying(scheduler)
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=OTHER_NODE)
+    scheduler.add_request(real)
+    scheduler.schedule()
+    assert real.status == RequestStatus.WAITING_FOR_REMOTE_KVS, "loads its own"
+    assert scheduler._phantom_stats["waited_for_phantom_copy"] == 0
+
+
+def test_a_request_stops_waiting_for_a_copy_that_never_ends(monkeypatch):
+    scheduler = _copying_scheduler(monkeypatch, VLLM_PHANTOM_COPY_WAIT_S="-1")
+    _phantom_copying(scheduler)
+    real = _make(0, "real", BLOCK_SIZE * 8, agent=NODE)
+    scheduler.add_request(real)
+    scheduler.update_from_output(scheduler.schedule(), EMPTY_MODEL_RUNNER_OUTPUT)
+    assert real.status == RequestStatus.WAITING  # waited one step
+    scheduler.schedule()
+    assert real.status == RequestStatus.WAITING_FOR_REMOTE_KVS, "loads its own"
+    assert scheduler._phantom_stats["phantom_copy_wait_timeout"] == 1
 
 
 def test_the_counters_reach_the_stats(monkeypatch):

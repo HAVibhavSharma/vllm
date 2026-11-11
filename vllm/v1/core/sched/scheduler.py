@@ -299,12 +299,22 @@ class Scheduler(SchedulerInterface):
         # Phantoms holding blocks at the start of the step, for the counters
         # that say whether one ever stood in a real request's way.
         self._step_phantoms_holding = 0
+        # Real requests waiting for their phantom's GPU copy, since when; one
+        # waits at most this long, in case the copy never finishes.
+        self._waiting_on_phantom_since: dict[str, float] = {}
+        self._phantom_copy_wait_s = float(
+            os.getenv("VLLM_PHANTOM_COPY_WAIT_S", "30") or 30
+        )
         self._phantom_stats = dict.fromkeys(
             (
                 "admitted",
                 "expired",
                 "dropped_on_arrival",
                 "dropped_after_request",
+                "no_key",
+                "key_prompt_mismatch",
+                "waited_for_phantom_copy",
+                "phantom_copy_wait_timeout",
                 "held_real_waiting",
                 "held_slot",
                 "held_memory",
@@ -923,6 +933,15 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # Its phantom is copying this request's prefix into the GPU:
+                # wait for that copy and hit its blocks once they are cached,
+                # instead of a second copy into blocks of its own -- as a
+                # request already waits for its phantom's L2 read in LMCache.
+                if self._waits_for_its_phantom(request, step_skipped_waiting):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -2269,6 +2288,9 @@ class Scheduler(SchedulerInterface):
             if request.resumable:
                 request.streaming_queue = deque()
             if self._phantom_queue and self._is_prefetch_only_request(request):
+                if self._agent_key(request) is None:
+                    # Queued all the same; no request can be matched to it.
+                    self._log_unkeyed_phantom(request)
                 if self._real_request_ahead_of(request):
                     # Its request came first and is loading or running that
                     # prefix already: never queued, finished unrun.
@@ -2366,6 +2388,8 @@ class Scheduler(SchedulerInterface):
         # A phantom can be aborted while parked in `skipped_waiting`; without
         # this its deferral timestamp outlives it.
         self._prefetch_deferred_since.pop(request_id, None)
+        # Likewise a real request that finished while waiting on a phantom.
+        self._waiting_on_phantom_since.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
@@ -3073,45 +3097,185 @@ class Scheduler(SchedulerInterface):
     def _drop_phantoms_for(self, request: Request) -> None:
         """Part 5: drop the queued phantoms this real request overtook.
 
-        A phantom whose full blocks are `request`'s first blocks was warming a
-        prefix `request` now loads or computes itself. Compared by block hash,
-        which carries the cache salt, so a different salt never matches.
+        A queued phantom with `request`'s `(job_id, agent_id)` whose prompt
+        prefix `request` starts with was warming the call `request` is: this
+        question's call of that node, which now loads or computes that prefix
+        itself. One with the key but another prefix is kept, and logged.
         """
-        hashes = request.block_hashes
-        if not hashes:
+        key = self._agent_key(request)
+        if key is None:
             return
         kept: list[Request] = []
         for phantom in self.phantom_waiting:
-            if self._phantom_warms(phantom, hashes):
+            if self._agent_key(phantom) != key:
+                kept.append(phantom)
+            elif self._phantom_warms(phantom, request.block_hashes):
                 self._queue_phantom_drop(phantom, "dropped_on_arrival")
             else:
+                self._log_prompt_mismatch(phantom, request)
                 kept.append(phantom)
         self.phantom_waiting = kept
 
     def _real_request_ahead_of(self, phantom: Request) -> bool:
-        """Part 5 the other way round: whether a real request that is still
-        waiting, loading or running already starts with `phantom`'s blocks.
+        """Part 5 the other way round: whether a real request with
+        `phantom`'s `(job_id, agent_id)` that starts with `phantom`'s prompt
+        prefix is still waiting, loading or running.
 
-        Such a phantom came after its request: that request loads or
-        computes the prefix itself, so the phantom could only load what it
-        is loading or holds. One whose request has already finished is kept:
-        it may be warming the node's next call.
+        Such a phantom came after its request, which loads or computes the
+        prefix itself, so the phantom could only load what that request is
+        loading or holds. One whose request has already finished is kept: it
+        may be warming the node's next call. So is one whose request has the
+        key but another prefix, and that is logged.
         """
-        if not phantom.block_hashes:
+        key = self._agent_key(phantom)
+        if key is None:
             return False
-        return any(
-            not request.is_finished()
-            and not self._is_prefetch_only_request(request)
-            and self._phantom_warms(phantom, request.block_hashes)
-            for request in self.requests.values()
-        )
+        mismatched: Request | None = None
+        for request in self.requests.values():
+            if (
+                request.is_finished()
+                or self._is_prefetch_only_request(request)
+                or self._agent_key(request) != key
+            ):
+                continue
+            if self._phantom_warms(phantom, request.block_hashes):
+                return True
+            mismatched = request
+        if mismatched is not None:
+            self._log_prompt_mismatch(phantom, mismatched)
+        return False
+
+    def _waits_for_its_phantom(
+        self, request: Request, step_skipped: RequestQueue
+    ) -> bool:
+        """Part 5, the copy stage: whether a real request holds back this step
+        for its phantom's copy of its prefix into the GPU.
+
+        A phantom with the request's `(job_id, agent_id)` and prompt prefix
+        that is loading its KV (WAITING_FOR_REMOTE_KVS) has those blocks in
+        APC once its copy finishes. Waiting for that and hitting them beats
+        allocating blocks of its own and copying the same KV from LMCache a
+        second time, which is the same rule LMCache follows for the L2 read.
+        At most VLLM_PHANTOM_COPY_WAIT_S, in case the copy never finishes.
+        """
+        request_id = request.request_id
+        if (
+            not self._phantom_queue
+            or request.num_computed_tokens != 0
+            or self._is_prefetch_only_request(request)
+            or self._waiting_on_phantom_since.get(request_id) == -1.0
+        ):
+            return False
+        if self._phantom_copying_for(request, step_skipped) is None:
+            self._waiting_on_phantom_since.pop(request_id, None)
+            return False
+        now = time.monotonic()
+        since = self._waiting_on_phantom_since.get(request_id)
+        if since is None:
+            self._waiting_on_phantom_since[request_id] = now
+            self._phantom_stats["waited_for_phantom_copy"] += 1
+            return True
+        if now - since > self._phantom_copy_wait_s:
+            # Never again for this request: -1 marks it as given up.
+            self._waiting_on_phantom_since[request_id] = -1.0
+            self._phantom_stats["phantom_copy_wait_timeout"] += 1
+            logger.info(
+                "agent_prefetch: request %s stopped waiting for its phantom's "
+                "copy after %.0f s and loads its prefix itself",
+                request_id,
+                self._phantom_copy_wait_s,
+            )
+            return False
+        return True
+
+    def _phantom_copying_for(
+        self, request: Request, step_skipped: RequestQueue
+    ) -> Request | None:
+        """A phantom loading `request`'s prefix: its key, its first blocks."""
+        key = self._agent_key(request)
+        if key is None:
+            return None
+        for queue in (self.waiting, self.skipped_waiting, step_skipped):
+            for phantom in queue:
+                if (
+                    phantom.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and self._is_prefetch_only_request(phantom)
+                    and phantom.block_hashes
+                    and self._agent_key(phantom) == key
+                    and self._phantom_warms(phantom, request.block_hashes)
+                ):
+                    return phantom
+        return None
 
     @staticmethod
     def _phantom_warms(phantom: Request, hashes: list) -> bool:
-        """Whether `phantom`'s full blocks are the first blocks of `hashes`."""
+        """Whether `phantom`'s full blocks are the first blocks of `hashes`.
+        A phantom with no full block has no prefix to confirm: no match."""
         prefix = phantom.block_hashes
         n = len(prefix)
         return bool(prefix) and n <= len(hashes) and hashes[:n] == prefix
+
+    def _log_prompt_mismatch(self, phantom: Request, request: Request) -> None:
+        """A phantom and a real request with one `(job_id, agent_id)` whose
+        prompts part before the phantom's prefix ends: the predictor built
+        another prefix than the call has. The phantom is kept."""
+        self._phantom_stats["key_prompt_mismatch"] += 1
+        if not phantom.block_hashes:
+            logger.info(
+                "agent_prefetch: phantom %s shares %s with request %s but has "
+                "no full block of prompt (%d tokens) to confirm the match by; "
+                "the phantom is kept",
+                phantom.request_id,
+                self._agent_key(phantom),
+                request.request_id,
+                phantom.num_tokens,
+            )
+            return
+        same = 0
+        for ours, theirs in zip(phantom.block_hashes, request.block_hashes):
+            if ours != theirs:
+                break
+            same += 1
+        logger.info(
+            "agent_prefetch: phantom %s and request %s share %s but not the "
+            "phantom's prompt prefix (the first %d of its %d blocks match); "
+            "the phantom is kept",
+            phantom.request_id,
+            request.request_id,
+            self._agent_key(phantom),
+            same,
+            len(phantom.block_hashes),
+        )
+
+    @staticmethod
+    def _agent_key(request: Request) -> tuple[str, str] | None:
+        """The `(job_id, agent_id)` a request carries in its extra args, or
+        None. The same key for a node's call and a phantom warming it: both
+        come from langgraph's `derive_agent_id`. A pattern id (a seed's
+        `langgraph:*:**:node`) names no one call, so it is no key."""
+        params = request.sampling_params
+        extra = params.extra_args if params is not None else None
+        if not extra:
+            return None
+        job_id, agent_id = extra.get("job_id"), extra.get("agent_id")
+        if job_id is None or not agent_id or "*" in str(agent_id):
+            return None
+        return str(job_id), str(agent_id)
+
+    def _log_unkeyed_phantom(self, phantom: Request) -> None:
+        """Say that a phantom arrived with no `(job_id, agent_id)`: it is
+        queued like any other, but its request can never drop it."""
+        self._phantom_stats["no_key"] += 1
+        params = phantom.sampling_params
+        extra = (params.extra_args if params is not None else None) or {}
+        logger.info(
+            "agent_prefetch: phantom %s carries no (job_id, agent_id) naming one "
+            "call (job_id=%r, agent_id=%r); queued, and not dropped when its "
+            "request arrives",
+            phantom.request_id,
+            extra.get("job_id"),
+            extra.get("agent_id"),
+        )
 
     def _queue_phantom_drop(self, phantom: Request, reason: str) -> None:
         """Finish a queued phantom unrun at the next `update_from_output`."""
