@@ -304,6 +304,7 @@ class Scheduler(SchedulerInterface):
                 "admitted",
                 "expired",
                 "dropped_on_arrival",
+                "dropped_after_request",
                 "held_real_waiting",
                 "held_slot",
                 "held_memory",
@@ -2268,8 +2269,13 @@ class Scheduler(SchedulerInterface):
             if request.resumable:
                 request.streaming_queue = deque()
             if self._phantom_queue and self._is_prefetch_only_request(request):
-                self.phantom_waiting.append(request)
-                self._phantom_enqueued_at[request.request_id] = time.monotonic()
+                if self._real_request_ahead_of(request):
+                    # Its request came first and is loading or running that
+                    # prefix already: never queued, finished unrun.
+                    self._queue_phantom_drop(request, "dropped_after_request")
+                else:
+                    self.phantom_waiting.append(request)
+                    self._phantom_enqueued_at[request.request_id] = time.monotonic()
             else:
                 self._enqueue_waiting_request(request)
                 if self.phantom_waiting:
@@ -3076,13 +3082,36 @@ class Scheduler(SchedulerInterface):
             return
         kept: list[Request] = []
         for phantom in self.phantom_waiting:
-            prefix = phantom.block_hashes
-            n = len(prefix)
-            if prefix and n <= len(hashes) and hashes[:n] == prefix:
+            if self._phantom_warms(phantom, hashes):
                 self._queue_phantom_drop(phantom, "dropped_on_arrival")
             else:
                 kept.append(phantom)
         self.phantom_waiting = kept
+
+    def _real_request_ahead_of(self, phantom: Request) -> bool:
+        """Part 5 the other way round: whether a real request that is still
+        waiting, loading or running already starts with `phantom`'s blocks.
+
+        Such a phantom came after its request: that request loads or
+        computes the prefix itself, so the phantom could only load what it
+        is loading or holds. One whose request has already finished is kept:
+        it may be warming the node's next call.
+        """
+        if not phantom.block_hashes:
+            return False
+        return any(
+            not request.is_finished()
+            and not self._is_prefetch_only_request(request)
+            and self._phantom_warms(phantom, request.block_hashes)
+            for request in self.requests.values()
+        )
+
+    @staticmethod
+    def _phantom_warms(phantom: Request, hashes: list) -> bool:
+        """Whether `phantom`'s full blocks are the first blocks of `hashes`."""
+        prefix = phantom.block_hashes
+        n = len(prefix)
+        return bool(prefix) and n <= len(hashes) and hashes[:n] == prefix
 
     def _queue_phantom_drop(self, phantom: Request, reason: str) -> None:
         """Finish a queued phantom unrun at the next `update_from_output`."""

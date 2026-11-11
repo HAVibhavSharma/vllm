@@ -222,6 +222,82 @@ def test_a_different_prompt_does_not_drop_a_phantom(monkeypatch):
     assert scheduler.phantom_waiting == [phantom]
 
 
+def _ran(req_id: str) -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_a_phantom_after_its_waiting_request_is_never_queued(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    real = _make(0, "real", BLOCK_SIZE * 8)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(real)
+    scheduler.add_request(phantom)  # came after its request
+    assert not scheduler.phantom_waiting
+    assert scheduler._phantom_stats["dropped_after_request"] == 1
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 0
+
+    output = scheduler.schedule()
+    assert "phantom" not in output.num_scheduled_tokens
+    ecos = scheduler.update_from_output(output, _ran("real"))
+    assert phantom.status == RequestStatus.FINISHED_STOPPED
+    assert len(_finished(ecos, "phantom")) == 1
+
+
+def test_a_phantom_after_its_running_request_is_never_queued(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    real = _make(0, "real", BLOCK_SIZE * 8)
+    scheduler.add_request(real)
+    scheduler.update_from_output(scheduler.schedule(), _ran("real"))
+    assert real.status == RequestStatus.RUNNING
+
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(phantom)
+    assert not scheduler.phantom_waiting
+    assert scheduler._phantom_stats["dropped_after_request"] == 1
+
+
+def test_a_phantom_after_its_request_finished_is_queued(monkeypatch):
+    # It may be warming the node's next call: kept.
+    scheduler = _scheduler(monkeypatch)
+    real = _make(0, "real", BLOCK_SIZE * 8)
+    scheduler.add_request(real)
+    scheduler.finish_requests("real", RequestStatus.FINISHED_ABORTED)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(phantom)
+    assert scheduler.phantom_waiting == [phantom]
+    assert scheduler._phantom_stats["dropped_after_request"] == 0
+
+
+def test_a_phantom_after_a_different_request_is_queued(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8))
+    phantom = _make(1, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(phantom)
+    assert scheduler.phantom_waiting == [phantom]
+
+
+def test_a_phantom_that_started_before_its_request_runs_on(monkeypatch):
+    # Admitted and loading when its request arrives: it runs as before.
+    scheduler = _scheduler(monkeypatch)
+    phantom = _make(0, "phantom", BLOCK_SIZE * 4, phantom=True)
+    scheduler.add_request(phantom)
+    output = scheduler.schedule()
+    assert "phantom" in output.num_scheduled_tokens
+
+    scheduler.add_request(_make(0, "real", BLOCK_SIZE * 8))
+    assert not phantom.is_finished()
+    assert scheduler._phantom_stats["dropped_after_request"] == 0
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 0
+    assert phantom not in scheduler._phantoms_to_drop
+
+
 def test_the_counters_reach_the_stats(monkeypatch):
     scheduler = _scheduler(monkeypatch)
     scheduler.add_request(_make(1, "phantom", BLOCK_SIZE * 4, phantom=True))
