@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
@@ -315,6 +316,58 @@ def _record_in_registry(
     )
     registry.record(agent_id, desc)
     return True
+
+
+def record_chat_completion_prefix(
+    state,
+    engine_client,
+    *,
+    extra_args: dict[str, Any],
+    model_name: str,
+    prompt_token_ids: Sequence[int] | None,
+) -> bool:
+    """Record a plain `/v1/chat/completions` prompt that asks to be recorded.
+
+    B (pitlane's `registry_record`): a ReAct node's next turn extends this
+    turn's prompt, so the prefetch before it should warm this whole prompt,
+    and the registry can only hand that out if this call recorded it.
+    `/v1/agent_chat` records its own calls; swe-agent sends its calls here,
+    with `record_in_registry` and `agent_id` as extra fields, and true only
+    for the nodes it means. Only those are recorded, under exactly that
+    `agent_id` -- not every call with a `langgraph_node`, which is what the
+    removed `auto_register.py` did. The salt is the one `/v1/agent_chat` uses,
+    so both endpoints recording one prompt make one entry. Best-effort: a
+    bookkeeping failure must never fail the completion.
+    """
+    flag = extra_args.get("record_in_registry")
+    if flag is not True and str(flag).strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    agent_id = extra_args.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id or "*" in agent_id:
+        return False
+    if not prompt_token_ids:
+        return False
+    try:
+        registry, _ = get_or_init_agent_prefetch_state(state, engine_client)
+        cache_salt = str(extra_args.get("agent_cache_salt") or f"agent::{agent_id}")
+        recorded = _record_in_registry(
+            registry=registry,
+            agent_id=agent_id,
+            cache_salt=cache_salt,
+            model_name=model_name,
+            prompt_token_ids=list(prompt_token_ids),
+        )
+    except Exception:
+        logger.exception("agent_prefetch: failed to record prefix for %s", agent_id)
+        return False
+    if recorded:
+        logger.debug(
+            "agent_prefetch: recorded prefix for agent %s "
+            "(%d tokens after chunk alignment) from /v1/chat/completions",
+            agent_id,
+            (len(prompt_token_ids) // DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE,
+        )
+    return recorded
 
 
 def _resolve_chat_cache_salt(req: AgentChatCompletionRequest) -> str:

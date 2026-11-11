@@ -83,6 +83,49 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _identity_extra_args(request: ChatCompletionRequest) -> dict[str, Any]:
+    """The `extra_args` engine core will see, for read-only use.
+
+    As `ChatCompletionRequest.to_sampling_params` builds them: `vllm_xargs`,
+    then `model_extra` on top -- a client may send `agent_id` and
+    `record_in_registry` either way, and swe-agent sends them as top-level
+    `extra_body` fields, which land in `model_extra`. A new dict, so reading
+    it never edits the request.
+    """
+    merged: dict[str, Any] = dict(request.vllm_xargs) if request.vllm_xargs else {}
+    if request.model_extra:
+        merged.update(request.model_extra)
+    return merged
+
+
+def _maybe_record_prefix(
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    engine_client,
+    model_name: str,
+    prompt_token_ids,
+) -> None:
+    """Record this prompt in the prefix registry if the call asks for it
+    (`record_in_registry` with its `agent_id`; see
+    `agent_chat.api_router.record_chat_completion_prefix`). A call that does
+    not ask costs one dict lookup."""
+    extra_args = _identity_extra_args(request)
+    if not extra_args.get("record_in_registry"):
+        return
+    # Here, not at the top: the agent router is only needed by calls that ask.
+    from vllm.entrypoints.openai.agent_chat.api_router import (
+        record_chat_completion_prefix,
+    )
+
+    record_chat_completion_prefix(
+        raw_request.app.state,
+        engine_client,
+        extra_args=extra_args,
+        model_name=model_name,
+        prompt_token_ids=prompt_token_ids,
+    )
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -274,6 +317,18 @@ class OpenAIServingChat(OpenAIServing):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
+
+            # B (pitlane's `registry_record`): a ReAct call that asks to be
+            # recorded goes into the prefix registry, so the prefetch for its
+            # node's next turn warms this whole prompt.
+            if raw_request is not None:
+                _maybe_record_prefix(
+                    raw_request,
+                    request,
+                    self.engine_client,
+                    self.model_config.model,
+                    prompt_token_ids,
+                )
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
