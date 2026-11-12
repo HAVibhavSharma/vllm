@@ -110,6 +110,7 @@ class PhantomPrefetchSubmitter:
         cache_salt: str,
         identity: dict[str, str] | None = None,
         prefill_on_miss: bool = True,
+        stage_l1: bool = False,
     ) -> asyncio.Task | None:
         """Submit one phantom prefetch.
 
@@ -134,11 +135,18 @@ class PhantomPrefetchSubmitter:
         exactly the blocks it exists to protect. Callers that know which node
         they are warming for should always pass it.
 
+        ``stage_l1`` asks the scheduler to read the prefix into LMCache's L1
+        only (``Scheduler._stage_phantoms``). Its id ends in ``::l1``, so the
+        same node's ordinary warm of the same prefix, sent as the tool loop
+        ends to release it, is not skipped as already in flight.
+
         Never raises; all failures inside the spawned task are logged
         and absorbed -- prefetch is best-effort and must not break the
         real call.
         """
         request_id = build_prefetch_request_id(agent_id, prefix_hash)
+        if stage_l1:
+            request_id += "::l1"
 
         async with self._lock:
             inflight_for_agent = self._inflight.setdefault(agent_id, set())
@@ -177,6 +185,9 @@ class PhantomPrefetchSubmitter:
                 "prefill_on_miss": bool(prefill_on_miss),
             },
         }
+        if stage_l1:
+            # Read by `Scheduler._is_staged_phantom`.
+            extra_args["kv_transfer_params"]["stage_l1"] = True
         if identity:
             # Top-level, beside kv_transfer_params -- the same shape a real
             # request carries, which is what lets one `node_key_for_request`

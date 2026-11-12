@@ -1050,6 +1050,32 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         )
         return (num_computed_tokens // chunk_tokens) * chunk_tokens
 
+    def release_lookup(self, request: "Request") -> None:
+        """Free what a lookup holds for a request that will never load.
+
+        A staged phantom (the scheduler's `stage_l1`) only looks up: its
+        lookup reads the prefix into L1 and read-locks the chunks it found
+        there, and it is finished without ever getting blocks. The lookup's
+        cleanup lives in `update_state_after_alloc`, which never runs for it,
+        so without this the chunks stay locked for LMCache's read TTL (300 s)
+        and the adapter keeps the lookup's state for good. A lookup still
+        reading keeps its locks until the TTL.
+        """
+        request_id = request.request_id
+        found = self.scheduler_adapter.check_lookup_result(request_id)
+        tracker = self.request_trackers.get(request_id)
+        start = (tracker.lookup_start or 0) if tracker is not None else 0
+        free_lookup_locks = getattr(self.scheduler_adapter, "free_lookup_locks", None)
+        if found and found > start and free_lookup_locks is not None:
+            free_lookup_locks(
+                token_ids=list(request.all_token_ids),
+                start=start,
+                end=found,
+                request_id=request_id,
+                cache_salt=tracker.cache_salt if tracker is not None else "",
+            )
+        self.scheduler_adapter.cleanup_lookup_result(request_id)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

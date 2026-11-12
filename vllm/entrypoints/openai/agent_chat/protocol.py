@@ -203,6 +203,21 @@ class AgentPrefetchRequest(BaseModel):
         "prompt -- the phantom loads that part and then prefills the rest, "
         "under the same throttle."
     )
+    stage_l1: bool = Field(
+        default=False,
+        description="Read this call's prefixes from LMCache's L2 into L1 "
+        "only, and take no GPU blocks.\n\n"
+        "For a warm sent while a tool loop is still running (langgraph's "
+        "lookahead from a ReAct node's first turn): a GPU copy then would "
+        "take the blocks the loop's next turn needs. With the phantom queue "
+        "on, the phantom runs only its LMCache lookup, which reads the prefix "
+        "into L1 and read-locks it there, and waits. It ends unrun when the "
+        "same node's ordinary warm (sent as the loop ends) or its call "
+        "arrives, whose own lookup finds the prefix in L1, or after "
+        "VLLM_PHANTOM_STAGE_TIMEOUT_S (300). Its request id differs from an "
+        "ordinary warm's of the same prefix, so that warm is not taken for a "
+        "duplicate. Without the phantom queue it is an ordinary phantom."
+    )
     @model_validator(mode="after")
     def _one_seed_source(self) -> "AgentPrefetchRequest":
         """``text`` and ``messages`` are two spellings of the same slot.

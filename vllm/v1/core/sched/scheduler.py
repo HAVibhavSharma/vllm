@@ -305,6 +305,19 @@ class Scheduler(SchedulerInterface):
         self._phantom_copy_wait_s = float(
             os.getenv("VLLM_PHANTOM_COPY_WAIT_S", "30") or 30
         )
+        # Staged phantoms (`stage_l1`): the lookahead's warm of the node after
+        # a tool loop, sent at the loop's first turn. Only its LMCache lookup
+        # runs -- the L2 read into L1, which read-locks what it finds there --
+        # and it takes no GPU blocks, so it cannot evict the prefix the loop's
+        # next turn needs. It ends unrun when that node's GPU warm, sent as
+        # the loop ends, or its call arrives, or after this long: LMCache's
+        # L1 read locks expire at 300 s.
+        self.phantom_staged: list[Request] = []
+        self._phantom_staged_since: dict[str, float] = {}
+        self._phantom_staged_loaded: set[str] = set()
+        self._phantom_stage_timeout_s = float(
+            os.getenv("VLLM_PHANTOM_STAGE_TIMEOUT_S", "300") or 300
+        )
         self._phantom_stats = dict.fromkeys(
             (
                 "admitted",
@@ -320,6 +333,10 @@ class Scheduler(SchedulerInterface):
                 "held_memory",
                 "real_blocked_with_phantom",
                 "real_preempted_with_phantom",
+                "staged",
+                "stage_loaded",
+                "stage_released",
+                "stage_expired",
             ),
             0,
         )
@@ -643,6 +660,8 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Staged phantoms only look up (L2 into L1); none enters `waiting`.
+        self._stage_phantoms()
         # Before anything below reads `waiting`: an admitted phantom goes
         # through this step's ordinary admission path.
         self._admit_phantom()
@@ -2295,12 +2314,19 @@ class Scheduler(SchedulerInterface):
                     # Its request came first and is loading or running that
                     # prefix already: never queued, finished unrun.
                     self._queue_phantom_drop(request, "dropped_after_request")
+                elif self._is_staged_phantom(request) and self.connector is not None:
+                    self.phantom_staged.append(request)
+                    self._phantom_staged_since[request.request_id] = time.monotonic()
+                    self._phantom_stats["staged"] += 1
                 else:
+                    if self.phantom_staged:
+                        # This node's GPU warm: the loop is over.
+                        self._release_staged_for(request)
                     self.phantom_waiting.append(request)
                     self._phantom_enqueued_at[request.request_id] = time.monotonic()
             else:
                 self._enqueue_waiting_request(request)
-                if self.phantom_waiting:
+                if self.phantom_waiting or self.phantom_staged:
                     self._drop_phantoms_for(request)
             self.requests[request.request_id] = request
             if self.log_stats:
@@ -2358,8 +2384,15 @@ class Scheduler(SchedulerInterface):
                 self.phantom_waiting = [
                     r for r in self.phantom_waiting if r.request_id not in gone
                 ]
+            if self.phantom_staged:
+                gone = {r.request_id for r in waiting_requests_to_remove}
+                self.phantom_staged = [
+                    r for r in self.phantom_staged if r.request_id not in gone
+                ]
             for request in waiting_requests_to_remove:
                 self._phantom_enqueued_at.pop(request.request_id, None)
+                if self._phantom_staged_since.pop(request.request_id, None) is not None:
+                    self._release_staged_lookup(request)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -3105,16 +3138,87 @@ class Scheduler(SchedulerInterface):
         key = self._agent_key(request)
         if key is None:
             return
+        # A staged phantom too: the call it staged L1 for has come, and its
+        # own lookup finds that prefix in L1.
+        for queue_name in ("phantom_waiting", "phantom_staged"):
+            kept: list[Request] = []
+            for phantom in getattr(self, queue_name):
+                if self._agent_key(phantom) != key:
+                    kept.append(phantom)
+                elif self._phantom_warms(phantom, request.block_hashes):
+                    self._queue_phantom_drop(phantom, "dropped_on_arrival")
+                else:
+                    self._log_prompt_mismatch(phantom, request)
+                    kept.append(phantom)
+            setattr(self, queue_name, kept)
+
+    @staticmethod
+    def _is_staged_phantom(request: Request) -> bool:
+        """Whether a phantom asks for its L2 read only (`stage_l1`)."""
+        params = request.kv_transfer_params
+        return bool(params and params.get("prefetch_only") and params.get("stage_l1"))
+
+    def _stage_phantoms(self) -> None:
+        """Run the staged phantoms' LMCache lookups: the L2 read into L1.
+
+        A lookup is submitted once and polled each step until LMCache has
+        read every chunk it holds into L1, read-locked there; the phantom then
+        waits, holding those locks, for its node's GPU warm or call. No GPU
+        block is allocated, so nothing in the GPU is evicted for it. Looked up
+        from token 0, not from vLLM's own hit: that hit may shrink while the
+        loop runs, and a lookup that started past it loads nothing.
+        """
+        if not self.phantom_staged:
+            return
+        now = time.monotonic()
         kept: list[Request] = []
-        for phantom in self.phantom_waiting:
-            if self._agent_key(phantom) != key:
-                kept.append(phantom)
-            elif self._phantom_warms(phantom, request.block_hashes):
-                self._queue_phantom_drop(phantom, "dropped_on_arrival")
+        for phantom in self.phantom_staged:
+            request_id = phantom.request_id
+            since = self._phantom_staged_since.get(request_id, now)
+            if now - since > self._phantom_stage_timeout_s:
+                self._queue_phantom_drop(phantom, "stage_expired")
+                continue
+            kept.append(phantom)
+            if request_id in self._phantom_staged_loaded:
+                continue
+            matched, _ = self.connector.get_num_new_matched_tokens(phantom, 0)
+            if matched is None:
+                continue  # LMCache is still reading it into L1
+            self._phantom_staged_loaded.add(request_id)
+            self._phantom_stats["stage_loaded"] += 1
+            logger.info(
+                "agent_prefetch: staged phantom %s has %d of its %d prompt tokens "
+                "in LMCache's L1 after %.1f s; its GPU copy waits for its node's "
+                "warm or call",
+                request_id,
+                matched,
+                phantom.num_tokens,
+                now - since,
+            )
+        self.phantom_staged = kept
+
+    def _release_staged_for(self, phantom: Request) -> None:
+        """End the staged phantoms `phantom`'s node had: `phantom` is that
+        node's GPU warm, sent as the loop before it ended, and its lookup
+        finds in L1 what theirs read there."""
+        key = self._agent_key(phantom)
+        if key is None:
+            return
+        kept: list[Request] = []
+        for staged in self.phantom_staged:
+            if self._agent_key(staged) == key:
+                self._queue_phantom_drop(staged, "stage_released")
             else:
-                self._log_prompt_mismatch(phantom, request)
-                kept.append(phantom)
-        self.phantom_waiting = kept
+                kept.append(staged)
+        self.phantom_staged = kept
+
+    def _release_staged_lookup(self, phantom: Request) -> None:
+        """Free a finished staged phantom's L1 read locks and lookup state,
+        which nothing else frees for a request that never got blocks."""
+        self._phantom_staged_loaded.discard(phantom.request_id)
+        release = getattr(self.connector, "release_lookup", None)
+        if release is not None:
+            release(phantom)
 
     def _real_request_ahead_of(self, phantom: Request) -> bool:
         """Part 5 the other way round: whether a real request with
@@ -3290,7 +3394,11 @@ class Scheduler(SchedulerInterface):
                 k: self._phantom_stats[k]
                 for k in ("real_blocked_with_phantom", "real_preempted_with_phantom")
             }
-        stats = dict(self._phantom_stats, queued=len(self.phantom_waiting))
+        stats = dict(
+            self._phantom_stats,
+            queued=len(self.phantom_waiting),
+            staged_queued=len(self.phantom_staged),
+        )
         block_pool = self.kv_cache_manager.block_pool
         if block_pool.warm_protect_s > 0:
             stats.update(block_pool.warm_stats)

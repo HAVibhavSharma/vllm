@@ -43,22 +43,26 @@ def _make(
     phantom: bool = False,
     agent: str | None = None,
     job: str = "1",
+    staged: bool = False,
 ) -> Request:
     """Request `index` of a batch, so its prompt is `[index] * num_tokens`.
 
     Two requests made with the same index share a prompt prefix; different
     indices never do. With `agent`, it carries `(job, agent)` in its extra
-    args, the key a phantom is matched to its request by.
+    args, the key a phantom is matched to its request by. A `staged` phantom
+    asks for its L2 read into L1 only (`stage_l1`).
     """
     request = create_requests(
         num_requests=index + 1,
         num_tokens=num_tokens,
-        max_tokens=1 if phantom else 16,
+        max_tokens=1 if phantom or staged else 16,
         block_size=BLOCK_SIZE,
         req_ids=[f"_{j}" for j in range(index)] + [req_id],
     )[index]
-    if phantom:
+    if phantom or staged:
         request.kv_transfer_params = {"prefetch_only": True, "cache_salt": "agent::x"}
+    if staged:
+        request.kv_transfer_params["stage_l1"] = True
     if agent is not None:
         request.sampling_params.extra_args = {"job_id": job, "agent_id": agent}
     return request
@@ -565,3 +569,155 @@ def test_phantoms_go_last_under_the_priority_policy():
     assert _phantom_priority(client) == _PHANTOM_PRIORITY
     scheduler_config.policy = "fcfs"
     assert _phantom_priority(client) == 0
+
+
+# -- Staged phantoms (`stage_l1`) --------------------------------------------
+#
+# The lookahead's warm of the node after a tool loop, sent at the loop's first
+# turn: only its LMCache lookup runs (the L2 read into L1), it takes no GPU
+# blocks, and it ends when that node's GPU warm or call arrives.
+
+
+def test_a_staged_phantom_only_looks_up_and_takes_no_blocks(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    pool = scheduler.kv_cache_manager.block_pool
+    free = pool.get_num_free_blocks()
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    scheduler.add_request(staged)
+    assert scheduler.phantom_staged == [staged]
+    assert not scheduler.phantom_waiting
+
+    output = scheduler.schedule()
+    assert "staged" not in output.num_scheduled_tokens
+    assert scheduler.phantom_staged == [staged], "it waits, holding L1"
+    assert pool.get_num_free_blocks() == free
+    assert scheduler._phantom_stats["staged"] == 1
+    assert scheduler._phantom_stats["stage_loaded"] == 1
+    assert scheduler._phantom_stats["admitted"] == 0
+
+
+def test_a_staged_phantom_waits_for_its_lookup(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    calls: list[int] = []
+
+    def pending(request, num_computed_tokens):
+        calls.append(num_computed_tokens)
+        return None, True  # LMCache is still reading it into L1
+
+    scheduler.connector.get_num_new_matched_tokens = pending
+    scheduler.add_request(_make(1, "staged", BLOCK_SIZE * 4, staged=True))
+    scheduler.schedule()
+    scheduler.schedule()
+    assert calls == [0, 0], "polled each step, looked up from token 0"
+    assert scheduler._phantom_stats["stage_loaded"] == 0
+
+
+def test_its_nodes_gpu_warm_releases_a_staged_phantom(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    released: list[str] = []
+    scheduler.connector.release_lookup = lambda r: released.append(r.request_id)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    scheduler.add_request(staged)
+    scheduler.schedule()
+
+    # The loop ended: the same node's ordinary warm, the GPU copy from L1.
+    warm = _make(1, "warm", BLOCK_SIZE * 4, phantom=True, agent=OTHER_NODE)
+    scheduler.add_request(warm)
+    assert not scheduler.phantom_staged
+    assert scheduler.phantom_waiting == [warm]
+    assert scheduler._phantom_stats["stage_released"] == 1
+
+    output = scheduler.schedule()
+    ecos = scheduler.update_from_output(output, _ran("warm"))
+    assert staged.status == RequestStatus.FINISHED_STOPPED
+    assert len(_finished(ecos, "staged")) == 1
+    assert released == ["staged"], "its L1 locks are freed"
+
+
+def test_another_nodes_warm_leaves_a_staged_phantom(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    scheduler.add_request(staged)
+    scheduler.add_request(_make(2, "warm", BLOCK_SIZE * 4, phantom=True, agent=NODE))
+    assert scheduler.phantom_staged == [staged]
+    assert scheduler._phantom_stats["stage_released"] == 0
+
+
+def test_its_call_drops_a_staged_phantom(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    scheduler.add_request(staged)
+    scheduler.add_request(_make(1, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    assert not scheduler.phantom_staged
+    assert scheduler._phantom_stats["dropped_on_arrival"] == 1
+
+
+def test_its_call_with_another_prompt_keeps_a_staged_phantom(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    scheduler.add_request(staged)
+    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    assert scheduler.phantom_staged == [staged]
+    assert scheduler._phantom_stats["key_prompt_mismatch"] == 1
+
+
+def test_a_staged_phantom_after_its_request_is_never_staged(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    scheduler.add_request(_make(1, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    scheduler.add_request(
+        _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    )
+    assert not scheduler.phantom_staged
+    assert scheduler._phantom_stats["dropped_after_request"] == 1
+
+
+def test_a_staged_phantom_expires(monkeypatch):
+    monkeypatch.setenv("VLLM_PHANTOM_STAGE_TIMEOUT_S", "-1")
+    scheduler = _scheduler(monkeypatch)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True)
+    scheduler.add_request(staged)
+    output = scheduler.schedule()
+    ecos = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert scheduler._phantom_stats["stage_expired"] == 1
+    assert staged.status == RequestStatus.FINISHED_STOPPED
+    assert len(_finished(ecos, "staged")) == 1
+
+
+def test_an_aborted_staged_phantom_frees_its_lookup(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    released: list[str] = []
+    scheduler.connector.release_lookup = lambda r: released.append(r.request_id)
+    scheduler.add_request(_make(1, "staged", BLOCK_SIZE * 4, staged=True))
+    scheduler.schedule()
+    scheduler.finish_requests("staged", RequestStatus.FINISHED_ABORTED)
+    assert not scheduler.phantom_staged
+    assert released == ["staged"]
+
+
+def test_without_the_queue_a_staged_phantom_is_an_ordinary_one():
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=BLOCK_SIZE * 2, is_async=False),
+        block_size=BLOCK_SIZE,
+    )
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True)
+    scheduler.add_request(staged)
+    assert not scheduler.phantom_staged
+    assert staged in scheduler.waiting
+
+
+def test_without_a_connector_a_staged_phantom_is_queued_as_usual(monkeypatch):
+    monkeypatch.setenv("VLLM_PHANTOM_QUEUE", "1")
+    scheduler = create_scheduler(block_size=BLOCK_SIZE)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True)
+    scheduler.add_request(staged)
+    assert not scheduler.phantom_staged
+    assert scheduler.phantom_waiting == [staged]
+
+
+def test_the_staged_counters_reach_the_stats(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+    scheduler.add_request(_make(1, "staged", BLOCK_SIZE * 4, staged=True))
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.phantom_queue["staged_queued"] == 1
+    assert stats.phantom_queue["staged"] == 1

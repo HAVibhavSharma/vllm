@@ -162,6 +162,7 @@ async def _fan_out_prefetches(
     wait: bool,
     identity: dict[str, str] | None = None,
     prefill_on_miss: bool = False,
+    stage_l1: bool = False,
 ) -> tuple[int, int]:
     """Submit phantom prefetches for ``agent_id``.
 
@@ -172,6 +173,7 @@ async def _fan_out_prefetches(
 
     ``prefill_on_miss`` is forwarded verbatim to every phantom; see
     :attr:`AgentPrefetchRequest.prefill_on_miss` for when it is appropriate.
+    So is ``stage_l1``; see :attr:`AgentPrefetchRequest.stage_l1`.
 
     ``identity`` rides into ``sampling_params.extra_args`` and is what makes
     the warmed blocks visible to the node-eviction policy; see
@@ -200,6 +202,7 @@ async def _fan_out_prefetches(
             cache_salt=desc.cache_salt,
             identity=identity,
             prefill_on_miss=prefill_on_miss,
+            stage_l1=stage_l1,
         )
         if task is not None:
             tasks.append(task)
@@ -835,6 +838,7 @@ async def prefetch_agent_cache(
         wait=request.wait,
         identity=identity,
         prefill_on_miss=request.prefill_on_miss,
+        stage_l1=request.stage_l1,
     )
 
     elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
@@ -864,6 +868,9 @@ async def prefetch_agent_cache(
         # is a full prefill rather than an abort, and a caller that set it by
         # accident has no other way to tell from the outside.
         "prefill_on_miss": request.prefill_on_miss,
+        # Echoed so a caller can tell a server that staged its warm in L1
+        # from one that ignored the field and copied it into the GPU.
+        "stage_l1": request.stage_l1,
         # "all" when no cap was provided; an int otherwise.
         "requested_top_k": top_k_repr,
         "available_prefixes": available,
