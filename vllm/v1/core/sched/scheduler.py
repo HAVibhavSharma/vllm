@@ -314,24 +314,10 @@ class Scheduler(SchedulerInterface):
         # L1 read locks expire at 300 s.
         self.phantom_staged: list[Request] = []
         self._phantom_staged_since: dict[str, float] = {}
-        # No longer polled by `_stage_phantoms`: its lookup finished, or the
-        # admission path submitted it.
         self._phantom_staged_loaded: set[str] = set()
         self._phantom_stage_timeout_s = float(
             os.getenv("VLLM_PHANTOM_STAGE_TIMEOUT_S", "300") or 300
         )
-        # VLLM_PHANTOM_STAGE_WHILE_HELD=1: a phantom queued for GPU room runs
-        # its LMCache lookup while it waits, so once admitted only the L1 copy
-        # is left. Off unless set. On swe_lite10_20261112_175442 get_clear's
-        # warm, sent as extract_implementation_plan started, was held for
-        # memory through extract's whole call and then expired (30 s) or was
-        # admitted too late to load, in 4 of 8 questions.
-        self._phantom_stage_while_held = (
-            os.getenv("VLLM_PHANTOM_STAGE_WHILE_HELD", "0").strip() == "1"
-        )
-        # Phantoms (staged or queued) whose lookup was submitted; one never
-        # given blocks frees what its lookup holds when it finishes.
-        self._phantom_looked_up: set[str] = set()
         self._phantom_stats = dict.fromkeys(
             (
                 "admitted",
@@ -351,8 +337,6 @@ class Scheduler(SchedulerInterface):
                 "stage_loaded",
                 "stage_released",
                 "stage_expired",
-                "held_staged",
-                "stage_gated",
             ),
             0,
         )
@@ -2407,17 +2391,7 @@ class Scheduler(SchedulerInterface):
                 ]
             for request in waiting_requests_to_remove:
                 self._phantom_enqueued_at.pop(request.request_id, None)
-                staged = (
-                    self._phantom_staged_since.pop(request.request_id, None)
-                    is not None
-                )
-                # A queued phantom that looked up but never got blocks: its
-                # lookup's cleanup, in update_state_after_alloc, never ran.
-                held = (
-                    request.request_id in self._phantom_looked_up
-                    and request.status == RequestStatus.WAITING
-                )
-                if staged or held:
+                if self._phantom_staged_since.pop(request.request_id, None) is not None:
                     self._release_staged_lookup(request)
 
         # Second pass: set status and free requests
@@ -2449,9 +2423,6 @@ class Scheduler(SchedulerInterface):
         self._prefetch_deferred_since.pop(request_id, None)
         # Likewise a real request that finished while waiting on a phantom.
         self._waiting_on_phantom_since.pop(request_id, None)
-        # And a phantom whose lookup ran before it was admitted.
-        self._phantom_looked_up.discard(request_id)
-        self._phantom_staged_loaded.discard(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
@@ -3123,14 +3094,6 @@ class Scheduler(SchedulerInterface):
             self._phantom_stats["held_memory"] += 1
             return
         kept.pop(index)
-        if (
-            self._phantom_stage_while_held
-            and phantom.request_id not in self._phantom_looked_up
-        ):
-            # The admission path submits this lookup, from vLLM's own hit; a
-            # poll from token 0 would read that as a shrunken hit and free it.
-            self._phantom_looked_up.add(phantom.request_id)
-            self._phantom_staged_loaded.add(phantom.request_id)
         self._phantom_admitting = phantom
         self._enqueue_waiting_request(phantom)
 
@@ -3196,84 +3159,43 @@ class Scheduler(SchedulerInterface):
         return bool(params and params.get("prefetch_only") and params.get("stage_l1"))
 
     def _stage_phantoms(self) -> None:
-        """Run the L2 reads into L1 of phantoms that hold no GPU blocks.
+        """Run the staged phantoms' LMCache lookups: the L2 read into L1.
 
-        The staged phantoms (`stage_l1`), and with VLLM_PHANTOM_STAGE_WHILE_HELD
-        the ones queued for GPU room. A lookup is submitted once and polled
-        each step until LMCache has read every chunk it holds into L1,
-        read-locked there. A staged phantom then waits, holding those locks,
-        for its node's GPU warm or call; a queued one, once admitted, only
-        copies from L1. No GPU block is allocated here, so nothing in the GPU
-        is evicted for it. Looked up from token 0, not from vLLM's own hit:
-        that hit may shrink while the phantom waits, and a lookup that started
-        past it loads nothing.
-
-        A lookup is submitted only while no real request is waiting: a real
-        request's own LMCache read would share the disk with it
-        (swe_lite10_20261102_113112 Q4: conduct_research's read took 5.0 s
-        instead of ~3 s beside extract's).
+        A lookup is submitted once and polled each step until LMCache has
+        read every chunk it holds into L1, read-locked there; the phantom then
+        waits, holding those locks, for its node's GPU warm or call. No GPU
+        block is allocated, so nothing in the GPU is evicted for it. Looked up
+        from token 0, not from vLLM's own hit: that hit may shrink while the
+        loop runs, and a lookup that started past it loads nothing.
         """
-        held = (
-            self.phantom_waiting
-            if self._phantom_stage_while_held and self.connector is not None
-            else []
-        )
-        if not self.phantom_staged and not held:
+        if not self.phantom_staged:
             return
         now = time.monotonic()
         kept: list[Request] = []
         for phantom in self.phantom_staged:
-            since = self._phantom_staged_since.get(phantom.request_id, now)
+            request_id = phantom.request_id
+            since = self._phantom_staged_since.get(request_id, now)
             if now - since > self._phantom_stage_timeout_s:
                 self._queue_phantom_drop(phantom, "stage_expired")
-            else:
-                kept.append(phantom)
-        self.phantom_staged = kept
-        gated = self._real_request_waiting()
-        counted_gate = False
-        for phantom in [*kept, *held]:
-            request_id = phantom.request_id
+                continue
+            kept.append(phantom)
             if request_id in self._phantom_staged_loaded:
                 continue
-            if request_id not in self._phantom_looked_up:
-                if gated:
-                    if not counted_gate:
-                        self._phantom_stats["stage_gated"] += 1
-                        counted_gate = True
-                    continue
-                self._phantom_looked_up.add(request_id)
             matched, _ = self.connector.get_num_new_matched_tokens(phantom, 0)
             if matched is None:
                 continue  # LMCache is still reading it into L1
             self._phantom_staged_loaded.add(request_id)
-            staged = request_id in self._phantom_staged_since
-            self._phantom_stats["stage_loaded" if staged else "held_staged"] += 1
-            since = (
-                self._phantom_staged_since
-                if staged
-                else self._phantom_enqueued_at
-            ).get(request_id, now)
+            self._phantom_stats["stage_loaded"] += 1
             logger.info(
-                "agent_prefetch: %s phantom %s has %d of its %d prompt tokens in "
-                "LMCache's L1 after %.1f s; %s",
-                "staged" if staged else "queued",
+                "agent_prefetch: staged phantom %s has %d of its %d prompt tokens "
+                "in LMCache's L1 after %.1f s; its GPU copy waits for its node's "
+                "warm or call",
                 request_id,
                 matched,
                 phantom.num_tokens,
                 now - since,
-                "its GPU copy waits for its node's warm or call"
-                if staged
-                else "once admitted it only copies from L1",
             )
-
-    def _real_request_waiting(self) -> bool:
-        """Whether a real request is still waiting for its KV: its own
-        LMCache lookup, its copy, or room."""
-        return any(
-            not self._is_prefetch_only_request(request)
-            for queue in (self.waiting, self.skipped_waiting)
-            for request in queue
-        )
+        self.phantom_staged = kept
 
     def _release_staged_for(self, phantom: Request) -> None:
         """End the staged phantoms `phantom`'s node had: `phantom` is that
