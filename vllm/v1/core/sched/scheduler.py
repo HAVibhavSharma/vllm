@@ -917,12 +917,20 @@ class Scheduler(SchedulerInterface):
             num_running_real = sum(
                 1 for r in self.running if not self._is_prefetch_only_request(r)
             )
+            # Waiting requests that hold KV blocks go first; see
+            # `_take_ready_kv_holders`.
+            ready_kv_holders = self._take_ready_kv_holders()
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                ready_kv_holders or self.waiting or self.skipped_waiting
+            ) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
+                request_queue = (
+                    ready_kv_holders
+                    or self._select_waiting_queue_for_scheduling()
+                )
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
@@ -1394,6 +1402,10 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+            # Block-holders the scan did not reach (it stopped early) go back
+            # in front; the next step takes them out first again.
+            if ready_kv_holders:
+                self.skipped_waiting.prepend_requests(ready_kv_holders)
 
         # Outside the block above: a step that preempted never ran the waiting
         # loop, and the phantom admitted into it has to come back all the same.
@@ -2127,6 +2139,44 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def _take_ready_kv_holders(self) -> RequestQueue:
+        """Move skipped requests that hold KV blocks and can run into a queue of their own.
+
+        Such a request -- its async KV load finished, or it was promoted after
+        one and did not fit the step it was promoted in -- needs only blocks
+        for its remaining tokens. Left where it is, it can sit behind a
+        request whose allocation fails, and the scan stops at that failure: it
+        is never reached, never runs, never frees its blocks, and those blocks
+        can be what the request in front is waiting for. Two SWE questions at
+        once deadlocked so in pitlane run swe_lite10_q1-2_20261120_123326 (the
+        earlier arrival's lookup finished second; nothing was scheduled for
+        6 min 43 s). Upstream's rework of skipped_waiting (#58947) drains
+        block-holders first for the same reason; this is that rule alone.
+        Prefetch-only requests keep their own admission rules.
+        """
+        holders = create_request_queue(self.policy)
+        ready = [
+            request
+            for request in self.skipped_waiting
+            if not self._is_prefetch_only_request(request)
+            and (
+                (
+                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and request.request_id in self.finished_recving_kv_req_ids
+                )
+                or (
+                    request.status
+                    in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    and request.num_computed_tokens > 0
+                )
+            )
+        ]
+        if ready:
+            self.skipped_waiting.remove_requests(ready)
+            for request in ready:
+                holders.add_request(request)
+        return holders
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
