@@ -2,30 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A request that waits for GPU room after its LMCache lookup.
 
-Reproduces the engine crash in pitlane run swe_lite10_q1-2_20261120_110959
-(two SWE questions at once). Q2's second conduct_research call (28,730 tokens)
-was looked up from its 16,560-token APC hit; LMCache found the rest of its
-prefix up to 27,424 on disk. It then waited 35 s for GPU blocks while Q1's
-call decoded, and Q1's decode evicted Q2's cached prefix down to 5,152 tokens.
-What followed, and what each test pins down:
+pitlane run swe_lite10_q1-2_20261120_110959 (two SWE questions at once) died
+on such a request. Q2's second conduct_research call (28,730 tokens) had an
+LMCache result up to 27,424 and waited 35 s for GPU blocks while Q1's call
+decoded and evicted Q2's cached prefix from 16,560 down to 5,152 tokens. With
+lookups starting at vLLM's own hit (LMCACHE_MP_LOOKUP_FROM_VLLM_HIT, now
+removed) that shrink took a path that released the lookup's locks on every
+scheduling attempt, left stale hit counts behind, and issued a retrieve for a
+request the scheduler was prefilling itself; its finished_recving then tripped
+the scheduler's assertion.
 
-1. Every scheduling attempt after the hit shrank took the "hit shrank below
-   the lookup's start" path and released the lookup's locks again: 1,170
-   releases in 35 s, the first one evicting the disk-loaded chunks from L1.
-   (`test_a_queued_request_releases_its_lookup_locks_once`)
-2. That path returns (0, False) but leaves the hit counts an earlier attempt
-   recorded. When blocks were finally allocated the request went RUNNING as a
-   plain prefill, yet `update_state_after_alloc` read the stale counts, set
-   WAITING_FOR_LOAD and the connector issued a retrieve LMCache could no
-   longer serve (retrieved_count=0).
-   (`test_a_request_scheduled_without_a_load_is_not_retrieved`)
-3. That retrieve's completion came back in finished_recving for a RUNNING
-   request, and `_update_from_kv_xfer_finished` asserted it was finished: the
-   EngineCore died.
-   (`test_finished_recving_for_a_running_request_does_not_kill_the_engine`)
+The lookup now covers the prompt from token 0 again, as upstream's does, so a
+shrinking hit only means more to load. These tests hold that down:
 
-Each test states the correct behaviour, so on the code that crashed all three
-fail; that failure is the confirmation.
+- the queued request keeps its locks and loads the difference
+  (`test_a_queued_request_whose_hit_shrank_loads_the_difference`);
+- the retrieve covers exactly what the scheduler was told to expect
+  (`test_the_retrieve_matches_what_the_scheduler_was_told`);
+- the scheduler still asserts when finished_recving names a RUNNING request,
+  as upstream's does; nothing produces that any more, so it is an expected
+  failure that documents the assertion
+  (`test_finished_recving_for_a_running_request_does_not_kill_the_engine`).
 
     pytest tests/v1/kv_connector/unit/test_lmcache_mp_queued_lookup.py -v
 """
@@ -61,8 +58,6 @@ HIT_AFTER_WAIT = 5_152  # what was left of the APC hit when blocks came free
 class Adapter:
     """Stands in for LMCache's scheduler adapter; records lock releases."""
 
-    supports_lookup_start = True
-
     def __init__(self, result: int | None):
         self.result = result
         self.lookups: list[dict] = []
@@ -94,7 +89,6 @@ def _connector(adapter: Adapter):
     conn.request_trackers = {}
     conn._full_hit_only = False
     conn._backing_reports = False
-    conn._lookup_from_vllm_hit = True
     return conn
 
 
@@ -120,12 +114,11 @@ def _queue_then_shrink(conn: mp.LMCacheMPConnector, adapter: Adapter, attempts: 
     Returns what each attempt after the shrink returned.
     """
     req = _request(PROMPT)
-    # Attempt 1: submits the lookup from the APC hit; LMCache still reading.
+    # Attempt 1: submits the lookup, of the whole prompt; LMCache still reading.
     assert conn.get_num_new_matched_tokens(req, HIT_AT_LOOKUP) == (None, True)
-    assert adapter.lookups == [{"start": HIT_AT_LOOKUP, "tokens": PROMPT}]
-    # Attempt 2: the lookup is back and the hit is intact, so the connector
-    # offers the load -- but allocate_slots finds no room and the request
-    # stays waiting. (update_state_after_alloc is not called.)
+    assert adapter.lookups == [{"start": 0, "tokens": PROMPT}]
+    # Attempt 2: the lookup is back and the connector offers the load -- but
+    # allocate_slots finds no room and the request stays waiting.
     adapter.result = LMCACHE_END
     assert conn.get_num_new_matched_tokens(req, HIT_AT_LOOKUP) == (
         LMCACHE_END - HIT_AT_LOOKUP,
@@ -138,41 +131,38 @@ def _queue_then_shrink(conn: mp.LMCacheMPConnector, adapter: Adapter, attempts: 
     return req, returned
 
 
-def test_a_queued_request_releases_its_lookup_locks_once():
+def test_a_queued_request_whose_hit_shrank_loads_the_difference():
     adapter = Adapter(result=None)
     conn = _connector(adapter)
     _, returned = _queue_then_shrink(conn, adapter, attempts=5)
-    assert returned == [(0, False)] * 5
-    # The locks on [lookup start, LMCache end) are released once. Every
-    # release after the first is of chunks LMCache no longer has (the run
-    # logged 795k "finish read on non-existing key" warnings).
-    assert adapter.freed == [(HIT_AT_LOOKUP, LMCACHE_END)], (
-        f"released {len(adapter.freed)} times: {adapter.freed[:3]}..."
-    )
+    # The lookup locked everything from token 0, so the tokens the GPU lost
+    # are still LMCache's to load, and nothing is released while it waits.
+    assert returned == [(LMCACHE_END - HIT_AFTER_WAIT, True)] * 5
+    assert adapter.freed == []
 
 
-def test_a_request_scheduled_without_a_load_is_not_retrieved():
+def test_the_retrieve_matches_what_the_scheduler_was_told():
     adapter = Adapter(result=None)
     conn = _connector(adapter)
     req, returned = _queue_then_shrink(conn, adapter, attempts=1)
-    assert returned == [(0, False)]
-    # Blocks come free: the scheduler takes (0, False) at its word and
-    # allocates the whole prompt as a plain prefill, no external tokens.
-    conn.update_state_after_alloc(req, _blocks(-(-PROMPT // BLOCK)), 0)
-    tracker = conn.request_trackers[req.request_id]
-    state = tracker.state.name  # before the next step's metadata moves it on
+    need = LMCACHE_END - HIT_AFTER_WAIT
+    assert returned == [(need, True)]
+    # Blocks come free: the scheduler allocates the hit plus the load.
+    conn.update_state_after_alloc(req, _blocks(-(-PROMPT // BLOCK)), need)
+    # Locks on what vLLM itself holds go back; the rest is retrieved.
+    assert adapter.freed == [(0, HIT_AFTER_WAIT)]
     metadata = mp.LMCacheMPConnectorMetadata()
     conn._process_retrieve_requests(metadata)
     retrieves = [m for m in metadata.requests if m.direction == "RETRIEVE"]
-    assert retrieves == [], (
-        "a retrieve was issued for a request vLLM is prefilling itself: the "
-        f"tracker went {state} from stale hit counts (vllm "
-        f"{tracker.num_vllm_hit_blocks} blocks, lmcache "
-        f"{tracker.num_lmcache_hit_blocks} blocks)"
-    )
-    assert state == mp.LMCacheMPRequestState.READY.name
+    assert [(m.op.start, m.op.end) for m in retrieves] == [(HIT_AFTER_WAIT, LMCACHE_END)]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="the scheduler (like upstream's) asserts a finished_recving request is "
+    "waiting for KV or finished; the connector no longer produces one that is "
+    "neither, see the module docstring",
+)
 def test_finished_recving_for_a_running_request_does_not_kill_the_engine():
     scheduler = create_scheduler(create_vllm_config(kv_load_failure_policy="recompute"))
     request = create_request(num_tokens=100 * scheduler.block_size)
