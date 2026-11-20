@@ -77,8 +77,8 @@ def test_async_load_failure(
     scheduler_output = scheduler.schedule()
 
     assert len(scheduler.waiting) == 0
-    assert len(scheduler.skipped_waiting) == 3
-    for request in scheduler.skipped_waiting:
+    assert len(scheduler.kv_holding_waiting) == 3
+    for request in scheduler.kv_holding_waiting:
         assert request.num_computed_tokens == num_external_computed_tokens
         assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler.connector.get_num_new_matched_tokens.call_count == 3
@@ -98,8 +98,8 @@ def test_async_load_failure(
     min_invalid_block_idx = min(invalid_block_idxs)
 
     assert len(scheduler.waiting) == 0
-    assert len(scheduler.skipped_waiting) == 3
-    for request in scheduler.skipped_waiting:
+    assert len(scheduler.kv_holding_waiting) == 3
+    for request in scheduler.kv_holding_waiting:
         if request.request_id == request2.request_id:
             assert request.num_computed_tokens == (
                 min_invalid_block_idx * scheduler.block_size
@@ -306,8 +306,9 @@ def test_async_progressive_load_failure(
     scheduler_output = scheduler.schedule()
 
     assert len(scheduler.waiting) == 0
-    assert len(scheduler.skipped_waiting) == 1
-    assert scheduler.skipped_waiting.peek_request().request_id == request.request_id
+    assert len(scheduler.kv_holding_waiting) == 1
+    peeked = scheduler.kv_holding_waiting.peek_request()
+    assert peeked.request_id == request.request_id
     assert request.num_computed_tokens == num_external_computed_tokens
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler.connector.get_num_new_matched_tokens.call_count == 1
@@ -329,8 +330,9 @@ def test_async_progressive_load_failure(
         min_invalid_block_idx = min(min_invalid_block_idx, invalid_block_idx)
 
         assert len(scheduler.waiting) == 0
-        assert len(scheduler.skipped_waiting) == 1
-        assert scheduler.skipped_waiting.peek_request().request_id == request.request_id
+        assert len(scheduler.kv_holding_waiting) == 1
+        peeked = scheduler.kv_holding_waiting.peek_request()
+        assert peeked.request_id == request.request_id
         assert request.num_computed_tokens == (
             min_invalid_block_idx * scheduler.block_size
         )

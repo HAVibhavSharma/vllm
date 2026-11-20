@@ -368,8 +368,13 @@ class Scheduler(SchedulerInterface):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
-        # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        # Waiting requests that hold KV blocks are always drained before
+        # self.waiting: a block-holder must never sit behind a request whose
+        # failed allocation would stop the scheduling scan.
+        self.kv_holding_waiting = create_request_queue(self.policy)
+        # Waiting requests that are deferred, i.e. were skipped by the scheduling
+        # scan or enqueued in a blocked status.
+        self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -911,42 +916,37 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting: deque[Request] = deque()
+            step_skipped_kv_holding: deque[Request] = deque()
+
+            def skip_request(from_queue: RequestQueue) -> None:
+                request_to_skip = from_queue.pop_request()
+                self.deferred_waiting.add(request_to_skip)
+                if self._holds_kv_blocks(request_to_skip):
+                    step_skipped_kv_holding.appendleft(request_to_skip)
+                else:
+                    step_skipped_waiting.appendleft(request_to_skip)
+
             # Counted once per step, not per candidate: `running` is capped at
             # max_num_seqs and this is a plain scan.
             num_running_real = sum(
                 1 for r in self.running if not self._is_prefetch_only_request(r)
             )
-            # Waiting requests that hold KV blocks go first; see
-            # `_take_ready_kv_holders`.
-            ready_kv_holders = self._take_ready_kv_holders()
 
-            while (
-                ready_kv_holders or self.waiting or self.skipped_waiting
-            ) and token_budget > 0:
+            while token_budget > 0:
+                # Requests holding KV blocks are always drained first.
+                request_queue = self.kv_holding_waiting or self.waiting
+                if not request_queue:
+                    break
                 if len(self.running) == self.max_num_running_reqs:
                     break
-
-                request_queue = (
-                    ready_kv_holders
-                    or self._select_waiting_queue_for_scheduling()
-                )
-                assert request_queue is not None
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                ready_to_schedule = self._handle_blocked_waiting_request(request)
+                if not ready_to_schedule:
+                    skip_request(request_queue)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -960,17 +960,15 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    skip_request(request_queue)
                     continue
 
                 # Its phantom is copying this request's prefix into the GPU:
                 # wait for that copy and hit its blocks once they are cached,
                 # instead of a second copy into blocks of its own -- as a
                 # request already waits for its phantom's L2 read in LMCache.
-                if self._waits_for_its_phantom(request, step_skipped_waiting):
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                if self._waits_for_its_phantom(request, step_skipped_kv_holding):
+                    skip_request(request_queue)
                     continue
 
                 num_external_computed_tokens = 0
@@ -996,8 +994,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
+                            skip_request(request_queue)
                             continue
 
                         num_external_computed_tokens = ext_tokens
@@ -1043,6 +1040,7 @@ class Scheduler(SchedulerInterface):
                             # partial hits, which the connector then reports
                             # as 0.
                             request_queue.pop_request()
+                            self.deferred_waiting.discard(request)
                             self._prefetch_only_misses.append(request)
                             self._prefetch_deferred_since.pop(request_id, None)
                             continue
@@ -1066,7 +1064,7 @@ class Scheduler(SchedulerInterface):
                             and self._defer_phantom_prefill(
                                 request,
                                 request_queue,
-                                step_skipped_waiting,
+                                skip_request,
                                 num_running_real,
                                 real_prefill_pending,
                             )
@@ -1194,7 +1192,7 @@ class Scheduler(SchedulerInterface):
                         or self._defer_phantom_prefill(
                             request,
                             request_queue,
-                            step_skipped_waiting,
+                            skip_request,
                             num_running_real,
                             real_prefill_pending,
                         )
@@ -1340,12 +1338,10 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
-                request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
                     # the request finished the KV transfer.
@@ -1360,8 +1356,11 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    skip_request(request_queue)
                     continue
 
+                request = request_queue.pop_request()
+                self.deferred_waiting.discard(request)
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1400,12 +1399,10 @@ class Scheduler(SchedulerInterface):
                             self.ec_connector.update_state_after_alloc(request, i)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_kv_holding:
+                self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
             if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
-            # Block-holders the scan did not reach (it stopped early) go back
-            # in front; the next step takes them out first again.
-            if ready_kv_holders:
-                self.skipped_waiting.prepend_requests(ready_kv_holders)
+                self.waiting.prepend_requests(step_skipped_waiting)
 
         # Outside the block above: a step that preempted never ran the waiting
         # loop, and the phantom admitted into it has to come back all the same.
@@ -2049,6 +2046,8 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            self.kv_holding_waiting.remove_requests(stopped_preempted_reqs)
+            self.deferred_waiting.difference_update(stopped_preempted_reqs)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -2134,61 +2133,26 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    @staticmethod
+    def _holds_kv_blocks(request: Request) -> bool:
+        # Whether a request currently has kv blocks allocated.
+        # While always the case when status is WAITING_FOR_REMOTE_KVS
+        # or WAITING_FOR_STREAMING_REQ, there are such cases where it's
+        # WAITING or PREEMPTED.
+        return (
+            request.num_computed_tokens > 0
+            # num_computed_tokens is reset to 0 if kv transfer fails for requests in
+            # WAITING_FOR_REMOTE_KVS state, before their allocated blocks are freed.
+            or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        )
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
-            self.skipped_waiting.add_request(request)
+            self.deferred_waiting.add(request)
+        if self._holds_kv_blocks(request):
+            self.kv_holding_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
-
-    def _take_ready_kv_holders(self) -> RequestQueue:
-        """Move skipped requests that hold KV blocks and can run into a queue of their own.
-
-        Such a request -- its async KV load finished, or it was promoted after
-        one and did not fit the step it was promoted in -- needs only blocks
-        for its remaining tokens. Left where it is, it can sit behind a
-        request whose allocation fails, and the scan stops at that failure: it
-        is never reached, never runs, never frees its blocks, and those blocks
-        can be what the request in front is waiting for. Two SWE questions at
-        once deadlocked so in pitlane run swe_lite10_q1-2_20261120_123326 (the
-        earlier arrival's lookup finished second; nothing was scheduled for
-        6 min 43 s). Upstream's rework of skipped_waiting (#58947) drains
-        block-holders first for the same reason; this is that rule alone.
-        Prefetch-only requests keep their own admission rules.
-        """
-        holders = create_request_queue(self.policy)
-        ready = [
-            request
-            for request in self.skipped_waiting
-            if not self._is_prefetch_only_request(request)
-            and (
-                (
-                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-                    and request.request_id in self.finished_recving_kv_req_ids
-                )
-                or (
-                    request.status
-                    in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                    and request.num_computed_tokens > 0
-                )
-            )
-        ]
-        if ready:
-            self.skipped_waiting.remove_requests(ready)
-            for request in ready:
-                holders.add_request(request)
-        return holders
-
-    def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        if self.policy == SchedulingPolicy.FCFS:
-            return self.skipped_waiting or self.waiting or None
-
-        # PRIORITY mode: compare queue heads when both queues are non-empty.
-        if self.waiting and self.skipped_waiting:
-            waiting_req = self.waiting.peek_request()
-            skipped_req = self.skipped_waiting.peek_request()
-            return self.waiting if waiting_req < skipped_req else self.skipped_waiting
-
-        return self.waiting or self.skipped_waiting or None
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
@@ -2337,7 +2301,7 @@ class Scheduler(SchedulerInterface):
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
-        return len(self.running), len(self.waiting) + len(self.skipped_waiting)
+        return len(self.running), len(self.waiting) + len(self.kv_holding_waiting)
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -2428,7 +2392,8 @@ class Scheduler(SchedulerInterface):
             self.running = remove_all(self.running, running_requests_to_remove)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
-            self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+            self.kv_holding_waiting.remove_requests(waiting_requests_to_remove)
+            self.deferred_waiting.difference_update(waiting_requests_to_remove)
             if self.phantom_waiting:
                 gone = {r.request_id for r in waiting_requests_to_remove}
                 self.phantom_waiting = [
@@ -2468,7 +2433,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
-        # A phantom can be aborted while parked in `skipped_waiting`; without
+        # A phantom can be aborted while parked in a waiting queue; without
         # this its deferral timestamp outlives it.
         self._prefetch_deferred_since.pop(request_id, None)
         # Likewise a real request that finished while waiting on a phantom.
@@ -2545,7 +2510,7 @@ class Scheduler(SchedulerInterface):
             return len(self.running)
         num_waiting = (
             len(self.waiting)
-            + len(self.skipped_waiting)
+            + len(self.kv_holding_waiting)
             + len(self.phantom_waiting)
             - self.num_waiting_for_streaming_input
         )
@@ -2648,8 +2613,10 @@ class Scheduler(SchedulerInterface):
         )
         return SchedulerStats(
             num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
-            num_skipped_waiting_reqs=len(self.skipped_waiting),
+            # Waiting requests not deferred, and those deferred by transient
+            # constraints or a blocked status (upstream #58947).
+            num_waiting_reqs=self.get_request_counts()[1] - len(self.deferred_waiting),
+            num_skipped_waiting_reqs=len(self.deferred_waiting),
             # make_stats() runs from update_from_output(), i.e. after
             # this step's schedule(), so both of these describe the
             # batch just built rather than the previous one.
@@ -2767,38 +2734,36 @@ class Scheduler(SchedulerInterface):
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
-    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
-        """
-        Try to promote a blocked waiting request back to schedulable states.
-        """
+    def _handle_blocked_waiting_request(self, request: Request) -> bool:
+        """Returns True if scheduling of this request should proceed, False if
+        it should be skipped for this step."""
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-            # finished_recving_kv_req_ids is populated during
-            # update_from_output(), based on worker-side connector signals
-            # in KVConnectorOutput.finished_recving
-            if request.request_id not in self.finished_recving_kv_req_ids:
+            # Check whether async loading requests are finished.
+            request_id = request.request_id
+            if request_id not in self.finished_recving_kv_req_ids:
+                logger.debug("%s is still in WAITING_FOR_REMOTE_KVS state.", request_id)
                 return False
+            # Promote request to waiting or preempted.
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
-            return True
 
-        if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
-            structured_output_req = request.structured_output_request
-            if not (structured_output_req and structured_output_req.grammar):
+        elif request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            # Check whether grammar compilation has finished.
+            struct_output_req = request.structured_output_request
+            if not (struct_output_req and struct_output_req.grammar):
                 return False
+            # Grammar is ready, promote to waiting state.
             request.status = RequestStatus.WAITING
-            return True
 
-        if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+        elif request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            # Streaming input request waiting for more input.
             assert not request.streaming_queue
             return False
 
-        raise AssertionError(
-            "Unexpected blocked waiting status in promotion: "
-            f"{request.status.name} for request {request.request_id}"
-        )
+        return True
 
     def _update_from_kv_xfer_finished(
         self,
@@ -2886,6 +2851,7 @@ class Scheduler(SchedulerInterface):
             cap,
         )
         request_queue.pop_request()
+        self.deferred_waiting.discard(request)
         self._prefetch_deferred_since.pop(request.request_id, None)
         self._prefetch_only_misses.append(request)
         return True
@@ -2907,7 +2873,7 @@ class Scheduler(SchedulerInterface):
         self,
         request: Request,
         request_queue,
-        step_skipped_waiting,
+        skip_request,
         num_running_real: int,
         real_prefill_pending: bool = False,
     ) -> bool:
@@ -2920,8 +2886,9 @@ class Scheduler(SchedulerInterface):
         instead, because a warm that lands after its request is worse than no
         warm; whatever it had already loaded stays in the prefix cache.
 
-        True means the request has been taken off `request_queue` and the
-        caller moves on to the next one.
+        True means the request has been taken off `request_queue` (deferred
+        through the scan's `skip_request`, or dropped) and the caller moves on
+        to the next one.
         """
         request_id = request.request_id
         if (
@@ -2946,10 +2913,10 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens,
             )
             request_queue.pop_request()
+            self.deferred_waiting.discard(request)
             self._prefetch_only_misses.append(request)
             return True
-        request_queue.pop_request()
-        step_skipped_waiting.prepend_request(request)
+        skip_request(request_queue)
         return True
 
     def _real_prefill_pending(self) -> bool:
@@ -2965,7 +2932,7 @@ class Scheduler(SchedulerInterface):
                 and request.num_computed_tokens < request.num_prompt_tokens
             ):
                 return True
-        for queue in (self.waiting, self.skipped_waiting):
+        for queue in (self.waiting, self.kv_holding_waiting):
             for request in queue:
                 if not self._is_prefetch_only_request(request):
                     return True
@@ -3070,7 +3037,7 @@ class Scheduler(SchedulerInterface):
         """Phantoms with blocks: loading their KV, seeds prefilling, and
         finished ones whose blocks wait on the connector's save notice."""
         holding = sum(1 for r in self.running if self._is_prefetch_only_request(r))
-        for queue in (self.waiting, self.skipped_waiting):
+        for queue in (self.waiting, self.kv_holding_waiting):
             holding += sum(
                 1
                 for r in queue
@@ -3120,7 +3087,7 @@ class Scheduler(SchedulerInterface):
             return
 
         live = sum(1 for r in self.running if not self._is_prefetch_only_request(r))
-        for queue in (self.waiting, self.skipped_waiting):
+        for queue in (self.waiting, self.kv_holding_waiting):
             for request in queue:
                 if self._is_prefetch_only_request(request):
                     continue
@@ -3160,7 +3127,7 @@ class Scheduler(SchedulerInterface):
         if not self._phantom_queue:
             return
         admitting, self._phantom_admitting = self._phantom_admitting, None
-        for queue in (self.waiting, self.skipped_waiting):
+        for queue in (self.waiting, self.kv_holding_waiting):
             back = [
                 r
                 for r in queue
@@ -3169,6 +3136,7 @@ class Scheduler(SchedulerInterface):
             ]
             if back:
                 queue.remove_requests(back)
+                self.deferred_waiting.difference_update(back)
                 self.phantom_waiting.extend(back)
         if admitting is not None and admitting.status in (
             RequestStatus.WAITING_FOR_REMOTE_KVS,
@@ -3300,7 +3268,7 @@ class Scheduler(SchedulerInterface):
         return False
 
     def _waits_for_its_phantom(
-        self, request: Request, step_skipped: RequestQueue
+        self, request: Request, step_skipped: Iterable[Request]
     ) -> bool:
         """Part 5, the copy stage: whether a real request holds back this step
         for its phantom's copy of its prefix into the GPU.
@@ -3343,13 +3311,13 @@ class Scheduler(SchedulerInterface):
         return True
 
     def _phantom_copying_for(
-        self, request: Request, step_skipped: RequestQueue
+        self, request: Request, step_skipped: Iterable[Request]
     ) -> Request | None:
         """A phantom loading `request`'s prefix: its key, its first blocks."""
         key = self._agent_key(request)
         if key is None:
             return None
-        for queue in (self.waiting, self.skipped_waiting, step_skipped):
+        for queue in (self.waiting, self.kv_holding_waiting, step_skipped):
             for phantom in queue:
                 if (
                     phantom.status == RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -3479,7 +3447,8 @@ class Scheduler(SchedulerInterface):
 
         # Remove from waiting queues so finish bookkeeping doesn't see it.
         self.waiting.remove_requests([request])
-        self.skipped_waiting.remove_requests([request])
+        self.kv_holding_waiting.remove_requests([request])
+        self.deferred_waiting.discard(request)
 
         request.status = RequestStatus.FINISHED_STOPPED
         # _free_request invokes the connector's request_finished hook
@@ -3627,7 +3596,7 @@ class Scheduler(SchedulerInterface):
         # handle async KV loads (not cached yet, evict_blocks=False)
         async_load_reqs = (
             req
-            for req in self.skipped_waiting
+            for req in self.kv_holding_waiting
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         )
         async_failed_req_ids, num_failed_tokens, _ = (

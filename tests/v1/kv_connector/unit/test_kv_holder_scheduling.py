@@ -82,5 +82,5 @@ def test_a_loaded_request_is_not_stuck_behind_one_that_cannot_fit(policy: str):
     assert loaded.status == RequestStatus.RUNNING
     assert older.request_id not in output.num_scheduled_tokens
     # Nothing was lost from the waiting queues.
-    waiting = list(scheduler.waiting) + list(scheduler.skipped_waiting)
+    waiting = list(scheduler.waiting) + list(scheduler.kv_holding_waiting)
     assert older in waiting and loaded not in waiting
