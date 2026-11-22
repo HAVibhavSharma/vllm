@@ -2439,6 +2439,11 @@ class Scheduler(SchedulerInterface):
                 self._phantom_enqueued_at.pop(request.request_id, None)
                 if self._phantom_staged_since.pop(request.request_id, None) is not None:
                     self._release_staged_lookup(request)
+                    if finished_status == RequestStatus.FINISHED_ABORTED:
+                        # Released from outside: `/v1/agents/release` when its
+                        # question ended, before its call came.
+                        logger.info("agent_prefetch: staged phantom %s ended (aborted)",
+                                    request.request_id)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -3466,6 +3471,13 @@ class Scheduler(SchedulerInterface):
         """Finish a queued phantom unrun at the next `update_from_output`."""
         self._phantom_stats[reason] += 1
         self._phantoms_to_drop.append(phantom)
+        if self._is_staged_phantom(phantom):
+            # One line per staged phantom, for the harness to judge each
+            # prediction: `dropped_on_arrival` is its call arriving with its
+            # prompt; `stage_released_mismatch` that call with another prompt;
+            # `stage_expired` no call in time.
+            logger.info("agent_prefetch: staged phantom %s ended (%s)",
+                        phantom.request_id, reason)
 
     def _phantom_queue_stats(self) -> dict[str, int]:
         """The counters of 13-phantom-queue.md; only the two that say whether
