@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_NODE_EVICTION_CONFIG: str | None = None
     VLLM_NODE_EVICTION_REDIS_URL: str | None = None
     VLLM_NODE_EVICTION_DECISION_LOG: str | None = None
+    VLLM_NODE_EVICTION_ACCESS_LOG: str | None = None
     VLLM_NODE_EVICTION_OBSERVE: bool = False
     VLLM_NODE_EVICTION_BASIC: bool = False
     VLLM_NODE_EVICTION_WARM_PROTECT_S: float = 10.0
@@ -748,6 +749,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unbounded under pressure - a debugging tool, not a production one.
     "VLLM_NODE_EVICTION_DECISION_LOG": lambda: os.getenv(
         "VLLM_NODE_EVICTION_DECISION_LOG"
+    ),
+    # If set, write one JSONL line per request's first prefix-cache lookup to
+    # this path: its identity, hit and every full block's (short) hash. Joined
+    # with the decision log's hashes it says which evicted blocks were needed
+    # again, when, and by whom. Unbounded - a debugging tool, not a production
+    # one.
+    "VLLM_NODE_EVICTION_ACCESS_LOG": lambda: os.getenv(
+        "VLLM_NODE_EVICTION_ACCESS_LOG"
     ),
     # Observe-only mode: build the policy's bookkeeping and emit the
     # kv_hbm line, but never reorder the free queue. This is the A/B
@@ -1957,6 +1966,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_NODE_EVICTION_CONFIG",
         "VLLM_NODE_EVICTION_REDIS_URL",
         "VLLM_NODE_EVICTION_DECISION_LOG",
+        "VLLM_NODE_EVICTION_ACCESS_LOG",
         "VLLM_NODE_EVICTION_OBSERVE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",

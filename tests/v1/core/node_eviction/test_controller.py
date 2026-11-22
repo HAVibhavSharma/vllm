@@ -10,7 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    FreeKVCacheBlockQueue,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.node_eviction.config import NodeEvictionConfig
 from vllm.v1.core.node_eviction.controller import (
     NodeEvictionController,
@@ -526,6 +531,42 @@ def test_eviction_drops_the_block_and_records_a_decision():
     controller.on_block_evicted(1)
     assert controller.index.owners_of(1) == set()
     assert controller.observer.counters.evictions_total == 1
+
+
+def test_access_and_eviction_logs_name_a_block_by_the_same_hash(tmp_path):
+    """The pool's hash carries a group id and the request's does not; both
+    logs must still print one name for one block, or nothing joins."""
+    import json
+
+    digests = [BlockHash(bytes([i]) * 32) for i in (7, 8)]
+    pool = FakePool(num_blocks=16)
+    for block_id, digest in zip((3, 4), digests):
+        pool.blocks[block_id].block_hash = make_block_hash_with_group_id(digest, 0)
+    decisions, accesses = tmp_path / "evictions.jsonl", tmp_path / "accesses.jsonl"
+    controller = make_controller(
+        pool, decision_log_path=str(decisions), access_log_path=str(accesses)
+    )
+    request = make_request()
+    request.block_hashes = digests
+    controller.on_cache_query(num_tokens=40, num_hits=16, request=request)
+    controller.on_block_evicted(3)
+    controller.observer.close()
+
+    access = json.loads(accesses.read_text().strip())
+    eviction = json.loads(decisions.read_text().strip())
+    assert access["key"] == ["run-42", "research", "tavily:summary"]
+    assert (access["num_tokens"], access["num_hits"]) == (40, 16)
+    assert access["hashes"] == [(bytes([7]) * 8).hex(), (bytes([8]) * 8).hex()]
+    assert eviction["hash"] == access["hashes"][0]
+
+
+def test_no_access_log_by_default(tmp_path):
+    controller = make_controller(FakePool(num_blocks=16))
+    request = make_request()
+    request.block_hashes = [BlockHash(b"x" * 32)]
+    controller.on_cache_query(num_tokens=16, num_hits=0, request=request)
+    assert not controller.observer.access_log_enabled
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_reset_prefix_cache_clears_the_index():

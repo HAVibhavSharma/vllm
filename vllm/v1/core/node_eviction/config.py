@@ -257,6 +257,11 @@ class NodeEvictionConfig:
     """When set, one JSONL line per evicted *cached* block. Unbounded under
     pressure, hence flag-gated; the counters in §6 are always on."""
 
+    access_log_path: str | None = None
+    """When set, one JSONL line per request's first prefix-cache lookup, with
+    every full block's short hash -- the other half of the decision log's
+    `hash`: an evicted hash that shows up here later was needed again."""
+
     regret_window_ms: float = 120_000.0
     """Horizon H for the always-on regret counter: an eviction whose key is
     requested again within this window is counted as regret."""
@@ -359,6 +364,8 @@ class NodeEvictionConfig:
             cfg.redis_url = envs.VLLM_NODE_EVICTION_REDIS_URL
         if envs.VLLM_NODE_EVICTION_DECISION_LOG:
             cfg.decision_log_path = envs.VLLM_NODE_EVICTION_DECISION_LOG
+        if envs.VLLM_NODE_EVICTION_ACCESS_LOG:
+            cfg.access_log_path = envs.VLLM_NODE_EVICTION_ACCESS_LOG
         # Assigned unconditionally, unlike the tunables above: the front-end
         # drainer reads this same env var, and a JSON file that could switch
         # the engine half on by itself would accumulate wants nobody submits

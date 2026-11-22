@@ -35,6 +35,7 @@ from vllm.v1.core.node_eviction.metrics import (
     CacheMovementTracker,
     EvictionObserver,
     TTFTTracker,
+    short_block_hash,
 )
 from vllm.v1.core.node_eviction.scoring import (
     apply_speculative_floor,
@@ -164,6 +165,7 @@ class NodeEvictionController:
             decision_log_path=config.decision_log_path,
             regret_window_ms=config.regret_window_ms,
             regret_buffer_size=config.regret_buffer_size,
+            access_log_path=config.access_log_path,
         )
 
         # There is exactly one free queue, shared by every KV cache group,
@@ -331,6 +333,10 @@ class NodeEvictionController:
         # it as waste would blame the prefetch for a block that earned its
         # place.
         speculative = bool(entries) and all(e.speculative for e in entries)
+        # Read off the block rather than passed in: `BlockPool` calls this
+        # *before* `reset_hash()`, so the hash is still there, and taking it
+        # here keeps the hook signature stable.
+        block_hash = self._hash_of(block_id)
 
         self.observer.record_eviction(
             block_id=block_id,
@@ -344,12 +350,11 @@ class NodeEvictionController:
             num_free_fresh=num_free_fresh,
             was_spliced=breakdown is not None and breakdown.scored,
             speculative=speculative,
+            block_hash=short_block_hash(block_hash, with_group_id=True),
         )
         # Remember the hash so a later re-cache of the same prefix can be
-        # recognised as redone work. Read off the block rather than passed
-        # in: `BlockPool` calls this *before* `reset_hash()`, so the hash is
-        # still there, and taking it here keeps the hook signature stable.
-        self.movement.on_block_evicted(self._hash_of(block_id))
+        # recognised as redone work.
+        self.movement.on_block_evicted(block_hash)
 
         self.index.remove_block(block_id)
         self._evictions_since_tick += 1
@@ -382,6 +387,19 @@ class NodeEvictionController:
             return
         phantom = request is not None and _is_prefetch_only(request)
         self.movement.on_cache_query(num_tokens, num_hits, phantom)
+        if request is not None and self.observer.access_log_enabled:
+            self.observer.record_access(
+                now_ms=time.time() * 1000.0,
+                request_id=getattr(request, "request_id", None),
+                key=node_key_for_request(request, self.config.use_call_type),
+                phantom=phantom,
+                num_tokens=num_tokens,
+                num_hits=num_hits,
+                hashes=[
+                    short_block_hash(h)
+                    for h in getattr(request, "block_hashes", None) or ()
+                ],
+            )
         if request is not None:
             # Kept for this request's own `kv_hbm_ttft` line. Both figures are
             # taken here, while they are still the prompt's: `num_tokens` grows

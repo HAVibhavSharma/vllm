@@ -551,6 +551,24 @@ class TTFTTracker:
         return {"ttft_n": self.count}
 
 
+def short_block_hash(block_hash, with_group_id: bool = False) -> str | None:
+    """A block hash as the first 8 bytes of its digest, in hex.
+
+    The decision and access logs both name blocks this way, so the two join
+    on it. A pool block's hash is a `BlockHashWithGroupId` -- the digest with
+    a 4-byte group id appended (`kv_cache_utils.make_block_hash_with_group_id`)
+    -- and `with_group_id` strips that first; a request's `block_hashes` are
+    bare digests. 64 bits: a collision among a run's ~10^5 blocks is
+    vanishingly unlikely.
+    """
+    if not block_hash:
+        return None
+    raw = bytes(block_hash)
+    if with_group_id:
+        raw = raw[:-4]
+    return raw[:8].hex() or None
+
+
 class EvictionObserver:
     """Counters, the regret ring buffer, and the optional decision log."""
 
@@ -559,6 +577,7 @@ class EvictionObserver:
         decision_log_path: str | None = None,
         regret_window_ms: float = 120_000.0,
         regret_buffer_size: int = 4096,
+        access_log_path: str | None = None,
     ) -> None:
         self.counters = EvictionCounters()
         self.regret_window_ms = regret_window_ms
@@ -578,6 +597,14 @@ class EvictionObserver:
                     "Could not open node eviction decision log %s",
                     decision_log_path,
                 )
+        self._access_file = None
+        if access_log_path:
+            try:
+                self._access_file = open(access_log_path, "a", buffering=1)
+            except OSError:
+                logger.exception(
+                    "Could not open node eviction access log %s", access_log_path
+                )
 
     # -- decisions ---------------------------------------------------------
 
@@ -594,8 +621,13 @@ class EvictionObserver:
         num_free_fresh: int = 0,
         was_spliced: bool = False,
         speculative: bool | None = None,
+        block_hash: str | None = None,
     ) -> None:
         """One evicted *cached* block. Fresh blocks carry no information.
+
+        `block_hash` is the block's short hash (`short_block_hash`), the key
+        the access log's `hashes` share: the block's contents, where
+        `block_id` is only the slot they sat in.
 
         `speculative` is the caller's authoritative read of provenance, from
         the ownership index. It falls back to the score breakdown only for
@@ -626,6 +658,7 @@ class EvictionObserver:
         line = {
             "ts": now_ms,
             "block_id": block_id,
+            "hash": block_hash,
             "keys": [list(k) for k in keys],
             "score": breakdown.score if breakdown is not None else None,
             "terms": breakdown.as_terms() if breakdown is not None else None,
@@ -648,6 +681,40 @@ class EvictionObserver:
             self._log_file.write(json.dumps(line) + "\n")
         except (OSError, ValueError):
             logger.debug("Node eviction decision log write failed", exc_info=True)
+
+    @property
+    def access_log_enabled(self) -> bool:
+        return self._access_file is not None
+
+    def record_access(
+        self,
+        *,
+        now_ms: float,
+        request_id: str | None,
+        key: NodeKey | None,
+        phantom: bool,
+        num_tokens: int,
+        num_hits: int,
+        hashes: list[str | None],
+    ) -> None:
+        """One request's first prefix-cache lookup: who asked, what it found
+        on the GPU, and every full block of its prompt by short hash, in
+        prefix order. Only when the access log is open."""
+        if self._access_file is None:
+            return
+        line = {
+            "ts": now_ms,
+            "request_id": request_id,
+            "key": list(key) if key is not None else None,
+            "phantom": phantom,
+            "num_tokens": num_tokens,
+            "num_hits": num_hits,
+            "hashes": hashes,
+        }
+        try:
+            self._access_file.write(json.dumps(line) + "\n")
+        except (OSError, ValueError):
+            logger.debug("Node eviction access log write failed", exc_info=True)
 
     def _push_recent(self, record: _RecentEviction) -> None:
         if len(self._recent) == self._recent.maxlen:
@@ -726,3 +793,6 @@ class EvictionObserver:
         if self._log_file is not None and not self._log_file.closed:
             self._log_file.close()
         self._log_file = None
+        if self._access_file is not None and not self._access_file.closed:
+            self._access_file.close()
+        self._access_file = None
