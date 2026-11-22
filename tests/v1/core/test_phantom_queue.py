@@ -661,6 +661,41 @@ def test_its_call_with_another_prompt_keeps_a_staged_phantom(monkeypatch):
     assert scheduler._phantom_stats["key_prompt_mismatch"] == 1
 
 
+def test_with_release_its_call_with_another_prompt_drops_a_staged_phantom(monkeypatch):
+    # VLLM_PHANTOM_STAGE_RELEASE: the call came with another prompt, so the
+    # staged prefix is let go now rather than held read-locked to its timeout.
+    monkeypatch.setenv("VLLM_PHANTOM_STAGE_RELEASE", "1")
+    scheduler = _scheduler(monkeypatch)
+    released: list[str] = []
+    scheduler.connector.release_lookup = lambda r: released.append(r.request_id)
+    staged = _make(1, "staged", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    scheduler.add_request(staged)
+    scheduler.schedule()
+    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    assert not scheduler.phantom_staged
+    assert scheduler._phantom_stats["key_prompt_mismatch"] == 1
+    assert scheduler._phantom_stats["stage_released_mismatch"] == 1
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert staged.status == RequestStatus.FINISHED_STOPPED
+    assert released == ["staged"], "its L1 locks are freed"
+
+
+def test_with_release_other_questions_staged_phantoms_stay(monkeypatch):
+    # Another job's call of the same node, or this job's call of another node,
+    # releases nothing: only the (job, agent) the call names.
+    monkeypatch.setenv("VLLM_PHANTOM_STAGE_RELEASE", "1")
+    scheduler = _scheduler(monkeypatch)
+    mine = _make(1, "mine", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE)
+    theirs = _make(3, "theirs", BLOCK_SIZE * 4, staged=True, agent=OTHER_NODE, job="10")
+    scheduler.add_request(mine)
+    scheduler.add_request(theirs)
+    scheduler.add_request(_make(2, "other-node", BLOCK_SIZE * 8, agent=NODE))
+    scheduler.add_request(_make(2, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))
+    assert scheduler.phantom_staged == [theirs]
+    assert scheduler._phantom_stats["stage_released_mismatch"] == 1
+
+
 def test_a_staged_phantom_after_its_request_is_never_staged(monkeypatch):
     scheduler = _scheduler(monkeypatch)
     scheduler.add_request(_make(1, "real", BLOCK_SIZE * 8, agent=OTHER_NODE))

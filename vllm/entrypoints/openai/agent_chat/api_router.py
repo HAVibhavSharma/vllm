@@ -1007,6 +1007,30 @@ async def reset_agent_prefix_cache(
     return JSONResponse(content=result)
 
 
+@router.post("/v1/agents/release")
+async def release_agent_job(
+    raw_request: Request,
+    job_id: str = Query(description="The job (question) whose phantoms to release."),
+    staged_only: bool = Query(
+        default=True,
+        description="Only the phantoms that hold LMCache L1 (staged, `::l1`).",
+    ),
+):
+    """Release what an ended job staged: abort its phantoms still in flight.
+
+    Called by the harness when a question ends. Only that job's phantoms are
+    aborted, matched exactly on the job their identity names; other jobs
+    running in parallel keep theirs.
+    """
+    submitter: PhantomPrefetchSubmitter | None = getattr(
+        raw_request.app.state, _SUBMITTER_ATTR, None
+    )
+    if submitter is None:
+        return JSONResponse(content={"job_id": job_id, "released": []})
+    released = await submitter.release_job(job_id, staged_only=staged_only)
+    return JSONResponse(content={"job_id": job_id, "released": released})
+
+
 @router.get("/v1/agents/registry_stats")
 async def get_agent_registry_stats(raw_request: Request):
     """Inspect the in-process registry. Returns counts per agent so you

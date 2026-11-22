@@ -99,6 +99,8 @@ class PhantomPrefetchSubmitter:
         # idempotency guard and observability; the engine itself
         # rejects duplicate request_ids if a true collision occurs.
         self._inflight: dict[str, set[str]] = {}
+        # request id -> the job its identity names, for `release_job`.
+        self._job_of: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def submit(
@@ -171,6 +173,9 @@ class PhantomPrefetchSubmitter:
                 )
                 return None
             inflight_for_agent.add(request_id)
+            job = (identity or {}).get("job_id")
+            if job is not None:
+                self._job_of[request_id] = str(job)
 
         extra_args: dict[str, Any] = {
             "kv_transfer_params": {
@@ -278,6 +283,33 @@ class PhantomPrefetchSubmitter:
                     inflight.discard(request_id)
                     if not inflight:
                         self._inflight.pop(agent_id, None)
+                self._job_of.pop(request_id, None)
+
+    async def release_job(self, job_id: str, *, staged_only: bool = True) -> list[str]:
+        """Abort the phantoms still in flight for one job; return their ids.
+
+        For a question that has ended: whatever it staged will never be read
+        by it. Matched on the job the phantom's identity names, exactly, so
+        no other job's phantom is touched (job "1" is not job "10"). Aborting
+        a staged phantom frees its read locks in LMCache's L1
+        (`Scheduler.finish_requests` -> `_release_staged_lookup`); a block
+        another job's phantom or call also holds keeps that holder's lock.
+        ``staged_only``: only the L1-only phantoms (ids ending ``::l1``),
+        which are what hold L1; a GPU warm finishes by itself.
+        """
+        job_id = str(job_id)
+        async with self._lock:
+            ids = [
+                rid for rid, job in self._job_of.items()
+                if job == job_id and (not staged_only or rid.endswith("::l1"))
+            ]
+        if ids:
+            await self._engine_client.abort(ids)
+        logger.info(
+            "agent_prefetch: released %d phantom(s) of job %s%s",
+            len(ids), job_id, " (staged)" if staged_only else "",
+        )
+        return ids
 
     def inflight_size(self, agent_id: str | None = None) -> int:
         if agent_id is None:

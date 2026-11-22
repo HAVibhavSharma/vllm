@@ -101,3 +101,58 @@ def test_a_staged_phantom_has_its_own_id_and_says_so():
     assert staged_id.endswith("::l1") and staged_id[: -len("::l1")] == warm_id
     assert staged_args["kv_transfer_params"]["stage_l1"] is True
     assert "stage_l1" not in warm_args["kv_transfer_params"]
+
+
+class BlockingEngine:
+    """A phantom stays in flight until aborted, as a staged one does."""
+
+    def __init__(self) -> None:
+        self.aborted: list[str] = []
+        self._events: dict[str, asyncio.Event] = {}
+
+    async def generate(self, prompt, params, request_id, priority=0):
+        event = self._events.setdefault(request_id, asyncio.Event())
+        await event.wait()
+        if False:
+            yield None
+
+    async def abort(self, request_ids):
+        ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        self.aborted += ids
+        for rid in ids:
+            self._events.setdefault(rid, asyncio.Event()).set()
+
+
+def test_release_job_aborts_only_that_jobs_staged_phantoms():
+    async def run():
+        engine = BlockingEngine()
+        submitter = PhantomPrefetchSubmitter(engine)
+
+        async def submit(job, node, prefix, stage):
+            return await submitter.submit(
+                agent_id=f"langgraph:{job}:swe_architect:{node}",
+                token_ids=[1, 2, 3], prefix_hash=prefix, cache_salt="s",
+                identity={"job_id": job}, stage_l1=stage,
+            )
+
+        await submit("1", "conduct_research", b"\x01" * 8, True)
+        await submit("1", "extract_implementation_plan", b"\x02" * 8, False)
+        await submit("10", "conduct_research", b"\x03" * 8, True)
+
+        async def settle():
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+        await settle()
+        released = await submitter.release_job("1")
+        await settle()
+        assert released == ["prefetch::langgraph:1:swe_architect:conduct_research::0101010101010101::l1"]
+        assert engine.aborted == released, "job 10's and the GPU warm stay"
+        everything = await submitter.release_job("1", staged_only=False)
+        assert everything == ["prefetch::langgraph:1:swe_architect:extract_implementation_plan::0202020202020202"]
+        await settle()
+        await submitter.release_job("10")
+        await settle()
+        assert submitter.inflight_size() == 0
+
+    asyncio.run(run())

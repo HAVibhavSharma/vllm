@@ -318,6 +318,15 @@ class Scheduler(SchedulerInterface):
         self._phantom_stage_timeout_s = float(
             os.getenv("VLLM_PHANTOM_STAGE_TIMEOUT_S", "300") or 300
         )
+        # A staged phantom whose call arrives with another prompt is dropped
+        # rather than kept to its timeout: the call's own lookup reads
+        # whatever part of the prefix the two share, and the rest would sit
+        # read-locked in LMCache's L1 until the timeout, crowding out other
+        # questions' prefixes (swe_lite10_q1-2-4-6-9-10_20261122_165645:
+        # 53% of the staged holding in arm AB).
+        self._phantom_stage_release = os.getenv(
+            "VLLM_PHANTOM_STAGE_RELEASE", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         self._phantom_stats = dict.fromkeys(
             (
                 "admitted",
@@ -337,6 +346,7 @@ class Scheduler(SchedulerInterface):
                 "stage_loaded",
                 "stage_released",
                 "stage_expired",
+                "stage_released_mismatch",
             ),
             0,
         )
@@ -3213,7 +3223,14 @@ class Scheduler(SchedulerInterface):
                     self._queue_phantom_drop(phantom, "dropped_on_arrival")
                 else:
                     self._log_prompt_mismatch(phantom, request)
-                    kept.append(phantom)
+                    if queue_name == "phantom_staged" and self._phantom_stage_release:
+                        # Only this question's warm of this node: the key is
+                        # (job_id, agent_id), so no other job's is touched,
+                        # and LMCache's lock counts keep any block another
+                        # job's warm or call still holds.
+                        self._queue_phantom_drop(phantom, "stage_released_mismatch")
+                    else:
+                        kept.append(phantom)
             setattr(self, queue_name, kept)
 
     @staticmethod
