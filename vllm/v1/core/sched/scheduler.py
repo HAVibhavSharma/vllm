@@ -455,6 +455,9 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            # A dense model's DP engines each run as DP 1, so the rank survives
+            # only here; it names this engine's node-eviction logs.
+            data_parallel_index=getattr(self.parallel_config, "data_parallel_index", 0),
         )
         if self.kv_cache_manager.block_pool.warm_protect_s > 0 and not (
             self._phantom_queue

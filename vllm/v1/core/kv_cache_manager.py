@@ -118,6 +118,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        data_parallel_index: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -166,6 +167,7 @@ class KVCacheManager:
                 g.kv_cache_spec.page_size_bytes
                 for g in kv_cache_config.kv_cache_groups
             ),
+            data_parallel_index=data_parallel_index,
         )
         if self.node_eviction is not None:
             self.block_pool.attach_node_eviction(self.node_eviction)

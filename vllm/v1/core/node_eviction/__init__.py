@@ -59,8 +59,27 @@ __all__ = [
     "SnapshotSource",
     "StaticSnapshotSource",
     "maybe_build_controller",
+    "per_engine_log_path",
     "node_key_for_request",
 ]
+
+
+def per_engine_log_path(path: str | None, data_parallel_index: int) -> str | None:
+    """`path` for the engine at `data_parallel_index`: unchanged for index 0,
+    `<stem>-dp<index><suffix>` beside it for the others.
+
+    Under data parallelism every engine core inherits the one environment, so
+    each would open the same decision and access logs. Two processes
+    appending lines longer than a write buffer interleave them, and the logs
+    are only readable per engine anyway: each engine has its own GPU cache,
+    and a block hash evicted on one says nothing about the other.
+    """
+    if not path or data_parallel_index <= 0:
+        return path
+    import os.path
+
+    stem, suffix = os.path.splitext(path)
+    return f"{stem}-dp{data_parallel_index}{suffix}"
 
 
 def maybe_build_controller(
@@ -68,13 +87,17 @@ def maybe_build_controller(
     num_kv_cache_groups: int,
     config: NodeEvictionConfig | None = None,
     block_size_bytes: int = 0,
+    data_parallel_index: int = 0,
 ) -> NodeEvictionController | None:
     """Build the controller if the policy is switched on, else None.
 
     Returning None rather than a disabled object is deliberate: the call
     sites are then a single `is not None` check, and flag-off does no work at
-    all.
+    all. `data_parallel_index` is the engine's DP rank, which names its logs
+    (`per_engine_log_path`).
     """
+    import dataclasses
+
     from vllm.logger import init_logger
 
     logger = init_logger(__name__)
@@ -83,6 +106,16 @@ def maybe_build_controller(
         config = NodeEvictionConfig.from_env()
     if not config.enabled:
         return None
+    if data_parallel_index > 0:
+        config = dataclasses.replace(
+            config,
+            decision_log_path=per_engine_log_path(
+                config.decision_log_path, data_parallel_index
+            ),
+            access_log_path=per_engine_log_path(
+                config.access_log_path, data_parallel_index
+            ),
+        )
 
     try:
         config.validate()
