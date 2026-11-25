@@ -311,6 +311,27 @@ class OpenAIServingChat(OpenAIServing):
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+        # VLLM_AGENT_DP_PIN: a prompt seed waits for an idle engine and is
+        # dropped if its target call comes first; an agent call marks the
+        # seeds for it stale. Both no-ops with pinning off.
+        from vllm.v1.agent_prefetch import dp_pin
+
+        if dp_pin.is_seed(request_id):
+            if data_parallel_rank is None:
+                issued_at = _identity_extra_args(request).get("seed_issued_at")
+                data_parallel_rank, dropped = await dp_pin.place_seed(
+                    self.engine_client,
+                    request_id,
+                    issued_at if isinstance(issued_at, (int, float)) else None,
+                )
+                if dropped is not None:
+                    return self.create_error_response(
+                        f"seed dropped: {dropped}",
+                        err_type="SeedDropped",
+                        status_code=HTTPStatus.CONFLICT,
+                    )
+        else:
+            dp_pin.note_call(_identity_extra_args(request).get("agent_id"))
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len

@@ -1031,6 +1031,36 @@ async def release_agent_job(
     return JSONResponse(content={"job_id": job_id, "released": released})
 
 
+@router.post("/v1/agents/dp_rank")
+async def set_agent_job_dp_rank(
+    raw_request: Request,
+    job_id: str = Query(description="The job (question) to place."),
+    rank: int = Query(description="Its data-parallel engine; negative removes the pin."),
+):
+    """Name the engine a question's phantoms go to (`VLLM_AGENT_DP_PIN`).
+
+    Called by the harness when the question starts, before any of its
+    requests, with the rank its chat calls then carry in
+    `X-data-parallel-rank`; the question's phantoms follow it there. A no-op
+    with pinning off, which the answer says.
+    """
+    from vllm.v1.agent_prefetch import dp_pin
+
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    engines = dp_pin.num_engines(engine_client)
+    if engines is not None and rank >= engines:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"rank {rank} out of range: {engines} engine(s)"},
+        )
+    if dp_pin.enabled():
+        dp_pin.set_job_rank(job_id, rank)
+        logger.info("agent_dp: job %s -> engine %d", job_id, rank)
+    return JSONResponse(
+        content={"job_id": job_id, "rank": rank, "enabled": dp_pin.enabled(), "engines": engines}
+    )
+
+
 @router.get("/v1/agents/registry_stats")
 async def get_agent_registry_stats(raw_request: Request):
     """Inspect the in-process registry. Returns counts per agent so you

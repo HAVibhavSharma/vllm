@@ -205,12 +205,18 @@ class PhantomPrefetchSubmitter:
             extra_args=extra_args,
         )
 
+        # VLLM_AGENT_DP_PIN: its question's engine, whose cache it warms.
+        from vllm.v1.agent_prefetch import dp_pin
+
         task = asyncio.create_task(
             self._run_one(
                 request_id=request_id,
                 token_ids=list(token_ids),
                 params=params,
                 agent_id=agent_id,
+                data_parallel_rank=dp_pin.phantom_rank(
+                    job if job is not None else dp_pin.job_of(agent_id)
+                ),
             ),
             name=f"agent_prefetch:{request_id}",
         )
@@ -225,6 +231,7 @@ class PhantomPrefetchSubmitter:
         token_ids: list[int],
         params: SamplingParams,
         agent_id: str,
+        data_parallel_rank: int | None = None,
     ) -> None:
         """Drain the engine generator. Exceptions are logged, never raised."""
         try:
@@ -239,14 +246,19 @@ class PhantomPrefetchSubmitter:
             started = time.perf_counter()
             _span_log(
                 "agent_prefetch_start req=%s prompt_tokens=%d agent=%s "
-                "identity=%s",
+                "identity=%s dp_rank=%s",
                 request_id,
                 len(token_ids),
                 agent_id,
                 params.extra_args,
+                data_parallel_rank,
             )
             gen = self._engine_client.generate(
-                prompt, params, request_id, priority=self._priority
+                prompt,
+                params,
+                request_id,
+                priority=self._priority,
+                data_parallel_rank=data_parallel_rank,
             )
             # Consume the generator until the engine finishes. We don't
             # use the outputs; the engine handles APC registration in
