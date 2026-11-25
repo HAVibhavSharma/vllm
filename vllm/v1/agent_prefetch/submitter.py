@@ -150,6 +150,15 @@ class PhantomPrefetchSubmitter:
         if stage_l1:
             request_id += "::l1"
 
+        # VLLM_AGENT_DP_PIN: a question that has ended warms nothing more.
+        from vllm.v1.agent_prefetch import dp_pin
+
+        ended_job = (identity or {}).get("job_id")
+        ended_job = str(ended_job) if ended_job is not None else dp_pin.job_of(agent_id)
+        if dp_pin.job_ended(ended_job):
+            logger.info("agent_prefetch: dropped %s: its question has ended", request_id)
+            return None
+
         async with self._lock:
             inflight_for_agent = self._inflight.setdefault(agent_id, set())
             if request_id in inflight_for_agent:
@@ -206,8 +215,6 @@ class PhantomPrefetchSubmitter:
         )
 
         # VLLM_AGENT_DP_PIN: its question's engine, whose cache it warms.
-        from vllm.v1.agent_prefetch import dp_pin
-
         task = asyncio.create_task(
             self._run_one(
                 request_id=request_id,

@@ -132,3 +132,48 @@ def test_only_seeds_and_only_with_pinning(monkeypatch):
     assert _place(_client({})) == (None, None)
     dp_pin.note_call("langgraph:7:g:target")
     assert dp_pin._last_call_at == {}
+
+
+def test_releasing_a_question_aborts_its_running_seeds_only():
+    client = _client({"chatcmpl-prefetch::langgraph:7:g:target::seed-1-ab12cd34": 1,
+                      "chatcmpl-prefetch::langgraph:8:g:target::seed-2-ef56ab78": 0,
+                      "chatcmpl-a-11112222": 0})
+    calls = []
+
+    async def abort(ids, internal=False):
+        calls.append((list(ids), internal))
+
+    client.abort = abort
+    dp_pin.set_job_rank("7", 1)
+    aborted = asyncio.run(dp_pin.end_job(client, "7"))
+    assert dp_pin.job_ended("7") and not dp_pin.job_ended("8")
+    assert aborted == ["chatcmpl-prefetch::langgraph:7:g:target::seed-1-ab12cd34"]
+    assert calls == [(aborted, True)]
+    assert dp_pin.job_rank("7") is None and "7" in dp_pin._ended_jobs
+    # nothing running: no abort call
+    calls.clear()
+    assert asyncio.run(dp_pin.end_job(client, "9")) == [] and calls == []
+
+
+def test_a_seed_that_reaches_the_engine_after_the_end_is_aborted(monkeypatch):
+    monkeypatch.setattr(dp_pin, "SWEEP_S", (0.01, 0.05))
+    client = _client({})
+    calls = []
+
+    async def abort(ids, internal=False):
+        # as the engine does once it reports them finished
+        calls.append(list(ids))
+        for rid in ids:
+            client.engine_core.reqs_in_flight.pop(rid, None)
+
+    client.abort = abort
+    dp_pin.set_job_rank("7", 0)
+
+    async def run():
+        assert await dp_pin.end_job(client, "7") == []
+        # placed just before the end, it reaches the engine a moment later
+        client.engine_core.reqs_in_flight["chatcmpl-prefetch::langgraph:7:g:t::seed-3-aa11bb22"] = b"e0"
+        await asyncio.sleep(0.2)
+
+    asyncio.run(run())
+    assert calls == [["chatcmpl-prefetch::langgraph:7:g:t::seed-3-aa11bb22"]]

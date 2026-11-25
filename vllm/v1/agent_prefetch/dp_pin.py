@@ -24,7 +24,11 @@ With ``VLLM_AGENT_DP_PIN=1`` a question keeps one engine instead:
 
 A seed that started in an idle gap still runs to its end if an agent call
 arrives on that engine meanwhile; one seed per engine at a time keeps that
-overlap to one seed's remaining prefill.
+overlap to one seed's remaining prefill. When a question ends (``end_job``,
+from ``POST /v1/agents/job_end``) nothing of it may stay on a GPU the next
+question is about to take: its seeds still running are aborted, and so is
+any the engine registers in the next few seconds (one placed just before the
+end, not yet in flight), and its later seeds and phantoms are refused.
 
 The map lives in the API server's process, which is the only place a request
 is placed; run it with ``--api-server-count 1``.
@@ -57,6 +61,10 @@ _ended_jobs: set[str] = set()
 _last_call_at: dict[str, float] = {}
 # engine index -> (seed request id, monotonic time it was placed there).
 _seed_placed: dict[int, tuple[str, float]] = {}
+# After a question ends, look for seeds of it again this long apart: a seed
+# placed just before the end reaches the engine a moment later.
+SWEEP_S = (0.25, 0.75, 2.0)
+_sweeps: set[asyncio.Task] = set()
 
 
 def enabled() -> bool:
@@ -72,6 +80,57 @@ def set_job_rank(job_id: str, rank: int) -> None:
         else:
             _rank_of_job[str(job_id)] = int(rank)
             _ended_jobs.discard(str(job_id))
+
+
+def running_seeds_of(engine_client: Any, job_id: str) -> list[str]:
+    """The engine-side ids of ``job_id``'s seeds in flight."""
+    core = getattr(engine_client, "engine_core", None)
+    in_flight = getattr(core, "reqs_in_flight", None) or {}
+    return [rid for rid in list(in_flight) if is_seed(rid) and job_of(rid) == str(job_id)]
+
+
+def job_ended(job_id: str | None) -> bool:
+    """Whether ``job_id``'s question has ended (pinning on, not named again)."""
+    if job_id is None or not enabled():
+        return False
+    with _lock:
+        return str(job_id) in _ended_jobs
+
+
+async def _abort_seeds(engine_client: Any, job_id: str) -> list[str]:
+    ids = running_seeds_of(engine_client, job_id)
+    if ids:
+        # reqs_in_flight holds the engine's own ids, hence internal.
+        await engine_client.abort(ids, internal=True)
+    return ids
+
+
+async def _sweep(engine_client: Any, job_id: str) -> None:
+    for delay in SWEEP_S:
+        await asyncio.sleep(delay)
+        late = await _abort_seeds(engine_client, job_id)
+        if late:
+            logger.info("agent_dp: job %s ended; aborted %d seed(s) that reached the engine after: %s",
+                        job_id, len(late), late)
+
+
+async def end_job(engine_client: Any, job_id: str) -> list[str]:
+    """The question ended: remove its pin, refuse its later seeds and
+    phantoms, abort its seeds running now and, for a few seconds, any that
+    reach the engine late. Returns the ids aborted now."""
+    job_id = str(job_id)
+    set_job_rank(job_id, -1)
+    with _lock:
+        for engine, (rid, _) in list(_seed_placed.items()):
+            if job_of(rid) == job_id:
+                _seed_placed.pop(engine, None)
+    aborted = await _abort_seeds(engine_client, job_id)
+    task = asyncio.get_running_loop().create_task(_sweep(engine_client, job_id))
+    _sweeps.add(task)
+    task.add_done_callback(_sweeps.discard)
+    logger.info("agent_dp: job %s released; aborted %d running seed(s)%s",
+                job_id, len(aborted), f" {aborted}" if aborted else "")
+    return aborted
 
 
 def job_rank(job_id: str | None) -> int | None:

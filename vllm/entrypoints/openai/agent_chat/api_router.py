@@ -1041,8 +1041,9 @@ async def set_agent_job_dp_rank(
 
     Called by the harness when the question starts, before any of its
     requests, with the rank its chat calls then carry in
-    `X-data-parallel-rank`; the question's phantoms follow it there. A no-op
-    with pinning off, which the answer says.
+    `X-data-parallel-rank`; the question's phantoms follow it there. Called
+    with a negative rank when the question ends, which also aborts its seeds
+    still running. A no-op with pinning off, which the answer says.
     """
     from vllm.v1.agent_prefetch import dp_pin
 
@@ -1053,12 +1054,53 @@ async def set_agent_job_dp_rank(
             status_code=400,
             content={"error": f"rank {rank} out of range: {engines} engine(s)"},
         )
+    aborted: list[str] = []
     if dp_pin.enabled():
-        dp_pin.set_job_rank(job_id, rank)
-        logger.info("agent_dp: job %s -> engine %d", job_id, rank)
+        if rank < 0:
+            # The question ended: its seeds still running are aborted too.
+            aborted = await dp_pin.end_job(engine_client, job_id)
+        else:
+            dp_pin.set_job_rank(job_id, rank)
+            logger.info("agent_dp: job %s -> engine %d", job_id, rank)
     return JSONResponse(
-        content={"job_id": job_id, "rank": rank, "enabled": dp_pin.enabled(), "engines": engines}
+        content={"job_id": job_id, "rank": rank, "enabled": dp_pin.enabled(),
+                 "engines": engines, "aborted_seeds": aborted}
     )
+
+
+@router.post("/v1/agents/job_end")
+async def end_agent_job(
+    raw_request: Request,
+    job_id: str = Query(description="The job (question) that has ended."),
+    status: str = Query(default="done", description="How it ended: done or failed."),
+    reason: str | None = Query(default=None, description="Why it failed, if it did."),
+):
+    """A question has ended, finished or failed: end everything of it still
+    running here.
+
+    Called by the harness first thing when a question ends, so nothing of it
+    keeps a GPU the next question is about to take. With pinning
+    (`VLLM_AGENT_DP_PIN`) its pin is removed, its seeds running are aborted
+    (and for a few seconds any that reach the engine late), and its later
+    seeds and phantoms are refused. Its phantoms in flight, staged or not, are
+    aborted in any case.
+    """
+    from vllm.v1.agent_prefetch import dp_pin
+
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    seeds = await dp_pin.end_job(engine_client, job_id) if dp_pin.enabled() else []
+    submitter: PhantomPrefetchSubmitter | None = getattr(
+        raw_request.app.state, _SUBMITTER_ATTR, None
+    )
+    warms = await submitter.release_job(job_id, staged_only=False) if submitter is not None else []
+    logger.info(
+        "agent_job: job %s %s%s: aborted %d seed(s) and %d phantom(s)",
+        job_id, status, f" ({reason[:300]})" if reason else "", len(seeds), len(warms),
+    )
+    return JSONResponse(content={
+        "job_id": job_id, "status": status, "pinning": dp_pin.enabled(),
+        "aborted_seeds": seeds, "released_phantoms": warms,
+    })
 
 
 @router.get("/v1/agents/registry_stats")
