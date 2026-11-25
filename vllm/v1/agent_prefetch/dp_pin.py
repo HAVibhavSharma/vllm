@@ -18,8 +18,9 @@ With ``VLLM_AGENT_DP_PIN=1`` a question keeps one engine instead:
   later call, and it should only use GPU time no agent call needs. So it waits
   (``place_seed``) until some engine is idle -- no agent call in flight and no
   other seed -- and runs there, on its own question's engine if both are idle.
-  A seed still waiting when its target call arrives, or when its question
-  ends, is dropped: the call computes its prompt itself, as without seeds.
+  A seed still waiting when its target call arrives, or one of a question
+  that has ended (it can reach the server after the release), is dropped:
+  the call computes its prompt itself, as without seeds.
 
 A seed that started in an idle gap still runs to its end if an agent call
 arrives on that engine meanwhile; one seed per engine at a time keeps that
@@ -50,6 +51,8 @@ RESERVE_S = 2.0
 
 _lock = threading.RLock()
 _rank_of_job: dict[str, int] = {}
+# Jobs whose question has ended (released, not named again since).
+_ended_jobs: set[str] = set()
 # agent_id -> wall-clock time the latest agent call carrying it arrived.
 _last_call_at: dict[str, float] = {}
 # engine index -> (seed request id, monotonic time it was placed there).
@@ -65,8 +68,10 @@ def set_job_rank(job_id: str, rank: int) -> None:
     with _lock:
         if rank < 0:
             _rank_of_job.pop(str(job_id), None)
+            _ended_jobs.add(str(job_id))
         else:
             _rank_of_job[str(job_id)] = int(rank)
+            _ended_jobs.discard(str(job_id))
 
 
 def job_rank(job_id: str | None) -> int | None:
@@ -157,8 +162,7 @@ async def place_seed(
     """Wait for an idle engine for the seed ``request_id``.
 
     Returns ``(rank, None)`` to send it to engine ``rank``; ``(None, reason)``
-    to drop it (its target call arrived, or its question ended, while it
-    waited); ``(None, None)`` for anything this does not handle (not a seed,
+    to drop it (its target call arrived, or its question has ended); ``(None, None)`` for anything this does not handle (not a seed,
     pinning off, one engine), which the load balancer then places.
     ``issued_at`` is the wall-clock time the harness issued the seed: a target
     call arriving after that makes it stale, even one that arrived before the
@@ -175,13 +179,12 @@ async def place_seed(
     waited_from = time.monotonic()
     agent_id = seed_agent_id(request_id)
     job = job_of(request_id)
-    had_job = job_rank(job) is not None
     while True:
         with _lock:
             own = _rank_of_job.get(job) if job is not None else None
             if agent_id is not None and _last_call_at.get(agent_id, float("-inf")) >= since:
                 reason = "its call arrived"
-            elif had_job and own is None:
+            elif job is not None and job in _ended_jobs:
                 reason = "its question ended"
             else:
                 reason = None

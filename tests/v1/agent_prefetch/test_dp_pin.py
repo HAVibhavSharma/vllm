@@ -16,10 +16,12 @@ SEED = "chatcmpl-prefetch::langgraph:7:g:target::seed-1"
 def _pinning(monkeypatch):
     monkeypatch.setenv("VLLM_AGENT_DP_PIN", "1")
     monkeypatch.setattr(dp_pin, "POLL_S", 0.01)
-    for table in (dp_pin._rank_of_job, dp_pin._last_call_at, dp_pin._seed_placed):
+    for table in (dp_pin._rank_of_job, dp_pin._last_call_at, dp_pin._seed_placed,
+                  dp_pin._ended_jobs):
         table.clear()
     yield
-    for table in (dp_pin._rank_of_job, dp_pin._last_call_at, dp_pin._seed_placed):
+    for table in (dp_pin._rank_of_job, dp_pin._last_call_at, dp_pin._seed_placed,
+                  dp_pin._ended_jobs):
         table.clear()
 
 
@@ -117,6 +119,11 @@ def test_dropped_when_its_call_arrives_or_its_question_ends():
         return await asyncio.wait_for(task, 1.0)
 
     assert asyncio.run(run()) == (None, "its question ended")
+    # one that reaches the server after the release is dropped too
+    assert _place(_client({}), SEED, time.time()) == (None, "its question ended")
+    # and a job named again takes seeds again
+    dp_pin.set_job_rank("7", 1)
+    assert _place(_client({}), SEED, time.time()) == (1, None)
 
 
 def test_only_seeds_and_only_with_pinning(monkeypatch):
