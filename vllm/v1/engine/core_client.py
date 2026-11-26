@@ -46,6 +46,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.kv_aware_routing import KVAwareRouter, is_phantom
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -1378,7 +1379,19 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines) * self.client_index
         ) // client_count
 
+        # VLLM_DP_KV_ROUTING: send a request to the engine whose GPU holds its
+        # prefix, within a load slack (vllm/v1/engine/kv_aware_routing.py).
+        self.kv_router = KVAwareRouter.from_env(
+            len(self.core_engines), self._kv_tokens_per_engine
+        )
+
+    def _kv_tokens_per_engine(self) -> int:
+        # The ready responses sum num_gpu_blocks over the engines.
+        cache = self.vllm_config.cache_config
+        return (cache.num_gpu_blocks or 0) * cache.block_size // len(self.core_engines)
+
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
+        hashes: list[int] | None = None
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None and (
             eng_index := get_late_interaction_engine_index(
@@ -1415,11 +1428,19 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 if score < min_score:
                     min_score = score
                     eng_index = idx
+            if self.kv_router is not None:
+                eng_index, hashes = self.kv_router.choose(
+                    request, current_counts, self.client_count, eng_index
+                )
             # Increment local waiting count for better balancing between stats
-            # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+            # updates from the coordinator (which happen every 100ms). A
+            # phantom never waits there, so with KV-aware routing it does not.
+            if self.kv_router is None or not is_phantom(request):
+                current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
+        if self.kv_router is not None:
+            self.kv_router.placed(request, eng_index, hashes)
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
@@ -1444,6 +1465,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
                     self.engine_inflight[engine] -= 1
+                if self.kv_router is not None:
+                    self.kv_router.finished(req_id)
 
     @staticmethod
     async def eep_process_engine_core_notification(
