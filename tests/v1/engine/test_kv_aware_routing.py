@@ -294,3 +294,33 @@ def test_the_balancer_hands_stranded_phantoms_over_once():
     assert client.kv_router.prefill_ahead(1) > 0
     _first_token(client, call)
     assert client.kv_router.prefill_ahead(1) == 0
+
+
+def _seed(tokens):
+    r = _request(tokens)
+    r.request_id = f"chatcmpl-prefetch::langgraph:1:swe:node::seed-{r.request_id}"
+    return r
+
+
+def test_seeds_yield_to_a_call_on_their_engine_when_switched_on(monkeypatch):
+    monkeypatch.setenv("VLLM_DP_SEED_YIELD", "1")
+    router = kvr.KVAwareRouter(2, lambda: 1_000_000)
+    seed = _seed(_prompt(7, 6000))
+    router.placed(seed, 0)
+    router.placed(_request(_prompt(8, 3000)), 1)  # the other engine: it keeps going
+    assert router.take_stranded() == []
+    router.placed(_request(_prompt(9, 3000)), 0)  # its engine: it yields
+    assert router.take_stranded() == [seed.request_id]
+    done = _seed(_prompt(10, 6000))
+    router.placed(done, 1)
+    router.produced(done.request_id)  # past its prefill: left alone
+    router.placed(_request(_prompt(11, 3000)), 1)
+    assert router.take_stranded() == []
+
+
+def test_seeds_do_not_yield_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_DP_SEED_YIELD", raising=False)
+    router = kvr.KVAwareRouter(2, lambda: 1_000_000)
+    router.placed(_seed(_prompt(12, 6000)), 0)
+    router.placed(_request(_prompt(13, 3000)), 0)
+    assert router.take_stranded() == []

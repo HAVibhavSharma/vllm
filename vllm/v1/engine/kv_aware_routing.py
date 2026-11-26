@@ -84,6 +84,13 @@ def is_staged(request: Any) -> bool:
     return bool(kv.get("prefetch_only") and kv.get("stage_l1"))
 
 
+def is_seed(request: Any) -> bool:
+    """A prompt seed (``chatcmpl-prefetch::...::seed-...``): a one-token call
+    the harness sends to compute a predicted prompt's KV ahead of its call."""
+    rid = str(getattr(request, "request_id", ""))
+    return "prefetch::" in rid and "::seed-" in rid
+
+
 def agent_key(request: Any) -> tuple[str, str] | None:
     """``(job_id, agent_id)``, as the scheduler's ``_agent_key``: the same for
     a node's call and the phantoms warming it."""
@@ -143,6 +150,10 @@ class KVAwareRouter:
         # Phantoms in flight: request id -> (engine, agent key).
         self.phantoms: dict[str, tuple[int, tuple[str, str] | None]] = {}
         self.stranded: list[str] = []
+        # Seeds still prefilling, by engine: an agent call placed on that
+        # engine makes them yield (VLLM_DP_SEED_YIELD=1; off by default).
+        self.seed_engine: dict[str, int] = {}
+        self.seed_yield = os.getenv("VLLM_DP_SEED_YIELD", "0") == "1"
 
     @classmethod
     def from_env(
@@ -276,6 +287,23 @@ class KVAwareRouter:
             return
         self.calls[engine] += 1
         self.call_engine[request.request_id] = engine
+        if is_seed(request):
+            self.seed_engine[request.request_id] = engine
+            return
+        if self.seed_yield:
+            yielding = [
+                rid for rid, e in self.seed_engine.items()
+                if e == engine and rid in self.prefilling
+            ]
+            for rid in yielding:
+                del self.seed_engine[rid]
+            if yielding:
+                self.stranded.extend(yielding)
+                logger.info(
+                    "kv_route: call %s on engine %d makes %d seed(s) still "
+                    "prefilling there yield: %s",
+                    request.request_id, engine, len(yielding), yielding,
+                )
         if key is None:
             return
         away = [
@@ -302,6 +330,7 @@ class KVAwareRouter:
 
     def finished(self, request_id: str) -> None:
         self.prefilling.pop(request_id, None)
+        self.seed_engine.pop(request_id, None)
         self.phantoms.pop(request_id, None)
         engine = self.call_engine.pop(request_id, None)
         if engine is not None:

@@ -69,6 +69,8 @@ _ended_jobs: set[str] = set()
 _last_call_at: dict[str, float] = {}
 # engine index -> (seed request id, monotonic time it was placed there).
 _seed_placed: dict[int, tuple[str, float]] = {}
+# Seeds sent to each engine so far (spreads seeds when several are idle).
+_seeds_sent: dict[int, int] = {}
 # After a question ends, look for seeds of it again this long apart: a seed
 # placed just before the end reaches the engine a moment later.
 SWEEP_S = (0.25, 0.75, 2.0)
@@ -291,7 +293,13 @@ async def place_seed(
                     elif prefix_engine in idle:
                         rank = prefix_engine
                     else:
-                        rank = idle[0]
+                        # VLLM_DP_SEED_YIELD=1: not always the first idle
+                        # engine but the one that has had fewer seeds, so
+                        # seeds spread over the GPUs. Off: the first idle one.
+                        rank = (min(idle, key=lambda i: (_seeds_sent.get(i, 0), i))
+                                if os.getenv("VLLM_DP_SEED_YIELD", "0") == "1"
+                                else idle[0])
+                    _seeds_sent[rank] = _seeds_sent.get(rank, 0) + 1
                     _seed_placed[rank] = (request_id, now)
                     logger.info(
                         "agent_dp: seed %s -> engine %d after waiting %.2f s "
