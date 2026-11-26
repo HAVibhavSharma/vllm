@@ -177,3 +177,44 @@ def test_a_seed_that_reaches_the_engine_after_the_end_is_aborted(monkeypatch):
 
     asyncio.run(run())
     assert calls == [["chatcmpl-prefetch::langgraph:7:g:t::seed-3-aa11bb22"]]
+
+
+def _unpinned_kv_routing(monkeypatch):
+    monkeypatch.setenv("VLLM_AGENT_DP_PIN", "0")
+    monkeypatch.setenv("VLLM_DP_KV_ROUTING", "1")
+
+
+def test_unpinned_kv_routing_places_seeds_too(monkeypatch):
+    """Without pinning, KV-aware routing keeps arm C's seed rules: a seed
+    waits for an idle engine, a call marks its seeds stale, an ended
+    question's seeds are refused."""
+    _unpinned_kv_routing(monkeypatch)
+    assert _place(_client({"chatcmpl-a": 0})) == (1, None)
+    dp_pin.note_call("langgraph:7:g:target")
+    assert "langgraph:7:g:target" in dp_pin._last_call_at
+    dp_pin.set_job_rank("9", -1)
+    assert dp_pin.job_ended("9")
+    assert dp_pin.phantom_rank("9") is None
+    monkeypatch.setenv("VLLM_DP_KV_ROUTING", "0")
+    dp_pin._seed_placed.clear()
+    assert _place(_client({})) == (None, None)
+
+
+def test_unpinned_both_idle_prefers_the_engine_holding_its_prefix(monkeypatch):
+    """So the seed's KV is where the router sends its call."""
+    from vllm.v1.engine.kv_aware_routing import KVAwareRouter
+
+    _unpinned_kv_routing(monkeypatch)
+    router = KVAwareRouter(2, lambda: 110_000)
+    prompt = list(range(10_000))
+    prev = SimpleNamespace(
+        request_id="prev", prompt_token_ids=prompt[:9_000], sampling_params=None
+    )
+    router.placed(prev, 1)
+    router.finished("prev")
+    client = _client({})
+    client.engine_core.kv_router = router
+    assert asyncio.run(dp_pin.place_seed(client, SEED, None, prompt)) == (1, None)
+    dp_pin._seed_placed.clear()
+    other = list(range(50_000, 51_000))
+    assert asyncio.run(dp_pin.place_seed(client, SEED, None, other)) == (0, None)

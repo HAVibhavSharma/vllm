@@ -1080,7 +1080,8 @@ async def end_agent_job(
 
     Called by the harness first thing when a question ends, so nothing of it
     keeps a GPU the next question is about to take. With pinning
-    (`VLLM_AGENT_DP_PIN`) its pin is removed, its seeds running are aborted
+    (`VLLM_AGENT_DP_PIN`) or unpinned KV-aware routing (`VLLM_DP_KV_ROUTING`)
+    its pin, if any, is removed, its seeds running are aborted
     (and for a few seconds any that reach the engine late), and its later
     seeds and phantoms are refused. Its phantoms in flight, staged or not, are
     aborted in any case.
@@ -1088,7 +1089,7 @@ async def end_agent_job(
     from vllm.v1.agent_prefetch import dp_pin
 
     engine_client = getattr(raw_request.app.state, "engine_client", None)
-    seeds = await dp_pin.end_job(engine_client, job_id) if dp_pin.enabled() else []
+    seeds = await dp_pin.end_job(engine_client, job_id) if dp_pin.seeds_placed() else []
     submitter: PhantomPrefetchSubmitter | None = getattr(
         raw_request.app.state, _SUBMITTER_ATTR, None
     )

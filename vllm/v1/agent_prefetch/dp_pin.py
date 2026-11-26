@@ -22,6 +22,13 @@ With ``VLLM_AGENT_DP_PIN=1`` a question keeps one engine instead:
   that has ended (it can reach the server after the release), is dropped:
   the call computes its prompt itself, as without seeds.
 
+Without pinning, ``VLLM_DP_KV_ROUTING=1`` (the router in
+vllm/v1/engine/kv_aware_routing.py) places seeds the same way: a seed waits
+for an idle engine, the idle one holding the longest prefix of its prompt if
+any, so its KV is where the router will send its call; an agent call marks
+its seeds stale and a question's end drops them, as with pinning. Calls and
+phantoms stay with the router.
+
 A seed that started in an idle gap still runs to its end if an agent call
 arrives on that engine meanwhile; one seed per engine at a time keeps that
 overlap to one seed's remaining prefill. When a question ends (``end_job``,
@@ -40,6 +47,7 @@ import asyncio
 import os
 import threading
 import time
+from collections.abc import Sequence
 from typing import Any
 
 from vllm.logger import init_logger
@@ -71,6 +79,12 @@ def enabled() -> bool:
     return os.getenv("VLLM_AGENT_DP_PIN", "0") == "1"
 
 
+def seeds_placed() -> bool:
+    """Seeds wait for an idle engine, are dropped when their call comes first
+    and end with their question: with pinning, or with KV-aware routing."""
+    return enabled() or os.getenv("VLLM_DP_KV_ROUTING", "0") == "1"
+
+
 def set_job_rank(job_id: str, rank: int) -> None:
     """Pin ``job_id`` to engine ``rank``; a negative rank removes the pin."""
     with _lock:
@@ -90,8 +104,9 @@ def running_seeds_of(engine_client: Any, job_id: str) -> list[str]:
 
 
 def job_ended(job_id: str | None) -> bool:
-    """Whether ``job_id``'s question has ended (pinning on, not named again)."""
-    if job_id is None or not enabled():
+    """Whether ``job_id``'s question has ended (seed placement on, not named
+    again)."""
+    if job_id is None or not seeds_placed():
         return False
     with _lock:
         return str(job_id) in _ended_jobs
@@ -177,7 +192,7 @@ def seed_agent_id(request_id: str) -> str | None:
 def note_call(agent_id: Any) -> None:
     """An agent call carrying ``agent_id`` arrived: seeds for it issued
     before now are stale."""
-    if enabled() and isinstance(agent_id, str) and agent_id:
+    if seeds_placed() and isinstance(agent_id, str) and agent_id:
         with _lock:
             _last_call_at[agent_id] = time.time()
 
@@ -215,8 +230,25 @@ def _seed_running(i: int, seeds_in_flight: list[int], now: float) -> bool:
     return False
 
 
+def _prefix_engine(core: Any, prompt_token_ids: Sequence[int] | None) -> int | None:
+    """Under KV-aware routing, the engine the router remembers holding the
+    longest prefix of a seed's prompt, if long enough to route a call by."""
+    router = getattr(core, "kv_router", None)
+    if router is None or not prompt_token_ids:
+        return None
+    from vllm.v1.engine.kv_aware_routing import chunk_hashes
+
+    hashes = chunk_hashes(prompt_token_ids, router.chunk)
+    matched = [router.matched_tokens(i, hashes) for i in range(router.num_engines)]
+    best = max(range(len(matched)), key=lambda i: matched[i])
+    return best if matched[best] >= router.min_tokens else None
+
+
 async def place_seed(
-    engine_client: Any, request_id: str, issued_at: float | None = None
+    engine_client: Any,
+    request_id: str,
+    issued_at: float | None = None,
+    prompt_token_ids: Sequence[int] | None = None,
 ) -> tuple[int | None, str | None]:
     """Wait for an idle engine for the seed ``request_id``.
 
@@ -227,7 +259,7 @@ async def place_seed(
     call arriving after that makes it stale, even one that arrived before the
     seed reached the server (seeds of one question are sent one at a time).
     """
-    if not enabled() or not is_seed(request_id):
+    if not seeds_placed() or not is_seed(request_id):
         return None, None
     core = getattr(engine_client, "engine_core", None)
     engines = getattr(core, "core_engines", None)
@@ -236,6 +268,8 @@ async def place_seed(
         return None, None
     since = issued_at if issued_at is not None else time.time()
     waited_from = time.monotonic()
+    # Unpinned: the idle engine holding the seed's prefix, where its call goes.
+    prefix_engine = _prefix_engine(core, prompt_token_ids)
     agent_id = seed_agent_id(request_id)
     job = job_of(request_id)
     while True:
@@ -252,12 +286,19 @@ async def place_seed(
                 idle = [i for i in range(len(engines))
                         if calls[i] == 0 and not _seed_running(i, seeds, now)]
                 if idle:
-                    rank = own if own in idle else idle[0]
+                    if own in idle:
+                        rank = own
+                    elif prefix_engine in idle:
+                        rank = prefix_engine
+                    else:
+                        rank = idle[0]
                     _seed_placed[rank] = (request_id, now)
                     logger.info(
                         "agent_dp: seed %s -> engine %d after waiting %.2f s "
-                        "(agent calls in flight %s, its job's engine %s)",
+                        "(agent calls in flight %s, its job's engine %s, its "
+                        "prefix's engine %s)",
                         request_id, rank, now - waited_from, calls, own,
+                        prefix_engine,
                     )
                     return rank, None
         if reason is not None:
