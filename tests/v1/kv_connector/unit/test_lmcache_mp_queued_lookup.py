@@ -6,14 +6,16 @@ pitlane run swe_lite10_q1-2_20261120_110959 (two SWE questions at once) died
 on such a request. Q2's second conduct_research call (28,730 tokens) had an
 LMCache result up to 27,424 and waited 35 s for GPU blocks while Q1's call
 decoded and evicted Q2's cached prefix from 16,560 down to 5,152 tokens. With
-lookups starting at vLLM's own hit (LMCACHE_MP_LOOKUP_FROM_VLLM_HIT, now
-removed) that shrink took a path that released the lookup's locks on every
+lookups starting at vLLM's own hit (the first LMCACHE_MP_LOOKUP_FROM_VLLM_HIT,
+c1f0cb269) that shrink took a path that released the lookup's locks on every
 scheduling attempt, left stale hit counts behind, and issued a retrieve for a
 request the scheduler was prefilling itself; its finished_recving then tripped
 the scheduler's assertion.
 
-The lookup now covers the prompt from token 0 again, as upstream's does, so a
-shrinking hit only means more to load. These tests hold that down:
+By default the lookup covers the prompt from token 0, as upstream's does, so a
+shrinking hit only means more to load. (LMCACHE_MP_LOOKUP_FROM_VLLM_HIT is back
+as an opt-in that looks up again from a shrunken hit; its tests are in
+test_lmcache_mp_lookup_from_hit.py.) These tests hold the default down:
 
 - the queued request keeps its locks and loads the difference
   (`test_a_queued_request_whose_hit_shrank_loads_the_difference`);

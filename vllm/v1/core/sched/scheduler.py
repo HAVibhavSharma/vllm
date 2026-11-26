@@ -3254,11 +3254,14 @@ class Scheduler(SchedulerInterface):
         read every chunk it holds into L1, read-locked there; the phantom then
         waits, holding those locks, for its node's GPU warm or call. No GPU
         block is allocated, so nothing in the GPU is evicted for it. Looked up
-        from token 0, not from vLLM's own hit: that hit may shrink while the
-        loop runs, and a lookup that started past it loads nothing.
+        from token 0, unless the connector starts lookups at vLLM's own hit
+        (LMCACHE_MP_LOOKUP_FROM_VLLM_HIT): then the phantom stages only what
+        the GPU does not hold, and the connector looks up again from a hit
+        that shrinks while the lookup runs.
         """
         if not self.phantom_staged:
             return
+        from_hit = bool(getattr(self.connector, "lookup_from_vllm_hit", False))
         now = time.monotonic()
         kept: list[Request] = []
         for phantom in self.phantom_staged:
@@ -3270,21 +3273,38 @@ class Scheduler(SchedulerInterface):
             kept.append(phantom)
             if request_id in self._phantom_staged_loaded:
                 continue
-            matched, _ = self.connector.get_num_new_matched_tokens(phantom, 0)
+            gpu_hit = self._gpu_hit_tokens(phantom) if from_hit else 0
+            matched, _ = self.connector.get_num_new_matched_tokens(phantom, gpu_hit)
             if matched is None:
                 continue  # LMCache is still reading it into L1
             self._phantom_staged_loaded.add(request_id)
             self._phantom_stats["stage_loaded"] += 1
             logger.info(
                 "agent_prefetch: staged phantom %s has %d of its %d prompt tokens "
-                "in LMCache's L1 after %.1f s; its GPU copy waits for its node's "
-                "warm or call",
+                "in LMCache's L1 (%d more on the GPU) after %.1f s; its GPU copy "
+                "waits for its node's warm or call",
                 request_id,
                 matched,
                 phantom.num_tokens,
+                gpu_hit,
                 now - since,
             )
         self.phantom_staged = kept
+
+    def _gpu_hit_tokens(self, request: Request) -> int:
+        """vLLM's own prefix-cache hit for `request`, in tokens.
+
+        `kv_cache_manager.get_computed_blocks` finds the same hit but records
+        each call in the prefix-cache stats; a staged phantom is polled every
+        step, so this asks the coordinator directly.
+        """
+        kv = self.kv_cache_manager
+        if not kv.enable_caching or request.skip_reading_prefix_cache:
+            return 0
+        _, hit = kv.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return hit
 
     def _release_staged_for(self, phantom: Request) -> None:
         """End the staged phantoms `phantom`'s node had: `phantom` is that
