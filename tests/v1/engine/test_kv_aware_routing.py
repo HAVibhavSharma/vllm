@@ -9,7 +9,7 @@ import asyncio
 from collections import Counter
 from types import SimpleNamespace
 
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.engine import kv_aware_routing as kvr
 from vllm.v1.engine.core_client import DPLBAsyncMPClient
 
@@ -17,10 +17,14 @@ KV_TOKENS = 110_000  # per engine, as in the pitlane runs
 _COUNTER = 0
 
 
-def _request(tokens, phantom=False, rank=None):
+def _request(tokens, phantom=False, rank=None, key=None, staged=False):
     global _COUNTER
     _COUNTER += 1
-    extra = {"kv_transfer_params": {"prefetch_only": True}} if phantom else {}
+    extra: dict = {}
+    if phantom:
+        extra["kv_transfer_params"] = {"prefetch_only": True, "stage_l1": staged}
+    if key is not None:
+        extra["job_id"], extra["agent_id"] = key
     return SimpleNamespace(
         request_id=f"req-{_COUNTER}",
         prompt_token_ids=list(tokens),
@@ -53,7 +57,8 @@ def test_a_call_follows_its_prefix_on_a_tie():
     router.placed(prev, 1)
     router.finished(prev.request_id)
     other = _request(_prompt(9, 15_242))
-    router.placed(other, 1)  # running on engine 1
+    router.placed(other, 1)  # decoding on engine 1
+    router.produced(other.request_id)
     counts = [[0, 1, 0.3], [0, 1, 0.2]]  # a call running on each
     nxt = _request(_prompt(4, 28_863) + _prompt(44, 13_561))
     engine, _ = router.choose(nxt, counts, 1, fallback=0)
@@ -175,11 +180,25 @@ def test_the_load_balancer_keeps_a_question_on_its_engine():
     assert client.kv_router.calls == [1, 2]
 
 
+def _first_token(client, request):
+    asyncio.run(
+        DPLBAsyncMPClient.process_engine_outputs(
+            client,
+            EngineCoreOutputs(
+                outputs=[
+                    EngineCoreOutput(request_id=request.request_id, new_token_ids=[1])
+                ]
+            ),
+        )
+    )
+
+
 def test_a_pinned_request_is_remembered_where_it_went():
     client = _dplb_client(_router())
     client.get_core_engine_for_request(_request(_prompt(11, 1_000), rank=0))
     pinned = _request(_prompt(12, 10_000), rank=1)
     assert client.get_core_engine_for_request(pinned) == client.core_engines[1]
+    _first_token(client, pinned)
     nxt = _request(_prompt(12, 10_000) + _prompt(13, 100))
     assert client.get_core_engine_for_request(nxt) == client.core_engines[1]
 
@@ -189,3 +208,89 @@ def test_without_the_switch_the_balancer_is_unchanged():
     a = client.get_core_engine_for_request(_request(_prompt(1, 9_000)))
     b = client.get_core_engine_for_request(_request(_prompt(1, 9_000)))
     assert a != b
+
+
+Q4 = ("4", "langgraph:4:swe_architect:conduct_research")
+
+
+def test_a_call_releases_its_nodes_phantoms_on_other_engines():
+    """A staged phantom ends only when its call reaches its engine; one left
+    on the other engine would hold L1 read locks until its question ends."""
+    router = _router()
+    away = _request(_prompt(20, 9_000), phantom=True, key=Q4, staged=True)
+    here = _request(_prompt(20, 9_000), phantom=True, key=Q4)
+    other_node = _request(
+        _prompt(21, 9_000), phantom=True, key=("4", "langgraph:4:x:y"), staged=True
+    )
+    router.placed(away, 0)
+    router.placed(here, 1)
+    router.placed(other_node, 0)
+    call = _request(_prompt(20, 9_000) + _prompt(22, 300), key=Q4)
+    router.placed(call, 1)
+    assert router.take_stranded() == [away.request_id]
+    assert router.take_stranded() == []
+    assert set(router.phantoms) == {here.request_id, other_node.request_id}
+
+
+def test_a_staged_phantom_is_not_taken_for_gpu_kv():
+    """It reads into LMCache's L1 only; the GPU holding the previous call's
+    prefix still gets the call."""
+    router = _router()
+    prev = _request(_prompt(30, 20_000), key=Q4)
+    router.placed(prev, 1)
+    router.produced(prev.request_id)
+    router.finished(prev.request_id)
+    staged = _request(_prompt(30, 20_000) + _prompt(31, 6_000), phantom=True,
+                      key=Q4, staged=True)
+    router.placed(staged, 0)
+    assert router.matched_tokens(0, kvr.chunk_hashes(staged.prompt_token_ids)) == 0
+    call = _request(_prompt(30, 20_000) + _prompt(31, 6_200), key=Q4)
+    counts = [[0, 0, 0.0], [0, 0, 0.0]]
+    assert router.choose(call, counts, 1, fallback=0)[0] == 1
+
+
+def test_a_tie_avoids_an_engine_in_a_long_prefill():
+    """Q4's case the other way round: the prefix's engine is prefilling 24k
+    new tokens, the other is decoding."""
+    router = _router()
+    old = _request(_prompt(40, 28_000))
+    router.placed(old, 0)
+    router.produced(old.request_id)
+    router.finished(old.request_id)
+    long_prefill = _request(_prompt(41, 24_000))
+    router.placed(long_prefill, 0)
+    decoding = _request(_prompt(42, 15_000))
+    router.placed(decoding, 1)
+    router.produced(decoding.request_id)
+    call = _request(_prompt(40, 28_000) + _prompt(43, 14_000))
+    counts = [[0, 1, 0.3], [0, 1, 0.2]]
+    assert router.choose(call, counts, 1, fallback=0)[0] == 1
+    router.produced(long_prefill.request_id)
+    assert router.choose(call, counts, 1, fallback=1)[0] == 0
+
+
+def test_a_tie_avoids_an_engine_without_room():
+    router = _router()
+    old = _request(_prompt(50, 20_000))
+    router.placed(old, 0)
+    router.produced(old.request_id)
+    router.finished(old.request_id)
+    call = _request(_prompt(50, 20_000) + _prompt(51, 12_000))
+    full = [[0, 0, 0.95], [0, 0, 0.10]]  # 5.5k tokens free on engine 0
+    assert router.choose(call, full, 1, fallback=0)[0] == 1
+    roomy = [[0, 0, 0.50], [0, 0, 0.10]]
+    assert router.choose(call, roomy, 1, fallback=1)[0] == 0
+
+
+def test_the_balancer_hands_stranded_phantoms_over_once():
+    client = _dplb_client(_router())
+    phantom = _request(_prompt(60, 9_000), phantom=True, key=Q4, staged=True, rank=0)
+    client.get_core_engine_for_request(phantom)
+    client.get_core_engine_for_request(_request(_prompt(61, 1_000), rank=0))
+    call = _request(_prompt(60, 9_000) + _prompt(62, 500), key=Q4)
+    assert client.get_core_engine_for_request(call) == client.core_engines[1]
+    assert client.take_stranded_phantoms() == [phantom.request_id]
+    assert client.take_stranded_phantoms() == []
+    assert client.kv_router.prefill_ahead(1) > 0
+    _first_token(client, call)
+    assert client.kv_router.prefill_ahead(1) == 0

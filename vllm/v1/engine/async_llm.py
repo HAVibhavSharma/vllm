@@ -411,6 +411,13 @@ class AsyncLLM(EngineClient):
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
 
+        # VLLM_DP_KV_ROUTING: a call placed on one engine ends its node's
+        # phantoms waiting on the others, which no call would reach there and
+        # which would hold LMCache L1 read locks until their question ended.
+        take_stranded = getattr(self.engine_core, "take_stranded_phantoms", None)
+        if take_stranded is not None and (stranded := take_stranded()):
+            await self.abort(stranded, internal=True)
+
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
 

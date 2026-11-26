@@ -1385,6 +1385,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines), self._kv_tokens_per_engine
         )
 
+    def take_stranded_phantoms(self) -> list[str]:
+        """Phantoms a call just placed on another engine releases, for
+        `AsyncLLM` to abort (VLLM_DP_KV_ROUTING)."""
+        return self.kv_router.take_stranded() if self.kv_router is not None else []
+
     def _kv_tokens_per_engine(self) -> int:
         # The ready responses sum num_gpu_blocks over the engines.
         cache = self.vllm_config.cache_config
@@ -1461,6 +1466,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if self.kv_router is not None:
+            # A call's first token ends the prefill the router counts ahead.
+            for output in outputs.outputs:
+                if output.new_token_ids:
+                    self.kv_router.produced(output.request_id)
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
